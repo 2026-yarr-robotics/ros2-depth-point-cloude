@@ -1,8 +1,25 @@
 devel/
 logs/
 build/
+install/
+log/
 bin/
 lib/
+
+# colcon-generated symlinks / artefacts
+**/__pycache__/
+
+# Calibration captures (re-generated locally)
+data/
+
+# YOLO weights cache
+*.pt
+
+# Cube R-CNN dependency installer artefacts (created by dependence/setup.bash)
+dependence/venv/
+dependence/src/
+dependence/models/
+dependence/logs/
 msg_gen/
 srv_gen/
 msg/*Action.msg

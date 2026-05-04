@@ -1,0 +1,61 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Reference Frame: world
+      Plane: XY
+      Plane Cell Count: 20
+      Cell Size: 0.1
+      Color: 80; 80; 80
+      Enabled: true
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Show Names: true
+      Show Axes: true
+      Marker Scale: 0.2
+    - Class: rviz_default_plugins/PointCloud2
+      Name: CubePoints
+      Topic:
+        Value: /digital_twin/cube_points
+        Reliability Policy: Best Effort
+      Color Transformer: RGB8
+      Style: Points
+      Size (Pixels): 2
+      Enabled: true
+    - Class: rviz_default_plugins/MarkerArray
+      Name: CubeBoxes
+      Topic:
+        Value: /digital_twin/cube_boxes
+      Enabled: true
+    - Class: rviz_default_plugins/Image
+      Name: CubeDebug
+      Topic:
+        Value: /digital_twin/cube_debug
+      Enabled: true
+  Global Options:
+    Background Color: 30; 30; 30
+    Fixed Frame: world
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 2.0
+      Focal Point:
+        X: 0.0
+        Y: 0.0
+        Z: 0.0
+      Pitch: 0.5
+      Yaw: 0.785
+      Name: Current View
+Window Geometry:
+  Height: 800
+  Width: 1280

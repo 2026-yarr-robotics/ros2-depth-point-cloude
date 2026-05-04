@@ -1,0 +1,70 @@
+/**:
+  ros__parameters:
+    camera_frame: camera_color_optical_frame
+    world_frame: world
+    depth_unit: 0.001  # RealSense aligned_depth_to_color is uint16 mm
+
+world_origin_node:
+  ros__parameters:
+    depth_topic: /camera/camera/aligned_depth_to_color/image_raw
+    window_radius: 20            # px patch radius around centre for plane fit
+    min_patch_points: 100        # min valid pixels in patch
+    max_plane_residual: 0.01     # m — reject noisy plane fits
+    samples_required: 10         # frames to average before publishing TF
+
+detection_node:
+  ros__parameters:
+    # If your ultralytics version supports it, you can switch to
+    #   yolo11n-seg.pt, yolo12n-seg.pt, or yolov26n-seg.pt
+    # yolov8n-seg.pt is the broadest fallback (works with old ultralytics
+    # versions and includes COCO 'scissors' class).
+    model: yolov8n-seg.pt
+    # COCO has no "can" class. Beverage cans are usually detected as "bottle"
+    # (taller cans) or "cup". Include both to cover most can shapes.
+    target_classes: ["bottle", "cup"]
+    confidence: 0.35
+    image_topic: /camera/camera/color/image_raw
+    detections_topic: /digital_twin/detections
+    debug_topic: /digital_twin/detection_debug
+    device: ""
+
+point_cloud_node:
+  ros__parameters:
+    rgb_topic: /camera/camera/color/image_raw
+    depth_topic: /camera/camera/aligned_depth_to_color/image_raw
+    detections_topic: /digital_twin/detections
+    points_topic: /digital_twin/points
+    hulls_topic: /digital_twin/hulls
+    downsample: 2
+    z_min: 0.1
+    z_max: 4.0
+    hull_line_width: 0.0015
+    approx_sync_slop: 0.05
+
+# -----------------------------------------------------------------------------
+# Cube R-CNN pipeline (independent of YOLO above)
+# -----------------------------------------------------------------------------
+cube_rcnn_node:
+  ros__parameters:
+    # Set these via launch args (config_file:= weights:= device:=).
+    config_file: ""
+    weights: ""
+    device: cuda
+    confidence: 0.25
+    target_classes: [""]   # empty -> keep all Omni3D classes
+    image_topic: /camera/camera/color/image_raw
+    detections_topic: /digital_twin/cube_detections
+    debug_topic: /digital_twin/cube_debug
+
+cube_point_cloud_node:
+  ros__parameters:
+    rgb_topic: /camera/camera/color/image_raw
+    depth_topic: /camera/camera/aligned_depth_to_color/image_raw
+    detections_topic: /digital_twin/cube_detections
+    points_topic: /digital_twin/cube_points
+    boxes_topic: /digital_twin/cube_boxes
+    z_min: 0.1
+    z_max: 4.0
+    obb_inflate: 0.02       # m, padding when filtering depth points by OBB
+    approx_sync_slop: 0.05
+    box_alpha: 0.25         # transparent CUBE marker on top of outline
