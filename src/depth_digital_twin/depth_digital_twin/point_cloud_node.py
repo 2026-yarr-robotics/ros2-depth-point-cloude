@@ -1,17 +1,25 @@
-"""point_cloud_node — fuse RGB + aligned depth + segmentation into a coloured
-PointCloud2 (entire scene) plus per-object 3D ConvexHull line markers, all
-expressed in the `world` frame.
+"""point_cloud_node — fuse RGB + aligned depth + segmentation into:
+
+* `/digital_twin/points`     — coloured PointCloud2 in the `world` frame
+* `/digital_twin/boxes`      — MarkerArray of per-object 3D position boxes
+                              (CUBE + LINE_LIST outline + TEXT label)
+* `/digital_twin/box_debug`  — RGB image with the projected 3D boxes drawn on top
+
+3D box estimation is tailored to cup-like objects: a standing cup is a
+near-symmetric cylinder, so PCA yaw is unstable and the box is published
+axis-aligned. A fallen cup has a clear elongation in the XY plane, so PCA on
+the horizontal projection is used to recover its orientation.
 """
 from __future__ import annotations
 
-import struct
 from pathlib import Path
 from typing import Iterable
 
+import cv2
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
-from geometry_msgs.msg import Point
+from geometry_msgs.msg import Point as MsgPoint, Quaternion
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import Image, PointCloud2, PointField
@@ -25,8 +33,16 @@ from depth_digital_twin.intrinsics import load_intrinsics
 from depth_digital_twin_msgs.msg import SegmentedObjectArray
 
 
+# Edge index pairs for the 12 edges of a box given the 8-corner layout used
+# by `_box_corners` below (bottom face 0..3, top face 4..7).
+_BOX_EDGES: tuple[tuple[int, int], ...] = (
+    (0, 1), (1, 2), (2, 3), (3, 0),
+    (4, 5), (5, 6), (6, 7), (7, 4),
+    (0, 4), (1, 5), (2, 6), (3, 7),
+)
+
+
 def _palette(i: int) -> tuple[float, float, float]:
-    """Stable distinct colour per index in [0,1]."""
     base = [
         (0.95, 0.26, 0.21),
         (0.30, 0.69, 0.31),
@@ -56,21 +72,27 @@ class PointCloudNode(Node):
                                '/camera/camera/aligned_depth_to_color/image_raw')
         self.declare_parameter('detections_topic', '/digital_twin/detections')
         self.declare_parameter('points_topic', '/digital_twin/points')
-        self.declare_parameter('hulls_topic', '/digital_twin/hulls')
+        self.declare_parameter('boxes_topic', '/digital_twin/boxes')
+        self.declare_parameter('box_debug_topic', '/digital_twin/box_debug')
         self.declare_parameter('camera_frame', 'camera_color_optical_frame')
         self.declare_parameter('world_frame', 'world')
         self.declare_parameter('depth_unit', 0.001)
-        self.declare_parameter('downsample', 2)  # take every Nth pixel
+        self.declare_parameter('downsample', 2)
         self.declare_parameter('z_min', 0.1)
         self.declare_parameter('z_max', 4.0)
-        self.declare_parameter('hull_line_width', 0.005)  # m
-        self.declare_parameter('approx_sync_slop', 0.05)  # s
-        self.declare_parameter('objects_only', True)  # only publish points inside detected masks
+        self.declare_parameter('box_line_width', 0.0015)
+        self.declare_parameter('box_alpha', 0.25)
+        self.declare_parameter('box_standing_ratio', 0.8)
+        self.declare_parameter('box_min_elongation', 1.5)
+        self.declare_parameter('box_force_aabb', False)
+        self.declare_parameter('approx_sync_slop', 0.05)
+        self.declare_parameter('objects_only', True)
 
         path = Path(self.get_parameter('intrinsics_path').value)
         if not path.is_file():
             raise FileNotFoundError(f'intrinsics_path not found: {path}')
         self.intr = load_intrinsics(path)
+        self.K = self.intr.K
 
         self.camera_frame: str = self.get_parameter('camera_frame').value
         self.world_frame: str = self.get_parameter('world_frame').value
@@ -78,7 +100,11 @@ class PointCloudNode(Node):
         self.downsample: int = max(1, int(self.get_parameter('downsample').value))
         self.z_min: float = float(self.get_parameter('z_min').value)
         self.z_max: float = float(self.get_parameter('z_max').value)
-        self.hull_w: float = float(self.get_parameter('hull_line_width').value)
+        self.box_line_w: float = float(self.get_parameter('box_line_width').value)
+        self.box_alpha: float = float(self.get_parameter('box_alpha').value)
+        self.standing_ratio: float = float(self.get_parameter('box_standing_ratio').value)
+        self.min_elongation: float = float(self.get_parameter('box_min_elongation').value)
+        self.force_aabb: bool = bool(self.get_parameter('box_force_aabb').value)
         self.objects_only: bool = bool(self.get_parameter('objects_only').value)
         slop: float = float(self.get_parameter('approx_sync_slop').value)
 
@@ -94,8 +120,10 @@ class PointCloudNode(Node):
 
         self.points_pub = self.create_publisher(
             PointCloud2, self.get_parameter('points_topic').value, 5)
-        self.hulls_pub = self.create_publisher(
-            MarkerArray, self.get_parameter('hulls_topic').value, latched)
+        self.boxes_pub = self.create_publisher(
+            MarkerArray, self.get_parameter('boxes_topic').value, latched)
+        self.box_debug_pub = self.create_publisher(
+            Image, self.get_parameter('box_debug_topic').value, 1)
 
         rgb_sub = message_filters.Subscriber(
             self, Image, self.get_parameter('rgb_topic').value)
@@ -108,9 +136,9 @@ class PointCloudNode(Node):
         self.sync.registerCallback(self._on_synced)
         self.get_logger().info('point_cloud_node ready (waiting for synced frames)')
 
+    # ------------------------------------------------------------------
     def _on_synced(self, rgb_msg: Image, depth_msg: Image,
                    det_msg: SegmentedObjectArray) -> None:
-        # Resolve camera->world transform; if not yet broadcast, drop the frame.
         try:
             tf = self.tf_buffer.lookup_transform(
                 self.world_frame, self.camera_frame, rclpy.time.Time())
@@ -122,13 +150,12 @@ class PointCloudNode(Node):
                 throttle_duration_sec=2.0)
             return
 
-        t_cw = np.array([tf.transform.translation.x,
+        # tf is target=world, source=camera ⇒ p_world = R_wc @ p_cam + t_wc.
+        t_wc = np.array([tf.transform.translation.x,
                          tf.transform.translation.y,
                          tf.transform.translation.z], dtype=np.float64)
-        # Rotation is identity by design (world axes-aligned with camera).
-        # We support a non-identity rotation for safety using quaternion-to-matrix.
         q = tf.transform.rotation
-        R_cw = _quat_to_rot(q.x, q.y, q.z, q.w)
+        R_wc = _quat_to_rot(q.x, q.y, q.z, q.w)
 
         rgb = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding='bgr8')
         depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
@@ -138,11 +165,9 @@ class PointCloudNode(Node):
                 f'RGB ({rgb.shape[:2]}) != depth ({h, w}); requires aligned depth')
             return
 
-        z = depth.astype(np.float32) * self.depth_unit  # metres
+        z = depth.astype(np.float32) * self.depth_unit
         valid = (z > self.z_min) & (z < self.z_max)
 
-        # Union of all detected object masks (used for both gating the cloud
-        # and for per-object hull computation below).
         union_mask = np.zeros((h, w), dtype=bool)
         per_object_masks: list[tuple[object, np.ndarray]] = []
         for obj in det_msg.objects:
@@ -156,42 +181,30 @@ class PointCloudNode(Node):
         sample_mask = valid & union_mask if self.objects_only else valid
 
         ys, xs = np.mgrid[0:h:self.downsample, 0:w:self.downsample]
-        ys = ys.flatten()
-        xs = xs.flatten()
+        ys = ys.flatten(); xs = xs.flatten()
         sel = sample_mask[ys, xs]
-        ys = ys[sel]
-        xs = xs[sel]
+        ys = ys[sel]; xs = xs[sel]
+
+        # Always emit a debug image (even if no detections) so RViz keeps a feed.
+        debug_img = rgb.copy()
+
         if ys.size == 0:
-            # No detected pixels this frame — publish an empty cloud so RViz
-            # clears the previous render instead of holding a stale point set.
             empty = _make_pointcloud2(
                 header=Header(stamp=rgb_msg.header.stamp, frame_id=self.world_frame),
                 xyz=np.zeros((0, 3), dtype=np.float32),
                 rgb=np.zeros((0,), dtype=np.float32))
             self.points_pub.publish(empty)
-            # Still clear hull markers.
-            clear = MarkerArray()
-            d = Marker()
-            d.header.frame_id = self.world_frame
-            d.header.stamp = rgb_msg.header.stamp
-            d.action = Marker.DELETEALL
-            clear.markers.append(d)
-            self.hulls_pub.publish(clear)
+            self._publish_clear_markers(rgb_msg.header.stamp)
+            self._annotate_status(debug_img, 0)
+            self._publish_debug(debug_img, rgb_msg.header)
             return
 
         zs = z[ys, xs]
-        # Deproject to camera frame.
         cam_x = (xs.astype(np.float32) - self.intr.cx) * zs / self.intr.fx
         cam_y = (ys.astype(np.float32) - self.intr.cy) * zs / self.intr.fy
-        cam_z = zs
-        pts_cam = np.stack([cam_x, cam_y, cam_z], axis=1)  # (N,3)
+        pts_cam = np.stack([cam_x, cam_y, zs], axis=1)
+        pts_world = (R_wc @ pts_cam.T).T + t_wc
 
-        # camera -> world : p_w = R_wc @ p_c + t_wc.
-        # tf above is target=world, source=camera, so it is T_w<-c directly:
-        # p_w = R @ p_c + t, where R = R_cw, t = t_cw.
-        pts_world = (R_cw @ pts_cam.T).T + t_cw
-
-        # Pack RGB (BGR -> RGB for the standard 'rgb' field).
         bgr = rgb[ys, xs]
         rgb_packed = _pack_rgb(bgr[:, 2], bgr[:, 1], bgr[:, 0])
 
@@ -201,14 +214,15 @@ class PointCloudNode(Node):
             rgb=rgb_packed)
         self.points_pub.publish(cloud_msg)
 
-        # Per-object hulls — recompute deprojection for each mask at full resolution.
+        # Per-object 3D boxes.
         markers = MarkerArray()
-        delete_all = Marker()
-        delete_all.header.frame_id = self.world_frame
-        delete_all.header.stamp = rgb_msg.header.stamp
-        delete_all.action = Marker.DELETEALL
-        markers.markers.append(delete_all)
+        clear = Marker()
+        clear.header.frame_id = self.world_frame
+        clear.header.stamp = rgb_msg.header.stamp
+        clear.action = Marker.DELETEALL
+        markers.markers.append(clear)
 
+        n_drawn = 0
         for i, (obj, mb) in enumerate(per_object_masks):
             obj_valid = mb & valid
             if obj_valid.sum() < 32:
@@ -218,44 +232,241 @@ class PointCloudNode(Node):
             ocx = (ox.astype(np.float32) - self.intr.cx) * oz / self.intr.fx
             ocy = (oy.astype(np.float32) - self.intr.cy) * oz / self.intr.fy
             obj_cam = np.stack([ocx, ocy, oz], axis=1)
-            obj_world = (R_cw @ obj_cam.T).T + t_cw
+            obj_world = (R_wc @ obj_cam.T).T + t_wc
 
-            edges = _convex_hull_edges(obj_world)
-            if edges is None:
+            box = _compute_box_world(
+                obj_world,
+                standing_ratio=self.standing_ratio,
+                min_elongation=self.min_elongation,
+                force_aabb=self.force_aabb)
+            if box is None:
                 continue
-
+            center, R_box, size, pose_label = box
+            # Top-centre of the box (pivot (0, 0, +1) in box-local, scaled).
+            top_world = center + R_box @ np.array(
+                [0.0, 0.0, float(size[2]) * 0.5], dtype=np.float64)
             colour = _palette(i)
-            m = Marker()
-            m.header.frame_id = self.world_frame
-            m.header.stamp = rgb_msg.header.stamp
-            m.ns = 'hulls'
-            m.id = i + 1
-            m.type = Marker.LINE_LIST
-            m.action = Marker.ADD
-            m.pose.orientation.w = 1.0
-            m.scale.x = self.hull_w
-            m.color = ColorRGBA(r=colour[0], g=colour[1], b=colour[2], a=1.0)
-            for a, b in edges:
-                m.points.append(Point(x=float(a[0]), y=float(a[1]), z=float(a[2])))
-                m.points.append(Point(x=float(b[0]), y=float(b[1]), z=float(b[2])))
-            markers.markers.append(m)
+            label_text = (f'{obj.class_name} {obj.score:.2f} [{pose_label}] '
+                          f'T({top_world[0]:.2f},{top_world[1]:.2f},'
+                          f'{top_world[2]:.2f})')
 
-            label = Marker()
-            label.header = m.header
-            label.ns = 'hull_labels'
-            label.id = i + 1
-            label.type = Marker.TEXT_VIEW_FACING
-            label.action = Marker.ADD
-            centroid = obj_world.mean(axis=0)
-            label.pose.position = Point(x=float(centroid[0]), y=float(centroid[1]),
-                                        z=float(centroid[2]))
-            label.pose.orientation.w = 1.0
-            label.scale.z = 0.04
-            label.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
-            label.text = f'{obj.class_name} {obj.score:.2f}'
-            markers.markers.append(label)
+            self._append_box_markers(
+                markers, i + 1, center, R_box, size, top_world, colour,
+                label_text, rgb_msg.header.stamp)
+            self._draw_box_overlay(
+                debug_img, center, R_box, size, top_world, colour, label_text,
+                R_wc, t_wc)
+            n_drawn += 1
 
-        self.hulls_pub.publish(markers)
+        self.boxes_pub.publish(markers)
+        self._annotate_status(debug_img, n_drawn)
+        self._publish_debug(debug_img, rgb_msg.header)
+
+    # ------------------------------------------------------------------
+    def _append_box_markers(self, markers: MarkerArray, idx: int,
+                            center: np.ndarray, R_box: np.ndarray,
+                            size: np.ndarray, top_world: np.ndarray,
+                            colour: tuple[float, float, float],
+                            label: str, stamp) -> None:
+        qx, qy, qz, qw = _rot_to_quat(R_box)
+
+        cube = Marker()
+        cube.header.frame_id = self.world_frame
+        cube.header.stamp = stamp
+        cube.ns = 'boxes'
+        cube.id = idx
+        cube.type = Marker.CUBE
+        cube.action = Marker.ADD
+        cube.pose.position = MsgPoint(
+            x=float(center[0]), y=float(center[1]), z=float(center[2]))
+        cube.pose.orientation = Quaternion(x=qx, y=qy, z=qz, w=qw)
+        cube.scale.x = float(max(size[0], 1e-3))
+        cube.scale.y = float(max(size[1], 1e-3))
+        cube.scale.z = float(max(size[2], 1e-3))
+        cube.color = ColorRGBA(
+            r=colour[0], g=colour[1], b=colour[2], a=float(self.box_alpha))
+        markers.markers.append(cube)
+
+        outline = Marker()
+        outline.header = cube.header
+        outline.ns = 'box_outline'
+        outline.id = idx
+        outline.type = Marker.LINE_LIST
+        outline.action = Marker.ADD
+        outline.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+        outline.scale.x = self.box_line_w
+        outline.color = ColorRGBA(r=colour[0], g=colour[1], b=colour[2], a=1.0)
+        corners = _box_corners(center, R_box, size)
+        for a, b in _BOX_EDGES:
+            outline.points.append(MsgPoint(
+                x=float(corners[a, 0]), y=float(corners[a, 1]), z=float(corners[a, 2])))
+            outline.points.append(MsgPoint(
+                x=float(corners[b, 0]), y=float(corners[b, 1]), z=float(corners[b, 2])))
+        markers.markers.append(outline)
+
+        # Sphere marker at the box top-centre (pivot (0,0,+1) in box-local).
+        top = Marker()
+        top.header = cube.header
+        top.ns = 'box_top'
+        top.id = idx
+        top.type = Marker.SPHERE
+        top.action = Marker.ADD
+        top.pose.position = MsgPoint(
+            x=float(top_world[0]), y=float(top_world[1]), z=float(top_world[2]))
+        top.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+        top.scale.x = top.scale.y = top.scale.z = 0.02
+        top.color = ColorRGBA(r=1.0, g=0.95, b=0.0, a=1.0)
+        markers.markers.append(top)
+
+        text = Marker()
+        text.header = cube.header
+        text.ns = 'box_labels'
+        text.id = idx
+        text.type = Marker.TEXT_VIEW_FACING
+        text.action = Marker.ADD
+        # Place above the sphere so they don't visually overlap.
+        text.pose.position = MsgPoint(
+            x=float(top_world[0]),
+            y=float(top_world[1]),
+            z=float(top_world[2] + 0.05))
+        text.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+        text.scale.z = 0.04
+        text.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
+        text.text = label
+        markers.markers.append(text)
+
+    # ------------------------------------------------------------------
+    def _draw_box_overlay(self, img: np.ndarray, center: np.ndarray,
+                          R_box: np.ndarray, size: np.ndarray,
+                          top_world: np.ndarray,
+                          colour: tuple[float, float, float], label: str,
+                          R_wc: np.ndarray, t_wc: np.ndarray) -> None:
+        corners_world = _box_corners(center, R_box, size)
+        # world -> camera: p_c = R_wc^T @ (p_w - t_wc)
+        corners_cam = (R_wc.T @ (corners_world - t_wc).T).T
+        in_front = corners_cam[:, 2] > 0.05
+        if not np.any(in_front):
+            return
+        z_safe = np.clip(corners_cam[:, 2], 1e-6, None)
+        pix = (self.K @ corners_cam.T).T
+        pix = pix[:, :2] / z_safe[:, None]
+        pts = pix.astype(int)
+        bgr_colour = (int(colour[2] * 255), int(colour[1] * 255), int(colour[0] * 255))
+        for a, b in _BOX_EDGES:
+            if not (in_front[a] and in_front[b]):
+                continue
+            cv2.line(img, tuple(pts[a]), tuple(pts[b]), bgr_colour, 2)
+
+        # Project the top-centre point and draw a marker on the image.
+        top_cam = R_wc.T @ (top_world - t_wc)
+        top_label_anchor = None
+        if top_cam[2] > 0.05:
+            tp = (self.K @ top_cam) / max(float(top_cam[2]), 1e-6)
+            tx, ty = int(round(tp[0])), int(round(tp[1]))
+            cv2.circle(img, (tx, ty), 6, (0, 240, 255), -1)
+            cv2.circle(img, (tx, ty), 7, (0, 0, 0), 1)
+            top_label_anchor = (tx, ty)
+
+        if top_label_anchor is not None:
+            tx, ty = top_label_anchor
+            cv2.putText(img, label, (tx + 8, max(0, ty - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 240, 255), 1,
+                        lineType=cv2.LINE_AA)
+        elif np.any(in_front):
+            anchor = pts[in_front][np.argmin(pix[in_front, 1])]
+            ax, ay = int(anchor[0]), max(0, int(anchor[1]) - 6)
+            cv2.putText(img, label, (ax, ay),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, bgr_colour, 2)
+
+    # ------------------------------------------------------------------
+    def _publish_clear_markers(self, stamp) -> None:
+        clear = MarkerArray()
+        d = Marker()
+        d.header.frame_id = self.world_frame
+        d.header.stamp = stamp
+        d.action = Marker.DELETEALL
+        clear.markers.append(d)
+        self.boxes_pub.publish(clear)
+
+    def _publish_debug(self, img: np.ndarray, src_header) -> None:
+        msg = self.bridge.cv2_to_imgmsg(img, encoding='bgr8')
+        msg.header = src_header
+        self.box_debug_pub.publish(msg)
+
+    @staticmethod
+    def _annotate_status(img: np.ndarray, n: int) -> None:
+        colour = (0, 255, 0) if n else (0, 200, 255)
+        cv2.putText(img, f'3d boxes={n}', (10, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, colour, 2)
+
+
+# ----------------------------------------------------------------------
+# Geometry helpers
+# ----------------------------------------------------------------------
+def _compute_box_world(points: np.ndarray, *,
+                       standing_ratio: float, min_elongation: float,
+                       force_aabb: bool):
+    """Estimate a 3D position box for a cluster of world-frame points.
+
+    Returns (center(3,), R(3,3), size(3,), pose_label) or None.
+
+    For cup-like targets: treat tall clusters (z extent dominates) as
+    standing → axis-aligned box (yaw=0). Otherwise project to the XY plane
+    and inspect PCA elongation; only commit to a yaw rotation when the
+    principal axis is clearly longer than the secondary one.
+    """
+    if points.shape[0] < 32:
+        return None
+
+    pmin = points.min(axis=0)
+    pmax = points.max(axis=0)
+    extent = pmax - pmin
+    z_ext = float(extent[2])
+    h_ext = float(max(extent[0], extent[1]))
+    aabb_center = (pmin + pmax) * 0.5
+
+    if force_aabb or h_ext < 1e-6:
+        return aabb_center, np.eye(3), extent, 'standing' if z_ext >= h_ext else 'unknown'
+
+    if z_ext / max(h_ext, 1e-6) > standing_ratio:
+        return aabb_center, np.eye(3), extent, 'standing'
+
+    xy = points[:, :2]
+    xy_centered = xy - xy.mean(axis=0)
+    cov = np.cov(xy_centered.T)
+    if not np.all(np.isfinite(cov)):
+        return aabb_center, np.eye(3), extent, 'unknown'
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    lam_major = float(eigvals[1])
+    lam_minor = float(max(eigvals[0], 1e-12))
+    elongation = (lam_major / lam_minor) ** 0.5
+
+    if elongation < min_elongation:
+        return aabb_center, np.eye(3), extent, 'unknown'
+
+    principal = eigvecs[:, -1]
+    yaw = float(np.arctan2(principal[1], principal[0]))
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    R = np.array([[cy, -sy, 0.0],
+                  [sy,  cy, 0.0],
+                  [0.0, 0.0, 1.0]], dtype=np.float64)
+
+    centroid = points.mean(axis=0)
+    local = (R.T @ (points - centroid).T).T
+    lmin = local.min(axis=0)
+    lmax = local.max(axis=0)
+    size = lmax - lmin
+    center_world = centroid + R @ ((lmin + lmax) * 0.5)
+    return center_world, R, size, 'fallen'
+
+
+def _box_corners(center: np.ndarray, R: np.ndarray, size: np.ndarray) -> np.ndarray:
+    h = np.asarray(size, dtype=np.float64) * 0.5
+    s = np.array([
+        [-1, -1, -1], [+1, -1, -1], [+1, +1, -1], [-1, +1, -1],
+        [-1, -1, +1], [+1, -1, +1], [+1, +1, +1], [-1, +1, +1],
+    ], dtype=np.float64) * h
+    return (R @ s.T).T + np.asarray(center, dtype=np.float64)
 
 
 def _quat_to_rot(x: float, y: float, z: float, w: float) -> np.ndarray:
@@ -263,15 +474,9 @@ def _quat_to_rot(x: float, y: float, z: float, w: float) -> np.ndarray:
     if n < 1e-12:
         return np.eye(3)
     s = 2.0 / n
-    xx = x * x * s
-    yy = y * y * s
-    zz = z * z * s
-    xy = x * y * s
-    xz = x * z * s
-    yz = y * z * s
-    wx = w * x * s
-    wy = w * y * s
-    wz = w * z * s
+    xx = x * x * s; yy = y * y * s; zz = z * z * s
+    xy = x * y * s; xz = x * z * s; yz = y * z * s
+    wx = w * x * s; wy = w * y * s; wz = w * z * s
     return np.array([
         [1 - (yy + zz), xy - wz, xz + wy],
         [xy + wz, 1 - (xx + zz), yz - wx],
@@ -279,27 +484,37 @@ def _quat_to_rot(x: float, y: float, z: float, w: float) -> np.ndarray:
     ], dtype=np.float64)
 
 
-def _convex_hull_edges(points: np.ndarray):
-    """Return list of (p_a, p_b) edge tuples for the 3D convex hull of `points`,
-    or None if the hull cannot be computed."""
-    try:
-        from scipy.spatial import ConvexHull, QhullError  # type: ignore
-    except ImportError:
-        return None
-    if points.shape[0] < 4:
-        return None
-    try:
-        hull = ConvexHull(points)
-    except (QhullError, ValueError):
-        return None
-    edges = set()
-    for simplex in hull.simplices:
-        for a, b in ((simplex[0], simplex[1]),
-                     (simplex[1], simplex[2]),
-                     (simplex[2], simplex[0])):
-            key = (a, b) if a < b else (b, a)
-            edges.add(key)
-    return [(points[a], points[b]) for a, b in edges]
+def _rot_to_quat(R: np.ndarray) -> tuple[float, float, float, float]:
+    """Return quaternion (x, y, z, w) from a 3x3 rotation matrix."""
+    m00, m01, m02 = R[0, 0], R[0, 1], R[0, 2]
+    m10, m11, m12 = R[1, 0], R[1, 1], R[1, 2]
+    m20, m21, m22 = R[2, 0], R[2, 1], R[2, 2]
+    tr = m00 + m11 + m22
+    if tr > 0:
+        s = (tr + 1.0) ** 0.5 * 2.0
+        w = 0.25 * s
+        x = (m21 - m12) / s
+        y = (m02 - m20) / s
+        z = (m10 - m01) / s
+    elif (m00 > m11) and (m00 > m22):
+        s = ((1.0 + m00 - m11 - m22) ** 0.5) * 2.0
+        w = (m21 - m12) / s
+        x = 0.25 * s
+        y = (m01 + m10) / s
+        z = (m02 + m20) / s
+    elif m11 > m22:
+        s = ((1.0 + m11 - m00 - m22) ** 0.5) * 2.0
+        w = (m02 - m20) / s
+        x = (m01 + m10) / s
+        y = 0.25 * s
+        z = (m12 + m21) / s
+    else:
+        s = ((1.0 + m22 - m00 - m11) ** 0.5) * 2.0
+        w = (m10 - m01) / s
+        x = (m02 + m20) / s
+        y = (m12 + m21) / s
+        z = 0.25 * s
+    return float(x), float(y), float(z), float(w)
 
 
 def _make_pointcloud2(header: Header, xyz: np.ndarray, rgb: np.ndarray) -> PointCloud2:

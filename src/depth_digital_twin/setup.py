@@ -29,8 +29,6 @@ setup(
             'world_origin_node = depth_digital_twin.world_origin_node:main',
             'detection_node = depth_digital_twin.detection_node:main',
             'point_cloud_node = depth_digital_twin.point_cloud_node:main',
-            'cube_rcnn_node = depth_digital_twin.cube_rcnn_node:main',
-            'cube_point_cloud_node = depth_digital_twin.cube_point_cloud_node:main',
         ],
     },
 )

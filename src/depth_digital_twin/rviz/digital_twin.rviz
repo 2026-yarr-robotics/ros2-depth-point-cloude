@@ -30,14 +30,19 @@ Visualization Manager:
       Size (Pixels): 2
       Enabled: true
     - Class: rviz_default_plugins/MarkerArray
-      Name: ConvexHulls
+      Name: ObjectBoxes
       Topic:
-        Value: /digital_twin/hulls
+        Value: /digital_twin/boxes
       Enabled: true
     - Class: rviz_default_plugins/Image
-      Name: DetectionDebug
+      Name: segmentation debug
       Topic:
         Value: /digital_twin/detection_debug
+      Enabled: true
+    - Class: rviz_default_plugins/Image
+      Name: 3d pos debug
+      Topic:
+        Value: /digital_twin/box_debug
       Enabled: true
   Global Options:
     Background Color: 30; 30; 30

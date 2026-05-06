@@ -34,37 +34,18 @@ point_cloud_node:
     depth_topic: /camera/camera/aligned_depth_to_color/image_raw
     detections_topic: /digital_twin/detections
     points_topic: /digital_twin/points
-    hulls_topic: /digital_twin/hulls
+    boxes_topic: /digital_twin/boxes
+    box_debug_topic: /digital_twin/box_debug
     downsample: 2
     z_min: 0.1
     z_max: 4.0
-    hull_line_width: 0.0015
+    box_line_width: 0.0015
+    box_alpha: 0.25
+    # 3D position-box pose decision (cup-tuned).
+    # ratio = z_extent / max(x_extent, y_extent); above this => standing (AABB).
+    box_standing_ratio: 0.8
+    # Below this PCA elongation a fallen-candidate cluster falls back to AABB.
+    box_min_elongation: 1.5
+    # Disable yaw OBB entirely (keep AABB always); useful for debugging.
+    box_force_aabb: false
     approx_sync_slop: 0.05
-
-# -----------------------------------------------------------------------------
-# Cube R-CNN pipeline (independent of YOLO above)
-# -----------------------------------------------------------------------------
-cube_rcnn_node:
-  ros__parameters:
-    # Set these via launch args (config_file:= weights:= device:=).
-    config_file: ""
-    weights: ""
-    device: cuda
-    confidence: 0.25
-    target_classes: [""]   # empty -> keep all Omni3D classes
-    image_topic: /camera/camera/color/image_raw
-    detections_topic: /digital_twin/cube_detections
-    debug_topic: /digital_twin/cube_debug
-
-cube_point_cloud_node:
-  ros__parameters:
-    rgb_topic: /camera/camera/color/image_raw
-    depth_topic: /camera/camera/aligned_depth_to_color/image_raw
-    detections_topic: /digital_twin/cube_detections
-    points_topic: /digital_twin/cube_points
-    boxes_topic: /digital_twin/cube_boxes
-    z_min: 0.1
-    z_max: 4.0
-    obb_inflate: 0.02       # m, padding when filtering depth points by OBB
-    approx_sync_slop: 0.05
-    box_alpha: 0.25         # transparent CUBE marker on top of outline
