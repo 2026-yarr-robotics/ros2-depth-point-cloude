@@ -22,7 +22,10 @@ class DetectionNode(Node):
     def __init__(self) -> None:
         super().__init__('detection_node')
 
-        self.declare_parameter('model', 'yolov26n-seg.pt')
+        # Default to YOLO26 (released 2026-01). Note the naming convention:
+        # YOLOv5/v8 use a 'v' prefix (yolov8n-seg.pt), YOLO11/12/26 do not
+        # (yolo26n-seg.pt). For a fine-tuned model, pass an absolute path.
+        self.declare_parameter('model', 'yolo26n-seg.pt')
         self.declare_parameter('target_classes', ['scissors'])
         self.declare_parameter('confidence', 0.35)
         self.declare_parameter('image_topic', '/camera/camera/color/image_raw')
@@ -45,9 +48,12 @@ class DetectionNode(Node):
         except FileNotFoundError as e:
             raise RuntimeError(
                 f"Ultralytics could not download or locate '{model_name}'. "
-                f"This usually means the package version does not know that "
-                f"weight name. Try one of: yolov8n-seg.pt / yolo11n-seg.pt / "
-                f"yolo12n-seg.pt, or upgrade ultralytics:\n"
+                f"This usually means the installed ultralytics version does "
+                f"not know that weight name. Recent valid names:\n"
+                f"  yolo26n-seg.pt / yolo26s-seg.pt   (YOLO26, no 'v' prefix)\n"
+                f"  yolo11n-seg.pt / yolo12n-seg.pt   (YOLO11/12)\n"
+                f"  yolov8n-seg.pt                    (YOLOv8 — broadest fallback)\n"
+                f"Or upgrade ultralytics:\n"
                 f"    pip install --user -U ultralytics") from e
         if device:
             self.model.to(device)

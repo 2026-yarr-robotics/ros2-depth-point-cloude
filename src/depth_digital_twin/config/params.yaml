@@ -7,21 +7,21 @@
 world_origin_node:
   ros__parameters:
     depth_topic: /camera/camera/aligned_depth_to_color/image_raw
-    window_radius: 20            # px patch radius around centre for plane fit
+    window_radius: 30            # px patch radius around centre for plane fit
     min_patch_points: 100        # min valid pixels in patch
-    max_plane_residual: 0.01     # m — reject noisy plane fits
+    max_plane_residual: 0.025     # m — reject noisy plane fits
     samples_required: 10         # frames to average before publishing TF
 
 detection_node:
   ros__parameters:
-    # If your ultralytics version supports it, you can switch to
-    #   yolo11n-seg.pt, yolo12n-seg.pt, or yolov26n-seg.pt
-    # yolov8n-seg.pt is the broadest fallback (works with old ultralytics
-    # versions and includes COCO 'scissors' class).
-    model: yolov8n-seg.pt
+    # Naming: YOLOv5/v8 use a 'v' prefix; YOLO11/12/26 do not.
+    #   yolo26n-seg.pt | yolo11n-seg.pt | yolo12n-seg.pt   (recent — no 'v')
+    #   yolov8n-seg.pt                                       (broadest fallback)
+    # For a fine-tuned model, pass an absolute path (.pt).
+    model: /home/eunwoosong/Projects/ros2-depth-point-cloude/vision/yolo/yolo26m-seg-best.pt
     # COCO has no "can" class. Beverage cans are usually detected as "bottle"
     # (taller cans) or "cup". Include both to cover most can shapes.
-    target_classes: ["bottle", "cup"]
+    target_classes: ["cup"]
     confidence: 0.35
     image_topic: /camera/camera/color/image_raw
     detections_topic: /digital_twin/detections
@@ -48,4 +48,13 @@ point_cloud_node:
     box_min_elongation: 1.5
     # Disable yaw OBB entirely (keep AABB always); useful for debugging.
     box_force_aabb: false
+    # Shrink YOLO mask by N pixels (cv2.erode, ellipse kernel) before sampling
+    # depth. Drops mixed-pixel/background depth at the segmentation boundary.
+    # 0 = disabled. Try 5-7 for noisier YOLO masks at longer distance.
+    mask_erode_px: 10
+    # Per-axis MAD outlier filter on the world-frame points before fitting the
+    # box. k=3.0 ≈ 3σ for Gaussian noise — kills single-pixel depth spikes
+    # (specular/transparent/mixed pixel) that make the box jump frame-to-frame.
+    # Lower (2.0) = more aggressive; 0 = disabled.
+    box_outlier_mad_k: 3.0
     approx_sync_slop: 0.05

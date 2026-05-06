@@ -85,6 +85,16 @@ class PointCloudNode(Node):
         self.declare_parameter('box_standing_ratio', 0.8)
         self.declare_parameter('box_min_elongation', 1.5)
         self.declare_parameter('box_force_aabb', False)
+        # Pixels to erode the YOLO mask before sampling depth points for the
+        # 3D box. YOLO seg boundaries are noisy and depth at object edges is
+        # frequently a mixed/foreground+background pixel. 0 disables.
+        self.declare_parameter('mask_erode_px', 3)
+        # Per-axis MAD-based outlier filter on the world-frame point cluster
+        # before fitting the box. Drops points whose deviation from the median
+        # on any axis exceeds k * 1.4826 * MAD (k≈3 ⇒ 3σ for Gaussian noise).
+        # Catches single-pixel depth spikes (specular/transparent/mixed pixel)
+        # that otherwise inflate the AABB. 0 disables.
+        self.declare_parameter('box_outlier_mad_k', 3.0)
         self.declare_parameter('approx_sync_slop', 0.05)
         self.declare_parameter('objects_only', True)
 
@@ -105,6 +115,9 @@ class PointCloudNode(Node):
         self.standing_ratio: float = float(self.get_parameter('box_standing_ratio').value)
         self.min_elongation: float = float(self.get_parameter('box_min_elongation').value)
         self.force_aabb: bool = bool(self.get_parameter('box_force_aabb').value)
+        self.mask_erode_px: int = max(0, int(self.get_parameter('mask_erode_px').value))
+        self.outlier_mad_k: float = max(
+            0.0, float(self.get_parameter('box_outlier_mad_k').value))
         self.objects_only: bool = bool(self.get_parameter('objects_only').value)
         slop: float = float(self.get_parameter('approx_sync_slop').value)
 
@@ -224,7 +237,11 @@ class PointCloudNode(Node):
 
         n_drawn = 0
         for i, (obj, mb) in enumerate(per_object_masks):
-            obj_valid = mb & valid
+            mb_box = self._erode_mask(mb)
+            # Fallback: if erosion ate the whole mask (small object) use raw.
+            if mb_box.sum() < 32:
+                mb_box = mb
+            obj_valid = mb_box & valid
             if obj_valid.sum() < 32:
                 continue
             oy, ox = np.where(obj_valid)
@@ -233,6 +250,7 @@ class PointCloudNode(Node):
             ocy = (oy.astype(np.float32) - self.intr.cy) * oz / self.intr.fy
             obj_cam = np.stack([ocx, ocy, oz], axis=1)
             obj_world = (R_wc @ obj_cam.T).T + t_wc
+            obj_world = _filter_outliers(obj_world, self.outlier_mad_k)
 
             box = _compute_box_world(
                 obj_world,
@@ -379,6 +397,16 @@ class PointCloudNode(Node):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, bgr_colour, 2)
 
     # ------------------------------------------------------------------
+    def _erode_mask(self, mb: np.ndarray) -> np.ndarray:
+        """Shrink the YOLO mask by `mask_erode_px` to drop edge pixels whose
+        depth is unreliable (mixed foreground/background). No-op if disabled."""
+        if self.mask_erode_px <= 0:
+            return mb
+        k = self.mask_erode_px
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1))
+        eroded = cv2.erode(mb.astype(np.uint8), kernel, iterations=1)
+        return eroded > 0
+
     def _publish_clear_markers(self, stamp) -> None:
         clear = MarkerArray()
         d = Marker()
@@ -403,6 +431,24 @@ class PointCloudNode(Node):
 # ----------------------------------------------------------------------
 # Geometry helpers
 # ----------------------------------------------------------------------
+def _filter_outliers(points: np.ndarray, mad_k: float) -> np.ndarray:
+    """Drop points whose per-axis absolute deviation from the median exceeds
+    `mad_k * 1.4826 * MAD` (≈ k·σ under Gaussian noise). Returns the filtered
+    subset; falls back to the original cluster if filtering would leave too
+    few points to fit a box."""
+    if mad_k <= 0.0 or points.shape[0] < 16:
+        return points
+    med = np.median(points, axis=0)
+    abs_dev = np.abs(points - med)
+    mad = np.median(abs_dev, axis=0)
+    # Avoid divide-by-zero on a perfectly flat axis.
+    threshold = mad_k * 1.4826 * np.maximum(mad, 1e-6)
+    keep = np.all(abs_dev <= threshold, axis=1)
+    if int(keep.sum()) < 16:
+        return points
+    return points[keep]
+
+
 def _compute_box_world(points: np.ndarray, *,
                        standing_ratio: float, min_elongation: float,
                        force_aabb: bool):
