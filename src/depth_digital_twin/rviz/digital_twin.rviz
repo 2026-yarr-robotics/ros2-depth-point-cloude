@@ -44,6 +44,19 @@ Visualization Manager:
       Topic:
         Value: /digital_twin/box_debug
       Enabled: true
+    - Class: rviz_default_plugins/Image
+      Name: depth debug
+      Topic:
+        Value: /digital_twin/depth_debug
+      Enabled: true
+    - Class: rviz_default_plugins/RobotModel
+      Name: RobotModel
+      Description Source: Topic
+      Description Topic:
+        Value: /robot_description
+      Enabled: true
+      Visual Enabled: true
+      Collision Enabled: false
   Global Options:
     Background Color: 30; 30; 30
     Fixed Frame: world
