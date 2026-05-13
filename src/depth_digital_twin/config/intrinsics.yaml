@@ -1,15 +1,15 @@
-image_width: 640
-image_height: 480
+image_width: 1280
+image_height: 720
 camera_matrix:
   rows: 3
   cols: 3
   data:
-  - 575.7888164214925
+  - 910.8783569335938
   - 0.0
-  - 320.0673113982821
+  - 646.3231201171875
   - 0.0
-  - 578.5664528632778
-  - 248.77648522510222
+  - 910.978515625
+  - 370.4569091796875
   - 0.0
   - 0.0
   - 1.0
@@ -17,9 +17,13 @@ distortion_coefficients:
   rows: 1
   cols: 5
   data:
-  - 0.15194899199977532
-  - 0.06604848130833434
-  - -0.024868973702217658
-  - -0.004839255601599459
-  - -1.0985977564712777
-reprojection_error: 0.6516088126151413
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+reprojection_error: 0.0
+# Source: RealSense factory intrinsics from /camera/camera/color/camera_info topic.
+# RealSense publishes already-rectified images → distortion = 0.
+# Previous chessboard-calibrated values had fy 15% off (788 vs real 911), causing
+# objects to appear at wrong world positions.  Factory values are far more reliable.

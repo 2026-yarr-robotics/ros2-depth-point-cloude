@@ -26,10 +26,9 @@ setup(
         'console_scripts': [
             'capture_chessboard = depth_digital_twin.capture_chessboard:main',
             'calibrate = depth_digital_twin.calibration:main',
-            'aruco_calibrate = depth_digital_twin.aruco_calibrate:main',
-            'aruco_handeye = depth_digital_twin.aruco_handeye:main',
             'robot_pose_bridge_node = depth_digital_twin.robot_pose_bridge_node:main',
             'world_origin_node = depth_digital_twin.world_origin_node:main',
+            'world_origin_control = depth_digital_twin.world_origin_control:main',
             'detection_node = depth_digital_twin.detection_node:main',
             'point_cloud_node = depth_digital_twin.point_cloud_node:main',
         ],

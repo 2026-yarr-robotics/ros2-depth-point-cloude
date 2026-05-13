@@ -3,42 +3,54 @@
     camera_frame: camera_color_optical_frame
     world_frame: world
     depth_unit: 0.001  # RealSense aligned_depth_to_color is uint16 mm
-    # Floor-patch sampling — single source of truth shared by:
-    #   • world_origin_node (plane fit for camera→world TF)
-    #   • point_cloud_node  (draws the patch box on /digital_twin/depth_debug)
-    window_radius: 30                  # px patch radius around centre
-    window_center_x_px: 640             # -1 = image centre, else absolute u
-    window_center_y_px: 600             # -1 = image centre, else absolute v
+    # Floor-patch sampling (world_origin_node floor mode + point_cloud_node debug box)
+    window_radius: 30
+    window_center_x_px: 640
+    window_center_y_px: 600
 
 world_origin_node:
   ros__parameters:
+    # ── Mode: aruco (default) | floor (legacy depth plane fit) ────────────
+    world_origin_mode: aruco
+
+    # ── ArUco mode ─────────────────────────────────────────────────────────
+    color_topic: /camera/camera/color/image_raw
+    world_marker_id: 0
+    world_marker_dict: DICT_4X4_50        # 4x4 marker dict; only ID 0 used
+    world_marker_length_m: 0.10           # marker side length (m) — MEASURE AND SET
+    world_marker_samples_required: 30     # detection frames to average
+    world_marker_reproj_err_max_px: 2.0   # solvePnP reprojection error limit (px)
+    world_marker_timeout_s: 15.0          # fallback to floor after this many seconds
+    aruco_timeout_then_floor: true
+
+    # Marker position in the ROBOT BASE frame (metres, measured physically).
+    world_marker_offset_x_m: 0.367
+    world_marker_offset_y_m: 0.003
+    world_marker_offset_z_m: 0.0         # height of marker surface in base frame
+
+    # Marker frame orientation relative to BASE frame (Euler intrinsic XYZ, deg).
+    # For a flat marker (normal = base +Z), only rot_z_deg matters — it rotates
+    # the marker's pattern-top direction to align with base +Y in RViz.
+    world_marker_rot_x_deg: 0.0
+    world_marker_rot_y_deg: 0.0
+    world_marker_rot_z_deg: -90.0
+
+    # ── Floor fallback params ──────────────────────────────────────────────
     depth_topic: /camera/camera/aligned_depth_to_color/image_raw
-    min_patch_points: 100        # min valid pixels in patch
-    max_plane_residual: 0.1     # m — reject noisy plane fits
-    samples_required: 10         # frames to average before publishing TF
-    # Hand-eye calibration result. Empty string ⇒ floor-plane fit (legacy).
-    # Naming convention picks the mode:
-    #   T_exo2base*.npy  → eye-to-hand (camera fixed; static TF, world=base)
-    #   T_hand2base*.npy → eye-in-hand (camera on EE; needs live robot pose)
-    calibration_matrix_path: /home/eunwoosong/Projects/ros2-depth-point-cloude/src/depth_digital_twin/config/T_exo2base.npy
-    calibration_translation_unit: "mm"            # mm | m  (Doosan default mm)
-    calibration_fallback_to_floor_fit: true
+    min_patch_points: 100
+    max_plane_residual: 0.1
+    samples_required: 10
 
 detection_node:
   ros__parameters:
-    # Naming: YOLOv5/v8 use a 'v' prefix; YOLO11/12/26 do not.
-    #   yolo26n-seg.pt | yolo11n-seg.pt | yolo12n-seg.pt   (recent — no 'v')
-    #   yolov8n-seg.pt                                       (broadest fallback)
-    # For a fine-tuned model, pass an absolute path (.pt).
     model: /home/eunwoosong/Projects/ros2-depth-point-cloude/vision/yolo/yolo26m-seg-best.pt
-    # COCO has no "can" class. Beverage cans are usually detected as "bottle"
-    # (taller cans) or "cup". Include both to cover most can shapes.
     target_classes: ["cup"]
     confidence: 0.35
     image_topic: /camera/camera/color/image_raw
     detections_topic: /digital_twin/detections
     debug_topic: /digital_twin/detection_debug
     device: ""
+    imgsz: 1280
 
 point_cloud_node:
   ros__parameters:
@@ -53,53 +65,26 @@ point_cloud_node:
     z_max: 4.0
     box_line_width: 0.0015
     box_alpha: 0.25
-    # 3D position-box pose decision (cup-tuned).
-    # ratio = z_extent / max(x_extent, y_extent); above this => standing (AABB).
     box_standing_ratio: 0.8
-    # Below this PCA elongation a fallen-candidate cluster falls back to AABB.
     box_min_elongation: 1.5
-    # Disable yaw OBB entirely (keep AABB always); useful for debugging.
     box_force_aabb: false
-    # Shrink YOLO mask by N pixels (cv2.erode, ellipse kernel) before sampling
-    # depth. Drops mixed-pixel/background depth at the segmentation boundary.
-    # 0 = disabled. Try 5-7 for noisier YOLO masks at longer distance.
-    mask_erode_px: 10
-    # Per-axis MAD outlier filter on the world-frame points before fitting the
-    # box. k=3.0 ≈ 3σ for Gaussian noise — kills single-pixel depth spikes
-    # (specular/transparent/mixed pixel) that make the box jump frame-to-frame.
-    # Lower (2.0) = more aggressive; 0 = disabled.
+    mask_erode_px: 13
+    depth_gradient_max_m: 0.015
     box_outlier_mad_k: 3.0
     approx_sync_slop: 0.05
 
-    # ----- Cup model (Speed Stack-style truncated cone, standing only) -----
-    # Known frustum dimensions — used to size the box (so self-occlusion of the
-    # back side doesn't shrink it) and to render a parametric cup polygon.
+    # ----- Cup model (Speed Stack truncated cone, standing only) -----
     cup_top_diameter_m: 0.054
     cup_bottom_diameter_m: 0.078
     cup_height_m: 0.095
-    # Discretisation of the top/bottom circles for the LINE_STRIP markers.
     cup_polygon_segments: 24
-    # EMA on the cup-axis XY: smoothed = α·new + (1-α)·prev. Smaller α =
-    # heavier smoothing. Set 1.0 to disable.
     cup_smoothing_alpha: 0.3
-    # Greedy nearest-neighbour matching threshold (m) between consecutive
-    # frames within the same class. Larger = more lenient association.
-    cup_track_max_dist_m: 0.15
-    # Keep a track (and its markers) alive this many frames after detection
-    # drops, to suppress flicker when YOLO momentarily loses the object.
     cup_track_keepalive_frames: 10
-    # Reject the cup-axis fit (and fall back to the existing AABB/OBB path)
-    # when the LS residual exceeds this. Tunable per scene noise.
-    # Note: the cup base elevation (z) is auto-detected per cluster as the
-    # robust 5th-percentile world Z, so cups sitting on tables/shelves work
-    # without any global floor assumption.
     cup_fit_residual_max: 0.02
 
     # ----- Accumulating-window pipeline -----
-    # Per-frame depth is too noisy for a single-shot fit. The node buffers
-    # per-track world points across frames within this window (≈7-8 frames
-    # at 15 Hz), MAD-filters the aggregate, fits once, and publishes the
-    # union cloud + markers exactly once per window. RViz therefore updates
-    # at 1 / window_period_s Hz; the per-frame /detection_debug, /box_debug
-    # and /depth_debug image streams are unaffected.
     window_period_s: 0.1
+
+    # ----- ArUco marker axes overlay on box_debug -----
+    aruco_overlay: true
+    world_marker_length_m: 0.05         # must match world_origin_node value

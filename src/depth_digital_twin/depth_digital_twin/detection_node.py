@@ -32,6 +32,7 @@ class DetectionNode(Node):
         self.declare_parameter('detections_topic', '/digital_twin/detections')
         self.declare_parameter('debug_topic', '/digital_twin/detection_debug')
         self.declare_parameter('device', '')  # '', 'cpu', '0'
+        self.declare_parameter('imgsz', 640)  # YOLO inference resolution (px)
 
         # Lazy import so the package can be inspected without ultralytics installed.
         try:
@@ -61,6 +62,7 @@ class DetectionNode(Node):
         self.targets: set[str] = {
             s.lower() for s in self.get_parameter('target_classes').value}
         self.conf: float = float(self.get_parameter('confidence').value)
+        self.imgsz: int = int(self.get_parameter('imgsz').value)
         self.bridge = CvBridge()
 
         # Resolve target class IDs from model.names.
@@ -85,8 +87,12 @@ class DetectionNode(Node):
     def _on_image(self, msg: Image) -> None:
         bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         h, w = bgr.shape[:2]
-        results = self.model.predict(
-            source=bgr, conf=self.conf, verbose=False, classes=list(self.target_ids) or None)
+        # persist=True keeps ByteTrack state across frames so boxes.id is
+        # stable per instance — the downstream tracker in point_cloud_node
+        # consumes that id directly instead of XY nearest-neighbour matching.
+        results = self.model.track(
+            source=bgr, conf=self.conf, verbose=False, imgsz=self.imgsz,
+            classes=list(self.target_ids) or None, persist=True)
         if not results:
             return
         r = results[0]
@@ -115,6 +121,15 @@ class DetectionNode(Node):
         except AttributeError:  # already numpy
             masks = np.asarray(masks_t)
 
+        # boxes.id is None until ByteTrack promotes detections to confirmed
+        # tracks (first 1-2 frames, or low-confidence noise). We forward -1 in
+        # that case; point_cloud_node skips those entries.
+        ids_t = getattr(boxes, 'id', None)
+        if ids_t is not None:
+            ids = ids_t.cpu().numpy() if hasattr(ids_t, 'cpu') else np.asarray(ids_t)
+        else:
+            ids = None
+
         for i in range(masks.shape[0]):
             cls_id = int(boxes.cls[i].item()) if hasattr(boxes.cls[i], 'item') else int(boxes.cls[i])
             score = float(boxes.conf[i].item()) if hasattr(boxes.conf[i], 'item') else float(boxes.conf[i])
@@ -124,6 +139,7 @@ class DetectionNode(Node):
             xyxy = boxes.xyxy[i]
             xyxy = xyxy.cpu().numpy() if hasattr(xyxy, 'cpu') else np.asarray(xyxy)
             x1, y1, x2, y2 = (int(round(v)) for v in xyxy.tolist())
+            inst_id = int(ids[i]) if ids is not None else -1
 
             # Resize mask to source frame and binarise.
             mask_src = cv2.resize(masks[i], (w, h), interpolation=cv2.INTER_NEAREST)
@@ -132,6 +148,7 @@ class DetectionNode(Node):
             obj = SegmentedObject()
             obj.class_name = name
             obj.class_id = cls_id
+            obj.instance_id = inst_id
             obj.score = score
             obj.x_min = max(0, x1)
             obj.y_min = max(0, y1)
@@ -142,7 +159,8 @@ class DetectionNode(Node):
             out.objects.append(obj)
 
             cv2.rectangle(debug, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(debug, f'{name} {score:.2f}', (x1, max(0, y1 - 6)),
+            id_tag = f'#{inst_id}' if inst_id >= 0 else '#?'
+            cv2.putText(debug, f'{id_tag} {name} {score:.2f}', (x1, max(0, y1 - 6)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             tint = np.zeros_like(debug)
             tint[mask_u8 > 0] = (0, 0, 255)

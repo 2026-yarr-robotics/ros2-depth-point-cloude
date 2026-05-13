@@ -90,6 +90,12 @@ class PointCloudNode(Node):
         # 3D box. YOLO seg boundaries are noisy and depth at object edges is
         # frequently a mixed/foreground+background pixel. 0 disables.
         self.declare_parameter('mask_erode_px', 3)
+        # Depth-Laplacian threshold (m) for the mixed-pixel filter. A pixel is
+        # rejected when |∇²z| exceeds this — i.e. it sits on a depth discontinuity
+        # (cup silhouette vs background table) where the stereo correlator
+        # averaged two surfaces and the deprojected point lands outside the
+        # true geometry. 0 disables.
+        self.declare_parameter('depth_gradient_max_m', 0.015)
         # Per-axis MAD-based outlier filter on the world-frame point cluster
         # before fitting the box. Drops points whose deviation from the median
         # on any axis exceeds k * 1.4826 * MAD (k≈3 ⇒ 3σ for Gaussian noise).
@@ -105,7 +111,6 @@ class PointCloudNode(Node):
         self.declare_parameter('cup_height_m', 0.095)
         self.declare_parameter('cup_polygon_segments', 24)
         self.declare_parameter('cup_smoothing_alpha', 0.3)
-        self.declare_parameter('cup_track_max_dist_m', 0.15)
         self.declare_parameter('cup_track_keepalive_frames', 10)
         self.declare_parameter('cup_fit_residual_max', 0.02)
         self.declare_parameter('cup_class_names', ['cup'])
@@ -123,6 +128,10 @@ class PointCloudNode(Node):
         self.declare_parameter('window_radius', 30)
         self.declare_parameter('window_center_x_px', -1)
         self.declare_parameter('window_center_y_px', -1)
+
+        # ArUco marker axes overlay on box_debug (uses calibrated TF, not real-time detect)
+        self.declare_parameter('aruco_overlay', True)
+        self.declare_parameter('world_marker_length_m', 0.05)
 
         path = Path(self.get_parameter('intrinsics_path').value)
         if not path.is_file():
@@ -142,6 +151,8 @@ class PointCloudNode(Node):
         self.min_elongation: float = float(self.get_parameter('box_min_elongation').value)
         self.force_aabb: bool = bool(self.get_parameter('box_force_aabb').value)
         self.mask_erode_px: int = max(0, int(self.get_parameter('mask_erode_px').value))
+        self.depth_grad_max: float = max(
+            0.0, float(self.get_parameter('depth_gradient_max_m').value))
         self.outlier_mad_k: float = max(
             0.0, float(self.get_parameter('box_outlier_mad_k').value))
         self.objects_only: bool = bool(self.get_parameter('objects_only').value)
@@ -150,7 +161,6 @@ class PointCloudNode(Node):
         self.cup_h: float = float(self.get_parameter('cup_height_m').value)
         self.cup_n_seg: int = max(8, int(self.get_parameter('cup_polygon_segments').value))
         self.cup_alpha: float = float(self.get_parameter('cup_smoothing_alpha').value)
-        self.cup_max_dist: float = float(self.get_parameter('cup_track_max_dist_m').value)
         self.cup_keepalive: int = int(self.get_parameter('cup_track_keepalive_frames').value)
         self.cup_resid_max: float = float(self.get_parameter('cup_fit_residual_max').value)
         self.cup_class_names: set[str] = {
@@ -161,16 +171,16 @@ class PointCloudNode(Node):
         self.window_period_s: float = max(
             1e-3, float(self.get_parameter('window_period_s').value))
 
-        # Per-class greedy tracker keyed by track id. Per-track state:
+        # Tracks keyed by Ultralytics ByteTrack instance id (forwarded via
+        # SegmentedObject.instance_id from detection_node). Per-track state:
         #   class_name              str
-        #   center_xy               np.ndarray (smoothed; also used for assoc)
+        #   center_xy               np.ndarray (EMA-smoothed cup centre)
         #   z_base                  float | None  (smoothed; None until first fit)
         #   points_buf, colors_buf  list[np.ndarray] — accumulated within window
         #   miss                    int — windows without any new points
         #   last_state              dict | None — last successful fit / render
         #   last_score, last_display_name, last_residual — for the label
         self._tracks: dict[int, dict] = {}
-        self._next_track_id: int = 1
         self._last_published_ids: set[int] = set()
         self._window_start_stamp = None  # rclpy.time.Time, set on first frame
 
@@ -206,6 +216,11 @@ class PointCloudNode(Node):
         self.sync.registerCallback(self._on_synced)
         self.get_logger().info('point_cloud_node ready (waiting for synced frames)')
 
+        # ── ArUco axis overlay (TF-based, not real-time detection) ────────
+        self._aruco_overlay = bool(self.get_parameter('aruco_overlay').value)
+        self._aruco_axis_len = float(
+            self.get_parameter('world_marker_length_m').value) * 0.8
+
     # ------------------------------------------------------------------
     def _on_synced(self, rgb_msg: Image, depth_msg: Image,
                    det_msg: SegmentedObjectArray) -> None:
@@ -240,6 +255,12 @@ class PointCloudNode(Node):
 
         z = depth.astype(np.float32) * self.depth_unit
         valid = (z > self.z_min) & (z < self.z_max)
+        if self.depth_grad_max > 0.0:
+            # Mixed-pixel reject: |∇²z| at object silhouettes is large because
+            # the stereo correlator averaged the cup surface with the background.
+            # Killing those pixels collapses the inflated "ring" outside the cup.
+            gz = cv2.Laplacian(z, cv2.CV_32F, ksize=3)
+            valid &= np.abs(gz) < self.depth_grad_max
 
         union_mask = np.zeros((h, w), dtype=bool)
         per_object_masks: list[tuple[object, np.ndarray]] = []
@@ -275,10 +296,30 @@ class PointCloudNode(Node):
             bgr = rgb[oy, ox]
             obj_rgb_packed = _pack_rgb(bgr[:, 2], bgr[:, 1], bgr[:, 0])
 
+            inst_id = int(getattr(obj, 'instance_id', -1))
+            if inst_id < 0:
+                # ByteTrack hasn't promoted this detection yet — skip rather
+                # than mint a synthetic id that would collide with future
+                # tracker ids.
+                continue
             class_name = (obj.class_name or '').lower()
             centroid_xy = np.median(obj_world[:, :2], axis=0)
-            tid = self._associate_to_track(class_name, centroid_xy)
-            track = self._tracks[tid]
+            tid = inst_id
+            track = self._tracks.get(tid)
+            if track is None:
+                track = {
+                    'class_name': class_name,
+                    'center_xy': np.asarray(centroid_xy, dtype=np.float64).copy(),
+                    'z_base': None,
+                    'points_buf': [],
+                    'colors_buf': [],
+                    'miss': 0,
+                    'last_state': None,
+                    'last_score': 0.0,
+                    'last_display_name': obj.class_name or class_name,
+                    'last_residual': 0.0,
+                }
+                self._tracks[tid] = track
             track['points_buf'].append(obj_world)
             track['colors_buf'].append(obj_rgb_packed)
             track['last_score'] = float(obj.score)
@@ -302,6 +343,7 @@ class PointCloudNode(Node):
                     debug_img, ls['frustum'], colour, R_wc, t_wc)
             n_drawn += 1
         self._annotate_status(debug_img, n_drawn)
+        self._draw_aruco_axes(debug_img)
         self._publish_debug(debug_img, rgb_msg.header)
 
         # Window check — finalize after window_period_s elapsed.
@@ -313,39 +355,6 @@ class PointCloudNode(Node):
         if elapsed >= self.window_period_s:
             self._finalize_window(rgb_msg.header.stamp)
             self._window_start_stamp = now
-
-    # ------------------------------------------------------------------
-    def _associate_to_track(self, class_name: str,
-                            centroid_xy: np.ndarray) -> int:
-        """Greedy nearest-neighbour match within the same class against the
-        last smoothed centre. Spawns a new track on no match. Returns track
-        id."""
-        best_tid = -1
-        best_d = self.cup_max_dist
-        for tid, track in self._tracks.items():
-            if track['class_name'] != class_name:
-                continue
-            d = float(np.linalg.norm(centroid_xy - track['center_xy']))
-            if d < best_d:
-                best_d = d
-                best_tid = tid
-        if best_tid >= 0:
-            return best_tid
-        tid = self._next_track_id
-        self._next_track_id += 1
-        self._tracks[tid] = {
-            'class_name': class_name,
-            'center_xy': np.asarray(centroid_xy, dtype=np.float64).copy(),
-            'z_base': None,
-            'points_buf': [],
-            'colors_buf': [],
-            'miss': 0,
-            'last_state': None,
-            'last_score': 0.0,
-            'last_display_name': class_name,
-            'last_residual': 0.0,
-        }
-        return tid
 
     # ------------------------------------------------------------------
     def _finalize_window(self, stamp) -> None:
@@ -716,6 +725,62 @@ class PointCloudNode(Node):
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1))
         eroded = cv2.erode(mb.astype(np.uint8), kernel, iterations=1)
         return eroded > 0
+
+    def _draw_aruco_axes(self, img: np.ndarray) -> None:
+        """Project calibrated world (base) and ArUco marker frames onto the debug image.
+
+        Both transforms are published once by world_origin_node at calibration
+        time and looked up from the TF tree — no real-time marker detection needed.
+        """
+        if not self._aruco_overlay:
+            return
+        dist = getattr(self.intr, 'dist', None)
+
+        def _project_label(tvec_3: np.ndarray, text: str, colour) -> None:
+            z = float(tvec_3[2])
+            if z < 0.01:
+                return
+            px = self.intr.K @ tvec_3 / z
+            cv2.putText(img, text, (int(px[0]) + 8, int(px[1]) - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, colour, 2, cv2.LINE_AA)
+
+        # ── world frame = robot base origin ──────────────────────────────
+        try:
+            tf_w = self.tf_buffer.lookup_transform(
+                self.camera_frame, self.world_frame, rclpy.time.Time())
+            tw = tf_w.transform.translation
+            qw = tf_w.transform.rotation
+            tvec_w = np.array([[tw.x], [tw.y], [tw.z]], dtype=np.float64)
+            if float(tw.z) > 0.01:
+                R_cw = _quat_to_rot(qw.x, qw.y, qw.z, qw.w)
+                rvec_w, _ = cv2.Rodrigues(R_cw)
+                cv2.drawFrameAxes(img, self.intr.K, dist, rvec_w, tvec_w,
+                                  self._aruco_axis_len * 1.5, thickness=3)
+                _project_label(np.array([tw.x, tw.y, tw.z]),
+                               'base', (255, 255, 255))
+        except (tf2_ros.LookupException,
+                tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException):
+            pass
+
+        # ── aruco marker frame ────────────────────────────────────────────
+        try:
+            tf_a = self.tf_buffer.lookup_transform(
+                self.camera_frame, 'aruco', rclpy.time.Time())
+            ta = tf_a.transform.translation
+            qa = tf_a.transform.rotation
+            tvec_a = np.array([[ta.x], [ta.y], [ta.z]], dtype=np.float64)
+            if float(ta.z) > 0.01:
+                R_ca = _quat_to_rot(qa.x, qa.y, qa.z, qa.w)
+                rvec_a, _ = cv2.Rodrigues(R_ca)
+                cv2.drawFrameAxes(img, self.intr.K, dist, rvec_a, tvec_a,
+                                  self._aruco_axis_len, thickness=2)
+                _project_label(np.array([ta.x, ta.y, ta.z]),
+                               'aruco', (0, 255, 255))
+        except (tf2_ros.LookupException,
+                tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException):
+            pass
 
     def _publish_clear_markers(self, stamp) -> None:
         clear = MarkerArray()

@@ -1,29 +1,26 @@
 """Bring up the depth digital twin alongside a Doosan URDF in RViz.
 
-The digital twin's `world` frame is published by `world_origin_node`. When a
-hand-eye calibration matrix (T_exo2base.npy / T_hand2base.npy) is loaded,
-that frame *is* the robot base, so the URDF can be attached to `world` via
-an identity static TF and the cup detections automatically render in the
-robot's coordinate system.
+world_origin_node detects the ArUco marker and sets world = robot base.
+The identity static TF world↔base_0 then grafts the URDF onto the digital
+twin TF tree so detections and the robot model share one coordinate frame.
 
 Prerequisites:
-  source ~/ros2_ws/install/setup.bash      # provides dsr_description2 share
+  source ~/ros2_ws/install/setup.bash          # dsr_description2
   source ~/ros2-depth-point-cloude/install/setup.bash
-
-Behaviour w.r.t. the live robot (per the spec):
-  * `with_pose_bridge:=true`  (default): a small bridge mirrors
-    `/dsr01/joint_states` → `/joint_states`. If `dsr_bringup2` is also up,
-    the URDF moves with the robot. If not, the bridge falls back to a
-    zero-joint default and the URDF stays in its home pose. Either way the
-    rest of the pipeline runs untouched.
-  * `with_pose_bridge:=false`: the user is expected to provide
-    `/joint_states` themselves (e.g. by running joint_state_publisher_gui or
-    a full dsr_bringup2 stack).
 
 Usage:
   ros2 launch depth_digital_twin digital_twin_with_robot.launch.py \\
-      model:=m0609 \\
-      calibration:=$PWD/src/depth_digital_twin/config/T_exo2base.npy
+      model:=m0609
+
+Args:
+  model            : Doosan model (default: m0609)
+  color            : robot color  (default: white)
+  name             : robot namespace, must match dsr_bringup2 (default: dsr01)
+  with_pose_bridge : bridge /dsr01/joint_states→/joint_states (default: true)
+  rviz             : launch RViz (default: true)
+  rviz_config      : path to .rviz file
+  intrinsics        : path to intrinsics.yaml
+  params            : path to params.yaml
 """
 import os
 
@@ -49,25 +46,29 @@ def generate_launch_description() -> LaunchDescription:
         description='Doosan model (m0609, m1013, ...)')
     color_arg = DeclareLaunchArgument(
         'color', default_value='white',
-        description='Robot model color (per dsr_description2)')
+        description='Robot model color')
     name_arg = DeclareLaunchArgument(
         'name', default_value='dsr01',
         description='Robot namespace (matches dsr_bringup2 default)')
     bridge_arg = DeclareLaunchArgument(
         'with_pose_bridge', default_value='true',
-        description='Bridge /dsr01/joint_states → /joint_states with default fallback')
-    calibration_arg = DeclareLaunchArgument(
-        'calibration', default_value='',
-        description='Absolute path to T_exo2base.npy / T_hand2base.npy (empty ⇒ floor-fit)')
+        description='Bridge /dsr01/joint_states → /joint_states with zero-joint fallback')
     rviz_arg = DeclareLaunchArgument(
         'rviz', default_value='true', description='Launch RViz')
     rviz_config_arg = DeclareLaunchArgument(
         'rviz_config',
-        default_value=PathJoinSubstitution(
-            [pkg_dt, 'rviz', 'digital_twin.rviz']),
-        description='RViz config')
+        default_value=PathJoinSubstitution([pkg_dt, 'rviz', 'digital_twin.rviz']),
+        description='RViz config file')
+    intrinsics_arg = DeclareLaunchArgument(
+        'intrinsics',
+        default_value=PathJoinSubstitution([pkg_dt, 'config', 'intrinsics.yaml']),
+        description='Absolute path to intrinsics.yaml')
+    params_arg = DeclareLaunchArgument(
+        'params',
+        default_value=PathJoinSubstitution([pkg_dt, 'config', 'params.yaml']),
+        description='Absolute path to params.yaml')
 
-    # ----- robot URDF (xacro) -----
+    # ----- robot URDF -----
     robot_description_content = Command([
         PathJoinSubstitution([FindExecutable(name='xacro')]),
         ' ',
@@ -75,24 +76,18 @@ def generate_launch_description() -> LaunchDescription:
         '.urdf.xacro',
         ' color:=', LaunchConfiguration('color'),
         ' name:=', LaunchConfiguration('name'),
-        # The remaining xacro args are required by dsr_description2 macros
-        # but irrelevant for visual-only rendering — pass placeholders.
         ' host:=127.0.0.1 port:=12345 mode:=virtual',
         ' rt_host:=127.0.0.1 update_rate:=100',
         ' model:=', LaunchConfiguration('model'),
     ])
-    robot_description = {
-        'robot_description': ParameterValue(
-            robot_description_content, value_type=str),
-    }
 
     robot_state_publisher = Node(
         package='robot_state_publisher',
         executable='robot_state_publisher',
         name='robot_state_publisher',
-        parameters=[robot_description],
-        output='screen',
-    )
+        parameters=[{'robot_description': ParameterValue(
+            robot_description_content, value_type=str)}],
+        output='screen')
 
     pose_bridge = Node(
         package='depth_digital_twin',
@@ -104,14 +99,10 @@ def generate_launch_description() -> LaunchDescription:
             'output_topic': '/joint_states',
         }],
         condition=IfCondition(LaunchConfiguration('with_pose_bridge')),
-        output='screen',
-    )
+        output='screen')
 
-    # world ↔ base_0: identity static TF when calibrated mode places `world`
-    # on the robot base (the eye-to-hand convention). This lets the URDF
-    # graft onto the digital_twin TF tree without a second world frame.
-    # Use the new-style flag args; positional `[x y z qx qy qz qw parent child]`
-    # is deprecated in ROS 2 Humble (still works but logs a WARN).
+    # world ↔ base_0 identity TF: world_origin_node places `world` on the robot
+    # base, so the URDF (rooted at base_0) can be grafted with an identity TF.
     world_to_base_tf = Node(
         package='tf2_ros', executable='static_transform_publisher',
         name='world_to_base_tf',
@@ -120,10 +111,8 @@ def generate_launch_description() -> LaunchDescription:
             '--qx', '0', '--qy', '0', '--qz', '0', '--qw', '1',
             '--frame-id', 'world', '--child-frame-id', 'base_0',
         ],
-        output='screen',
-    )
+        output='screen')
 
-    # ----- digital_twin pipeline -----
     digital_twin = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([
             PathJoinSubstitution([pkg_dt, 'launch', 'digital_twin.launch.py']),
@@ -131,12 +120,12 @@ def generate_launch_description() -> LaunchDescription:
         launch_arguments={
             'rviz': LaunchConfiguration('rviz'),
             'rviz_config': LaunchConfiguration('rviz_config'),
-            'calibration': LaunchConfiguration('calibration'),
-        }.items(),
-    )
+            'intrinsics': LaunchConfiguration('intrinsics'),
+            'params': LaunchConfiguration('params'),
+        }.items())
 
     return LaunchDescription([
-        model_arg, color_arg, name_arg, bridge_arg, calibration_arg,
-        rviz_arg, rviz_config_arg,
+        model_arg, color_arg, name_arg, bridge_arg,
+        rviz_arg, rviz_config_arg, intrinsics_arg, params_arg,
         robot_state_publisher, pose_bridge, world_to_base_tf, digital_twin,
     ])
