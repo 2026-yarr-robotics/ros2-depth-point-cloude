@@ -1,0 +1,81 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded: ~
+      Splitter Ratio: 0.5
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Plane Cell Count: 20
+      Reference Frame: <Fixed Frame>
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Marker Scale: 0.25
+      Show Names: true
+      Show Axes: true
+      Show Arrows: false
+    - Class: rviz_default_plugins/PointCloud2
+      Name: points_exo
+      Enabled: true
+      Topic:
+        Value: /digital_twin/points_exo
+        Reliability Policy: Reliable
+      Size (m): 0.004
+      Style: Points
+      Color Transformer: FlatColor
+      Color: 0; 200; 255
+    - Class: rviz_default_plugins/PointCloud2
+      Name: points_hand
+      Enabled: true
+      Topic:
+        Value: /digital_twin/points_hand
+        Reliability Policy: Reliable
+      Size (m): 0.004
+      Style: Points
+      Color Transformer: FlatColor
+      Color: 255; 140; 0
+    - Class: rviz_default_plugins/MarkerArray
+      Name: boxes_exo
+      Enabled: true
+      Topic:
+        Value: /digital_twin/boxes_exo
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/MarkerArray
+      Name: boxes_hand
+      Enabled: true
+      Topic:
+        Value: /digital_twin/boxes_hand
+        Reliability Policy: Reliable
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: world
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+      Distance: 2.0
+      Focal Point:
+        X: 0.3
+        Y: 0.0
+        Z: 0.2
+      Pitch: 0.5
+      Yaw: 0.9
+      Target Frame: world
+Window Geometry:
+  Height: 900
+  Width: 1500
+  Hide Left Dock: false
+  Hide Right Dock: true

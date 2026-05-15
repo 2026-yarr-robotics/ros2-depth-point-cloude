@@ -43,7 +43,12 @@ world_origin_node:
 
 detection_node:
   ros__parameters:
+    # `model` = default / live-camera weight.
     model: /home/eunwoosong/Projects/ros2-depth-point-cloude/vision/yolo/yolo26m-seg-best.pt
+    # Per-view weights for digital_twin_sequence.launch.py (view:=exo|hand).
+    # Replace model_hand with a hand-specialised weight when available.
+    model_exo: /home/eunwoosong/Projects/ros2-depth-point-cloude/vision/yolo/yolo26m-seg-best.pt
+    model_hand: /home/eunwoosong/Projects/ros2-depth-point-cloude/vision/yolo/yolo26m-seg-best.pt
     target_classes: ["cup"]
     confidence: 0.35
     image_topic: /camera/camera/color/image_raw

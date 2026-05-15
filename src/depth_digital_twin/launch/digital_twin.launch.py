@@ -41,12 +41,20 @@ def _make_nodes(context, *args, **kwargs):
 
     common_params = [params, {'intrinsics_path': intrinsics}]
 
+    # Optional YOLO weight override (e.g. a view-specialised model selected
+    # from params.yaml by digital_twin_sequence.launch.py). Empty → use
+    # detection_node.model from params.yaml.
+    yolo_model = LaunchConfiguration('yolo_model').perform(context)
+    detection_params = list(common_params)
+    if yolo_model:
+        detection_params.append({'model': yolo_model})
+
     world_origin = Node(
         package='depth_digital_twin', executable='world_origin_node',
         name='world_origin_node', output='screen', parameters=common_params)
     detection = Node(
         package='depth_digital_twin', executable='detection_node',
-        name='detection_node', output='screen', parameters=common_params)
+        name='detection_node', output='screen', parameters=detection_params)
     point_cloud = Node(
         package='depth_digital_twin', executable='point_cloud_node',
         name='point_cloud_node', output='screen', parameters=common_params)
@@ -85,5 +93,8 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument(
             'control_panel', default_value='true',
             description='Show Reset/Redetect control panel popup'),
+        DeclareLaunchArgument(
+            'yolo_model', default_value='',
+            description='Override detection_node.model (empty = params.yaml)'),
         OpaqueFunction(function=_make_nodes),
     ])

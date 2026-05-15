@@ -183,6 +183,50 @@ ros2 launch depth_digital_twin digital_twin_with_robot.launch.py [args]
 
 추가 실행 노드: `robot_state_publisher`, `robot_pose_bridge_node`, `static_transform_publisher`(world↔base_0)
 
+### `digital_twin_sequence.launch.py` (Phase 2a — 녹화 시퀀스 재생)
+
+라이브 카메라 대신 `ros2-recode-sequence`로 **녹화한 시퀀스**(exo RGB-D)를
+기존 파이프라인에 그대로 투입한다. 코어 노드(world_origin/detection/
+point_cloud) **수정 없음**. exo 카메라 intrinsics는 시퀀스 `meta.json`에서
+자동 추출(`<sequence>/exo_intrinsics.yaml`)되어 파이프라인에 전달된다.
+
+```bash
+# 두 워크스페이스 모두 source
+source ~/Projects/ros2-recode-sequence/install/setup.bash
+source ~/Projects/ros2-depth-point-cloude/install/setup.bash
+
+# exo (기본)
+ros2 launch depth_digital_twin digital_twin_sequence.launch.py \
+    sequence:=/home/eunwoosong/Projects/record_sequence/0005
+# hand 카메라로 보기  (ROS2는 --hand 가 아니라 view:=hand)
+ros2 launch depth_digital_twin digital_twin_sequence.launch.py \
+    sequence:=/home/eunwoosong/Projects/record_sequence/0005 view:=hand
+```
+
+| arg | default | 설명 |
+|---|---|---|
+| `sequence` | *(필수)* | 녹화 시퀀스 폴더 절대경로 (`record_sequence/NNNN`) |
+| `view` | `exo` | `exo`\|`hand` — 파이프라인에 투입할 녹화 카메라. 해당 카메라 intrinsics를 meta.json에서 추출해 사용 |
+| `yolo_model` | `''` | 명시 지정 시 우선 적용. 비우면 **params.yaml의 `detection_node.model_<view>`** 사용 (`model_exo`/`model_hand`) |
+| `loop` | `false` | 끝에서 정지(미순환) / `true` 시 반복 |
+| `autostart` | `true` | 즉시 재생 |
+| `params` | `config/params.yaml` | 파이프라인 파라미터 |
+| `rviz` | `true` | RViz2 실행 |
+
+hand 특화 YOLO는 `params.yaml`의 `detection_node.model_hand` 경로를
+교체하면 `view:=hand` 시 자동 적용된다(`model_exo`는 exo용, `model`은
+라이브/기본). 임시 오버레이 파일을 만들지 않는다.
+
+> ⚠️ `view:=hand`: 손목 장착 hand 카메라는 보통 ArUco 마커를 보지 못하므로
+> `world_origin_node`가 15초 후 **floor-plane fallback**으로 전환된다(정상).
+> EE + hand-eye 기반의 정확한 hand→world 정렬은 **Phase 2b**.
+
+데이터 흐름: `sequence_player_node`(exo→`/camera/camera/color|aligned_depth`,
+frame=`camera_color_optical_frame`) → `world_origin_node`가 재생 프레임의
+ArUco로 world 보정 → `detection_node`+`point_cloud_node`가 컵 검출. 재생
+제어는 `playback_control` 패널(Stop/Resume/Replay/Step+Apply). hand 카메라
+융합(2b)은 후속.
+
 ---
 
 ## 5. params.yaml 기능 정리
