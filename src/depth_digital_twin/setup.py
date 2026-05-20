@@ -31,6 +31,7 @@ setup(
             'world_origin_control = depth_digital_twin.world_origin_control:main',
             'detection_node = depth_digital_twin.detection_node:main',
             'point_cloud_node = depth_digital_twin.point_cloud_node:main',
+            'pick_ui_node = depth_digital_twin.pick_ui_node:main',
         ],
     },
 )

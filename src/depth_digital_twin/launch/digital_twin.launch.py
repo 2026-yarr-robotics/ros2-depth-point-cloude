@@ -38,8 +38,30 @@ def _make_nodes(context, *args, **kwargs):
     intrinsics = LaunchConfiguration('intrinsics').perform(context)
     params = LaunchConfiguration('params').perform(context)
     rviz_cfg = LaunchConfiguration('rviz_config').perform(context)
+    camera_ns = LaunchConfiguration('camera_ns').perform(context).strip()
 
     common_params = [params, {'intrinsics_path': intrinsics}]
+    # When a non-default camera namespace is used (cameras_only.launch.py
+    # view:=exo publishes to /exo/exo/...) we need two things:
+    #
+    #  1. camera_frame parameter override — this IS a wildcard in params.yaml
+    #     so the inline dict correctly overrides it.
+    #
+    #  2. Topic redirection — params.yaml stores topic names in node-specific
+    #     sections (world_origin_node, detection_node, point_cloud_node), which
+    #     take precedence over any wildcard inline dict.  Use ROS 2 topic
+    #     remapping instead: it operates below the parameter layer and reliably
+    #     redirects whichever topic the node actually subscribes to.
+    cam_remaps: list[tuple[str, str]] = []
+    if camera_ns and camera_ns != 'camera':
+        pfx = f'/{camera_ns}/{camera_ns}'
+        common_params.append({'camera_frame': f'{camera_ns}_color_optical_frame'})
+        cam_remaps = [
+            ('/camera/camera/color/image_raw',
+             f'{pfx}/color/image_raw'),
+            ('/camera/camera/aligned_depth_to_color/image_raw',
+             f'{pfx}/aligned_depth_to_color/image_raw'),
+        ]
 
     # Optional YOLO weight override (e.g. a view-specialised model selected
     # from params.yaml by digital_twin_sequence.launch.py). Empty → use
@@ -51,13 +73,16 @@ def _make_nodes(context, *args, **kwargs):
 
     world_origin = Node(
         package='depth_digital_twin', executable='world_origin_node',
-        name='world_origin_node', output='screen', parameters=common_params)
+        name='world_origin_node', output='screen', parameters=common_params,
+        remappings=cam_remaps)
     detection = Node(
         package='depth_digital_twin', executable='detection_node',
-        name='detection_node', output='screen', parameters=detection_params)
+        name='detection_node', output='screen', parameters=detection_params,
+        remappings=cam_remaps)
     point_cloud = Node(
         package='depth_digital_twin', executable='point_cloud_node',
-        name='point_cloud_node', output='screen', parameters=common_params)
+        name='point_cloud_node', output='screen', parameters=common_params,
+        remappings=cam_remaps)
     rviz = Node(
         package='rviz2', executable='rviz2', name='rviz2',
         arguments=['-d', rviz_cfg],
@@ -96,5 +121,10 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument(
             'yolo_model', default_value='',
             description='Override detection_node.model (empty = params.yaml)'),
+        DeclareLaunchArgument(
+            'camera_ns', default_value='camera',
+            description='RealSense camera namespace. '
+                        '"camera" = rs_align_depth_launch.py default (/camera/camera/...). '
+                        '"exo" = cameras_only.launch.py view:=exo (/exo/exo/...).'),
         OpaqueFunction(function=_make_nodes),
     ])

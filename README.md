@@ -327,3 +327,85 @@ ArUco로 world 보정 → `detection_node`+`point_cloud_node`가 컵 검출. 재
 
 - `sample/` : Doosan 로봇 가이드 PDF, 체커보드 캘리브레이션 예시, eye-to-hand/eye-in-hand 참조 코드
 - `legacy/` : 구 eye-to-hand 캘리브레이션 파일 (aruco_calibrate, aruco_handeye) — 현재 미사용
+
+---
+
+# USE CASE
+
+## UC-1. 라이브 단독 실행 (exo 카메라 + 로봇)
+
+로봇과 exo 카메라가 연결된 상태에서 실시간 컵 검출 + pick UI.
+
+```bash
+# 터미널 1: 로봇 bringup
+source ~/ros2_ws/install/setup.bash
+ros2 launch dsr_bringup2 dsr_bringup2_rviz.launch.py \
+    mode:=real model:=m0609 host:=192.168.1.100
+ros2 service call /dsr01/system/set_robot_mode \
+    dsr_msgs2/srv/SetRobotMode "robot_mode: 0"
+
+# 터미널 2: exo 카메라 (serial 고정, hand 카메라 충돌 방지)
+source ~/Projects/ros2-recode-sequence/install/setup.bash
+ros2 launch recode_sequence cameras_only.launch.py view:=exo
+
+# 터미널 3: detection 파이프라인 (exo 토픽 구독)
+source ~/Projects/ros2-depth-point-cloude/install/setup.bash
+ros2 launch depth_digital_twin digital_twin.launch.py camera_ns:=exo
+
+# 터미널 4: pick UI
+ros2 run depth_digital_twin pick_ui_node
+```
+
+> `camera_ns:=exo` 를 주면 `/exo/exo/color/image_raw` 등 exo 토픽을 자동으로 구독한다.
+> 기본값(`camera_ns:=camera`)은 `rs_align_depth_launch.py` 단독 실행 시 토픽과 호환된다.
+
+---
+
+## UC-2. 녹화 시퀀스 재생 (오프라인 검증)
+
+라이브 카메라·로봇 없이 녹화된 시퀀스로 파이프라인 검증.
+
+```bash
+# 두 워크스페이스 source
+source ~/Projects/ros2-recode-sequence/install/setup.bash
+source ~/Projects/ros2-depth-point-cloude/install/setup.bash
+
+# exo view (기본)
+ros2 launch depth_digital_twin digital_twin_sequence.launch.py \
+    sequence:=/home/eunwoosong/Projects/record_sequence/0010
+
+# pick UI (별도 터미널)
+ros2 run depth_digital_twin pick_ui_node
+```
+
+재생 제어: `playback_control` 패널(Stop / Resume / Replay / Step+Apply).
+
+---
+
+## UC-3. 녹화 시퀀스 재생 — hand view (FK 기반 world 변환)
+
+hand 카메라 FK 체인 검증 (ArUco 불필요, joint FK + handeye 사용).
+
+```bash
+# 세 워크스페이스 모두 source
+source ~/ros2_ws/install/setup.bash   # dsr_description2 (m0609 URDF)
+source ~/Projects/ros2-recode-sequence/install/setup.bash
+source ~/Projects/ros2-depth-point-cloude/install/setup.bash
+
+ros2 launch depth_digital_twin digital_twin_sequence.launch.py \
+    sequence:=/home/eunwoosong/Projects/record_sequence/0010 view:=hand
+```
+
+> ⚠ 라이브 `dsr_bringup2`가 켜져 있으면 TF 충돌. 종료 후 실행하거나 `ROS_DOMAIN_ID` 분리.
+
+---
+
+## UC-4. pick UI 재스캔 트리거
+
+pick 전 최신 포즈로 갱신하고 싶을 때:
+
+```bash
+ros2 service call /point_cloud_node/trigger_scan std_srvs/srv/Trigger
+```
+
+또는 pick UI 창의 **⟳ Re-scan** 버튼 클릭.

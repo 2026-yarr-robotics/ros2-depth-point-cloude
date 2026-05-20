@@ -13,7 +13,7 @@ lib/
 data/
 
 # YOLO weights cache
-*.pt
+#*.pt
 
 # Cube R-CNN dependency installer artefacts (created by dependence/setup.bash)
 dependence/venv/

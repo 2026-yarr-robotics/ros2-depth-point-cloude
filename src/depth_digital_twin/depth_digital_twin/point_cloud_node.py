@@ -28,6 +28,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 import message_filters
 import tf2_ros
+from std_srvs.srv import Trigger
 
 from depth_digital_twin.intrinsics import load_intrinsics
 from depth_digital_twin_msgs.msg import SegmentedObjectArray
@@ -104,6 +105,31 @@ class PointCloudNode(Node):
         self.declare_parameter('box_outlier_mad_k', 3.0)
         self.declare_parameter('approx_sync_slop', 0.05)
         self.declare_parameter('objects_only', True)
+        # World-frame re-association distance (m). When ByteTrack issues a new
+        # instance_id for a detection whose world-frame centroid is within this
+        # distance of an existing track, the new id is silently merged into the
+        # existing track. Prevents ghost boxes when the camera moves fast and
+        # ByteTrack re-ids the same physical cup.
+        self.declare_parameter('track_world_merge_dist_m', 0.08)
+
+        # ── Scan-and-lock ──────────────────────────────────────────────────
+        # A track transitions SCANNING → LOCKED after this many consecutive
+        # windows in which the smoothed cup centre stays within
+        # `lock_pose_eps_m` of the streak anchor (pose-stability criterion —
+        # the box is actually steady in space, not merely "the fit math
+        # succeeded N times").
+        self.declare_parameter('scan_lock_min_windows', 5)
+        # Max planar drift (m) from the streak anchor still counted as stable.
+        # Exceeding it re-anchors and restarts the streak.
+        self.declare_parameter('lock_pose_eps_m', 0.008)
+        # While LOCKED, if the fresh-window point centroid departs the frozen
+        # box centre by more than this (m), the cup was moved (robot pick /
+        # relocation) → auto-unlock and re-scan. Hysteresis: must be > eps so
+        # jitter doesn't flap the lock.
+        self.declare_parameter('lock_unlock_dist_m', 0.03)
+        # Windows of zero new points (YOLO miss) before a LOCKED track reverts
+        # to SCANNING and begins fresh accumulation.
+        self.declare_parameter('scan_locked_miss_max', 8)
 
         # ----- Cup model (truncated-cone prior; standing only) -----
         self.declare_parameter('cup_top_diameter_m', 0.054)
@@ -162,6 +188,16 @@ class PointCloudNode(Node):
         self.cup_n_seg: int = max(8, int(self.get_parameter('cup_polygon_segments').value))
         self.cup_alpha: float = float(self.get_parameter('cup_smoothing_alpha').value)
         self.cup_keepalive: int = int(self.get_parameter('cup_track_keepalive_frames').value)
+        self._track_merge_dist: float = float(
+            self.get_parameter('track_world_merge_dist_m').value)
+        self._lock_min_windows: int = int(
+            self.get_parameter('scan_lock_min_windows').value)
+        self._lock_pose_eps: float = float(
+            self.get_parameter('lock_pose_eps_m').value)
+        self._lock_unlock_dist: float = float(
+            self.get_parameter('lock_unlock_dist_m').value)
+        self._locked_miss_max: int = int(
+            self.get_parameter('scan_locked_miss_max').value)
         self.cup_resid_max: float = float(self.get_parameter('cup_fit_residual_max').value)
         self.cup_class_names: set[str] = {
             s.lower() for s in self.get_parameter('cup_class_names').value}
@@ -214,6 +250,8 @@ class PointCloudNode(Node):
         self.sync = message_filters.ApproximateTimeSynchronizer(
             [rgb_sub, depth_sub, det_sub], queue_size=10, slop=slop)
         self.sync.registerCallback(self._on_synced)
+        self._trigger_scan_srv = self.create_service(
+            Trigger, '~/trigger_scan', self._on_trigger_scan)
         self.get_logger().info('point_cloud_node ready (waiting for synced frames)')
 
         # ── ArUco axis overlay (TF-based, not real-time detection) ────────
@@ -304,7 +342,7 @@ class PointCloudNode(Node):
                 continue
             class_name = (obj.class_name or '').lower()
             centroid_xy = np.median(obj_world[:, :2], axis=0)
-            tid = inst_id
+            tid = self._resolve_track_id(inst_id, centroid_xy)
             track = self._tracks.get(tid)
             if track is None:
                 track = {
@@ -318,6 +356,11 @@ class PointCloudNode(Node):
                     'last_score': 0.0,
                     'last_display_name': obj.class_name or class_name,
                     'last_residual': 0.0,
+                    'state': 'scanning',       # 'scanning' | 'locked'
+                    'stable_streak': 0,        # consecutive windows centre stayed
+                                               # within eps of lock_ref_xy
+                    'lock_ref_xy': None,       # anchor for the stability streak
+                    'lock_miss': 0,            # miss windows since locked
                 }
                 self._tracks[tid] = track
             track['points_buf'].append(obj_world)
@@ -361,7 +404,19 @@ class PointCloudNode(Node):
         """End-of-window: aggregate each track's accumulated points, MAD-filter,
         re-fit the cup pose (or OBB fallback), then publish the union of all
         tracks' filtered points and a fresh marker set. This is the only path
-        that publishes /points and /boxes."""
+        that publishes /points and /boxes.
+
+        Scan-and-lock state machine (per track):
+          SCANNING: fit every window. The box LOCKS once the smoothed centre
+                    holds within `lock_pose_eps_m` of the streak anchor for
+                    `scan_lock_min_windows` consecutive windows (pose
+                    stability, not raw fit-success count).
+          LOCKED:   box pose is frozen; new points still feed the cloud.
+                    Unlocks on EITHER the cup vanishing for
+                    `scan_locked_miss_max` windows OR the fresh-point centroid
+                    departing the frozen centre by `lock_unlock_dist_m`
+                    (robot picked / relocated the cup → re-scan, box follows).
+        """
         alive_xyz: list[np.ndarray] = []
         alive_rgb: list[np.ndarray] = []
 
@@ -371,31 +426,104 @@ class PointCloudNode(Node):
             buf_cols = track['colors_buf']
             track['points_buf'] = []
             track['colors_buf'] = []
+            state = track.get('state', 'scanning')
 
-            if not buf_pts:
-                track['miss'] += 1
-                if track['miss'] > self.cup_keepalive:
-                    self._tracks.pop(tid, None)
-                continue
+            # ── LOCKED ────────────────────────────────────────────────────
+            if state == 'locked':
+                if not buf_pts:
+                    track['lock_miss'] = track.get('lock_miss', 0) + 1
+                    if track['lock_miss'] > self._locked_miss_max:
+                        self._unlock(track, tid,
+                                     f'cup missing {self._locked_miss_max} '
+                                     f'windows')
+                    # Keep track alive; last_state provides the frozen marker.
+                    continue
 
-            all_pts = np.vstack(buf_pts)
-            all_rgb = np.concatenate(buf_cols)
-            # MAD filter on the aggregated cluster — much more robust than
-            # per-frame because median + MAD have many more samples to anchor.
-            keep = _mad_keep_indices(all_pts, self.outlier_mad_k)
-            if keep is not None:
-                all_pts = all_pts[keep]
-                all_rgb = all_rgb[keep]
-            if all_pts.shape[0] < 32:
-                track['miss'] += 1
-                if track['miss'] > self.cup_keepalive:
-                    self._tracks.pop(tid, None)
-                continue
+                all_pts = np.vstack(buf_pts)
+                all_rgb = np.concatenate(buf_cols)
+                keep = _mad_keep_indices(all_pts, self.outlier_mad_k)
+                if keep is not None and int(keep.sum()) >= 32:
+                    all_pts = all_pts[keep]
+                    all_rgb = all_rgb[keep]
+                if all_pts.shape[0] < 32:
+                    # Too sparse to judge displacement — treat as a miss.
+                    track['lock_miss'] = track.get('lock_miss', 0) + 1
+                    if track['lock_miss'] > self._locked_miss_max:
+                        self._unlock(track, tid,
+                                     f'cup missing {self._locked_miss_max} '
+                                     f'windows')
+                    continue
+
+                ls_locked = track.get('last_state')
+                moved = False
+                if ls_locked is not None:
+                    cur_xy = np.median(all_pts[:, :2], axis=0)
+                    locked_xy = np.asarray(
+                        ls_locked['center'][:2], dtype=np.float64)
+                    moved = (float(np.linalg.norm(cur_xy - locked_xy))
+                             > self._lock_unlock_dist)
+
+                if not moved:
+                    track['lock_miss'] = 0
+                    # Fresh points feed the cloud; box stays frozen.
+                    alive_xyz.append(all_pts.astype(np.float32))
+                    alive_rgb.append(all_rgb)
+                    continue
+
+                # Cup was moved (robot pick / relocation) → unlock and FALL
+                # THROUGH to the fit block so the box follows in this window.
+                self._unlock(
+                    track, tid,
+                    f'cup moved >{self._lock_unlock_dist*100:.0f}cm')
+                # all_pts / all_rgb already filtered above.
+
+            else:
+                # ── SCANNING ──────────────────────────────────────────────
+                if not buf_pts:
+                    track['miss'] += 1
+                    if track['miss'] > self.cup_keepalive:
+                        self._tracks.pop(tid, None)
+                    continue
+
+                all_pts = np.vstack(buf_pts)
+                all_rgb = np.concatenate(buf_cols)
+                keep = _mad_keep_indices(all_pts, self.outlier_mad_k)
+                if keep is not None:
+                    all_pts = all_pts[keep]
+                    all_rgb = all_rgb[keep]
+                if all_pts.shape[0] < 32:
+                    track['miss'] += 1
+                    if track['miss'] > self.cup_keepalive:
+                        self._tracks.pop(tid, None)
+                    continue
+
+            # ── Fit + pose-stability lock test ────────────────────────────
+            # Reached by SCANNING tracks and by just-unlocked (moved) tracks;
+            # all_pts / all_rgb are filtered above in both paths.
             track['miss'] = 0
 
             ls = self._fit_and_render_state(tid, track, all_pts)
             if ls is not None:
                 track['last_state'] = ls
+                centre_xy = np.asarray(track['center_xy'], dtype=np.float64)
+                ref = track.get('lock_ref_xy')
+                if ref is None or (float(np.linalg.norm(centre_xy - ref))
+                                   > self._lock_pose_eps):
+                    # First fit, or drifted out of the eps ball → re-anchor.
+                    track['lock_ref_xy'] = centre_xy.copy()
+                    track['stable_streak'] = 1
+                else:
+                    track['stable_streak'] = track.get('stable_streak', 0) + 1
+                if track['stable_streak'] >= self._lock_min_windows:
+                    track['state'] = 'locked'
+                    track['lock_miss'] = 0
+                    self.get_logger().info(
+                        f'[scan-lock] #{tid} LOCKED — centre stable within '
+                        f'{self._lock_pose_eps*1000:.0f}mm for '
+                        f'{track["stable_streak"]} windows')
+            else:
+                track['stable_streak'] = 0
+                track['lock_ref_xy'] = None
 
             alive_xyz.append(all_pts.astype(np.float32))
             alive_rgb.append(all_rgb)
@@ -419,9 +547,11 @@ class PointCloudNode(Node):
             if ls is None:
                 continue
             colour = _palette(tid - 1)
+            label = ('[L]_' + ls['label']
+                     if track.get('state') == 'locked' else ls['label'])
             self._append_box_markers(
                 markers, tid, ls['center'], ls['R'], ls['size'],
-                ls['top_world'], colour, ls['label'], stamp)
+                ls['top_world'], colour, label, stamp)
             if ls.get('frustum') is not None:
                 self._append_cup_frustum_markers(
                     markers, tid, ls['frustum'], colour, stamp)
@@ -716,6 +846,54 @@ class PointCloudNode(Node):
             markers.markers.append(d)
 
     # ------------------------------------------------------------------
+    def _unlock(self, track: dict, tid: int, reason: str) -> None:
+        """Revert a LOCKED track to SCANNING, clearing streak/anchor state.
+
+        The frozen `last_state` marker persists until the next window fits a
+        fresh pose, so the box does not blink out during re-scan.
+        """
+        track['state'] = 'scanning'
+        track['stable_streak'] = 0
+        track['lock_ref_xy'] = None
+        track['lock_miss'] = 0
+        track['miss'] = 0
+        self.get_logger().info(
+            f'[scan-lock] #{tid} unlocked — {reason}, re-scanning')
+
+    # ------------------------------------------------------------------
+    def _on_trigger_scan(self, request, response):
+        """Clear all tracks and restart scanning. Called via ~/trigger_scan."""
+        n = len(self._tracks)
+        self._tracks.clear()
+        self._last_published_ids.clear()
+        self._window_start_stamp = None
+        self._publish_clear_markers(self.get_clock().now().to_msg())
+        response.success = True
+        response.message = f'scan reset: {n} track(s) cleared'
+        self.get_logger().info(f'[scan-lock] trigger_scan → cleared {n} tracks')
+        return response
+
+    def _resolve_track_id(self, inst_id: int, centroid_xy: np.ndarray) -> int:
+        """Map a ByteTrack instance_id to a world-frame track id.
+
+        If inst_id is already a known track, return it directly.
+        If inst_id is new but its world centroid is within `_track_merge_dist`
+        of an existing track, return that track's id instead. This absorbs
+        re-IDs that ByteTrack issues when the camera moves fast, preventing
+        the old track (still within keepalive) and the new id from coexisting
+        as duplicate ghost boxes.
+        """
+        if inst_id in self._tracks:
+            return inst_id
+        best_id = inst_id
+        best_dist = self._track_merge_dist
+        for tid, track in self._tracks.items():
+            dist = float(np.linalg.norm(centroid_xy - track['center_xy']))
+            if dist < best_dist:
+                best_dist = dist
+                best_id = tid
+        return best_id
+
     def _erode_mask(self, mb: np.ndarray) -> np.ndarray:
         """Shrink the YOLO mask by `mask_erode_px` to drop edge pixels whose
         depth is unreliable (mixed foreground/background). No-op if disabled."""

@@ -48,7 +48,7 @@ detection_node:
     # Per-view weights for digital_twin_sequence.launch.py (view:=exo|hand).
     # Replace model_hand with a hand-specialised weight when available.
     model_exo: /home/eunwoosong/Projects/ros2-depth-point-cloude/vision/yolo/yolo26m-seg-best.pt
-    model_hand: /home/eunwoosong/Projects/ros2-depth-point-cloude/vision/yolo/yolo26m-seg-best.pt
+    model_hand: /home/eunwoosong/Projects/ros2-depth-point-cloude/vision/yolo/speed_stack_yolo26m_seg_1280_a100_best.pt
     target_classes: ["cup"]
     confidence: 0.35
     image_topic: /camera/camera/color/image_raw
@@ -73,10 +73,11 @@ point_cloud_node:
     box_standing_ratio: 0.8
     box_min_elongation: 1.5
     box_force_aabb: false
-    mask_erode_px: 13
+    mask_erode_px: 5
     depth_gradient_max_m: 0.015
     box_outlier_mad_k: 3.0
     approx_sync_slop: 0.05
+    track_world_merge_dist_m: 0.02  # world-frame re-association radius (m)
 
     # ----- Cup model (Speed Stack truncated cone, standing only) -----
     cup_top_diameter_m: 0.054
@@ -84,11 +85,20 @@ point_cloud_node:
     cup_height_m: 0.095
     cup_polygon_segments: 24
     cup_smoothing_alpha: 0.3
-    cup_track_keepalive_frames: 10
+    cup_track_keepalive_frames: 5
     cup_fit_residual_max: 0.02
 
     # ----- Accumulating-window pipeline -----
     window_period_s: 0.1
+
+    # ----- Scan-and-lock -----
+    # LOCK when the smoothed centre stays within lock_pose_eps_m of the streak
+    # anchor for scan_lock_min_windows consecutive windows (pose stability).
+    scan_lock_min_windows: 5     # stable windows → LOCKED          (5 × 0.1s = 0.5s)
+    lock_pose_eps_m: 0.008       # max planar drift counted as stable (8 mm)
+    # UNLOCK on cup vanishing OR moving (robot pick) past lock_unlock_dist_m.
+    lock_unlock_dist_m: 0.03     # fresh centroid this far from frozen box → moved
+    scan_locked_miss_max: 8      # empty windows before unlock      (8 × 0.1s = 0.8s)
 
     # ----- ArUco marker axes overlay on box_debug -----
     aruco_overlay: true
