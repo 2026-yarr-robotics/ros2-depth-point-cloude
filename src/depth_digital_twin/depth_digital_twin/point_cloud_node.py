@@ -12,6 +12,7 @@ the horizontal projection is used to recover its orientation.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Iterable
 
@@ -23,7 +24,7 @@ from geometry_msgs.msg import Point as MsgPoint, Quaternion
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import Image, PointCloud2, PointField
-from std_msgs.msg import ColorRGBA, Header
+from std_msgs.msg import ColorRGBA, Header, Int32MultiArray, String
 from visualization_msgs.msg import Marker, MarkerArray
 
 import message_filters
@@ -61,6 +62,39 @@ def _pack_rgb(r: np.ndarray, g: np.ndarray, b: np.ndarray) -> np.ndarray:
                 | (g.astype(np.uint32) << 8)
                 | b.astype(np.uint32))
     return np.frombuffer(rgb_uint.astype(np.uint32).tobytes(), dtype=np.float32)
+
+
+def _classify_color_bgr(bgr: np.ndarray, allowed: list[str]) -> str | None:
+    """Bucket the median HSV of a (N,3) BGR pixel block to a color name.
+
+    Returns None if the chosen color isn't in `allowed` (caller will fall back
+    to the existing track color). OpenCV hue range is 0–179.
+    """
+    if bgr.size == 0:
+        return None
+    hsv = cv2.cvtColor(bgr.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV).reshape(-1, 3)
+    h_med = float(np.median(hsv[:, 0]))
+    s_med = float(np.median(hsv[:, 1]))
+    v_med = float(np.median(hsv[:, 2]))
+
+    if v_med < 35:
+        cand = 'black'
+    elif s_med < 40:
+        cand = 'white' if v_med > 200 else 'gray'
+    elif h_med < 10 or h_med >= 170:
+        cand = 'red'
+    elif h_med < 23:
+        cand = 'orange'
+    elif h_med < 35:
+        cand = 'yellow'
+    elif h_med < 80:
+        cand = 'green'
+    elif h_med < 130:
+        cand = 'blue'
+    else:
+        cand = 'purple'
+
+    return cand if cand in allowed else None
 
 
 class PointCloudNode(Node):
@@ -131,6 +165,23 @@ class PointCloudNode(Node):
         # to SCANNING and begins fresh accumulation.
         self.declare_parameter('scan_locked_miss_max', 8)
 
+        # ── Color classification + cups_on_table publish ──────────────────
+        # Per-track color votes are accumulated from each frame's masked
+        # pixels (HSV bucket). The argmax is published as the track's color
+        # and counted into /cups_on_table — minus any track ids currently in
+        # /stack_track_ids (cups vision-node says are stacked).
+        self.declare_parameter('cups_on_table_topic', '/cups_on_table')
+        self.declare_parameter('stack_track_ids_topic', '/stack_track_ids')
+        # Colors recognised by the HSV bucket. Names match the palette used
+        # downstream by the bridge / verifier.
+        self.declare_parameter(
+            'color_classes',
+            ['red', 'orange', 'yellow', 'green', 'blue', 'purple',
+             'white', 'black'])
+        # Min pixel count in the mask before a frame contributes a color
+        # vote (avoid tiny masks with mostly edge noise).
+        self.declare_parameter('color_min_pixels', 64)
+
         # ----- Cup model (truncated-cone prior; standing only) -----
         self.declare_parameter('cup_top_diameter_m', 0.054)
         self.declare_parameter('cup_bottom_diameter_m', 0.078)
@@ -198,6 +249,15 @@ class PointCloudNode(Node):
             self.get_parameter('lock_unlock_dist_m').value)
         self._locked_miss_max: int = int(
             self.get_parameter('scan_locked_miss_max').value)
+        self._color_classes: list[str] = [
+            str(c).lower()
+            for c in self.get_parameter('color_classes').value]
+        self._color_min_pixels: int = max(
+            1, int(self.get_parameter('color_min_pixels').value))
+        # depth-track ids that vision-node currently reports as stacked. These
+        # are subtracted from /cups_on_table so a "stacked" cup is not double
+        # counted (verifier owns the slot, depth owns the table count).
+        self._stacked_ids: set[int] = set()
         self.cup_resid_max: float = float(self.get_parameter('cup_fit_residual_max').value)
         self.cup_class_names: set[str] = {
             s.lower() for s in self.get_parameter('cup_class_names').value}
@@ -240,6 +300,15 @@ class PointCloudNode(Node):
             Image, self.get_parameter('box_debug_topic').value, 1)
         self.depth_debug_pub = self.create_publisher(
             Image, self.get_parameter('depth_debug_topic').value, 1)
+        # JSON {color: count} of cups on the table, EXCLUDING any track id
+        # vision-node has reported as occupying a stack slot. Latched so a
+        # late-joining subscriber sees the most recent snapshot.
+        self.cups_on_table_pub = self.create_publisher(
+            String, self.get_parameter('cups_on_table_topic').value, latched)
+        self.create_subscription(
+            Int32MultiArray,
+            self.get_parameter('stack_track_ids_topic').value,
+            self._on_stack_track_ids, 10)
 
         rgb_sub = message_filters.Subscriber(
             self, Image, self.get_parameter('rgb_topic').value)
@@ -361,11 +430,22 @@ class PointCloudNode(Node):
                                                # within eps of lock_ref_xy
                     'lock_ref_xy': None,       # anchor for the stability streak
                     'lock_miss': 0,            # miss windows since locked
+                    'color': None,             # argmax of color_votes
+                    'color_votes': {},         # {color_name: vote_count}
                 }
                 self._tracks[tid] = track
             track['points_buf'].append(obj_world)
             track['colors_buf'].append(obj_rgb_packed)
             track['last_score'] = float(obj.score)
+            # Per-frame color vote from the masked pixels.
+            if bgr.shape[0] >= self._color_min_pixels:
+                color = _classify_color_bgr(bgr, self._color_classes)
+                if color is not None:
+                    track['color_votes'][color] = \
+                        track['color_votes'].get(color, 0) + 1
+                    track['color'] = max(
+                        track['color_votes'],
+                        key=track['color_votes'].get)
             track['last_display_name'] = obj.class_name
 
         # Per-frame box debug overlay using the LAST window's fit (frozen
@@ -561,6 +641,27 @@ class PointCloudNode(Node):
             self._append_delete_markers(markers, tid, stamp)
         self._last_published_ids = alive_ids
         self.boxes_pub.publish(markers)
+        self._publish_cups_on_table()
+
+    # ------------------------------------------------------------------
+    def _publish_cups_on_table(self) -> None:
+        """JSON {color: count} of currently rendered tracks (has last_state)
+        whose id is NOT in /stack_track_ids.  Schema is always the configured
+        color_classes plus 'unknown' so downstream sees a stable shape."""
+        counts: dict[str, int] = {c: 0 for c in self._color_classes}
+        counts['unknown'] = 0
+        for tid, track in self._tracks.items():
+            if track.get('last_state') is None:
+                continue
+            if tid in self._stacked_ids:
+                continue
+            colour = track.get('color') or 'unknown'
+            counts[colour] = counts.get(colour, 0) + 1
+        self.cups_on_table_pub.publish(
+            String(data=json.dumps(counts, ensure_ascii=False)))
+
+    def _on_stack_track_ids(self, msg: Int32MultiArray) -> None:
+        self._stacked_ids = {int(x) for x in msg.data}
 
     # ------------------------------------------------------------------
     def _fit_and_render_state(self, tid: int, track: dict,
@@ -615,7 +716,9 @@ class PointCloudNode(Node):
                 bot_d=self.cup_bot_d, height=self.cup_h,
                 floor_z=z_base_smooth, n_seg=self.cup_n_seg)
             r_mm = residual * 1000.0
-            line1 = f"#{tid}_{track['last_display_name']}_{track['last_score']:.2f}"
+            color_tok = track.get('color') or 'unknown'
+            line1 = (f"#{tid}_c={color_tok}_{track['last_display_name']}_"
+                     f"{track['last_score']:.2f}")
             line2 = (f"r={r_mm:.0f}mm_"
                      f"({cx_smooth:.2f},{cy_smooth:.2f},{top_world[2]:.2f})")
             label = line1.replace(' ', '_') + '\n' + line2.replace(' ', '_')
@@ -636,7 +739,8 @@ class PointCloudNode(Node):
         top_world = center + R_box @ np.array(
             [0.0, 0.0, float(size[2]) * 0.5], dtype=np.float64)
         track['center_xy'] = center[:2].astype(np.float64)
-        line1 = (f"#{tid}_{track['last_display_name']}_"
+        color_tok = track.get('color') or 'unknown'
+        line1 = (f"#{tid}_c={color_tok}_{track['last_display_name']}_"
                  f"{track['last_score']:.2f}_[{pose_label}]")
         line2 = (f"({top_world[0]:.2f},{top_world[1]:.2f},"
                  f"{top_world[2]:.2f})")
