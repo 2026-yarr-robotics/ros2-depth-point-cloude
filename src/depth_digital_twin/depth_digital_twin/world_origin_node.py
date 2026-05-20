@@ -1,12 +1,12 @@
 """world_origin_node — define `world` frame relative to the camera.
 
-Two modes, selected by `world_origin_mode`:
+Three modes, selected by `world_origin_mode`:
 
-* **aruco** (default): detect a known ArUco marker placed in the workspace at a
-  measured position relative to the robot base. On startup the node collects
-  `world_marker_samples_required` good detections, averages them, and publishes
-  a single static TF camera→world (world := robot base). The color subscription
-  is then released; the TF persists indefinitely.
+* **aruco** (default, exo camera): detect a known ArUco marker placed in the
+  workspace at a measured position relative to the robot base. On startup the
+  node collects `world_marker_samples_required` good detections, averages them,
+  and publishes a single static TF camera→world (world := robot base). The
+  color subscription is then released; the TF persists indefinitely.
 
   Marker frame convention (OpenCV / solvePnP):
     - Z  : out of marker plane, toward camera (= world +Z for flat marker on table)
@@ -20,6 +20,19 @@ Two modes, selected by `world_origin_mode`:
   (Euler intrinsic XYZ, degrees). Both default to zero (marker axes = base axes,
   suitable for a flat marker whose normal is world +Z and whose pattern top
   points in the base +Y direction).
+
+* **handeye_aruco** (hand-eye camera): same ArUco geometry as `aruco`, but
+  the camera is wrist-mounted so its world pose depends on the robot pose.
+  At each ArUco sample we ALSO look up `base_link → ee_frame` via tf2 (from
+  the URDF + joint_states) and compute the constant hand-eye
+  T_ee→cam = inv(T_base→ee) · inv(T_cam→base). Averaging these per-sample
+  hand-eye estimates yields a clean handeye transform that replaces the
+  pre-calibrated T_gripper2camera.npy. We then publish TWO static TFs:
+    1. `world → base_link`     (identity — world is the robot base)
+    2. `ee_frame → camera_frame`  (the freshly computed hand-eye)
+  After publish the color subscription is released; subsequent
+  base_link → ee_frame motion (from RSP+joint_states) automatically drives
+  the world → camera chain via the static hand-eye.
 
 * **floor** (fallback): sample a depth patch around (window_center_*_px),
   fit a plane via SVD, build a Z-up basis, publish a static TF. Activated
@@ -37,10 +50,13 @@ import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import TransformStamped
+from rclpy.duration import Duration
 from rclpy.node import Node
+from rclpy.time import Time as RclpyTime
 from sensor_msgs.msg import Image
 from std_srvs.srv import Trigger
-from tf2_ros import StaticTransformBroadcaster
+from tf2_ros import Buffer, StaticTransformBroadcaster, TransformListener
+from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
 
 from depth_digital_twin.intrinsics import load_intrinsics
 
@@ -59,7 +75,19 @@ class WorldOriginNode(Node):
         self.declare_parameter('window_center_y_px', -1)
 
         # ── mode ───────────────────────────────────────────────────────────
-        self.declare_parameter('world_origin_mode', 'aruco')  # aruco | floor
+        self.declare_parameter(
+            'world_origin_mode', 'aruco')  # aruco | handeye_aruco | floor
+
+        # ── handeye_aruco mode params ──────────────────────────────────────
+        # FK chain endpoints. With m0609, base_link → ... → link_6.
+        # `world` is published as identity onto base_frame so the rest of the
+        # stack (point_cloud_node, etc.) keeps the world_frame convention.
+        self.declare_parameter('base_frame', 'base_link')
+        self.declare_parameter('ee_frame', 'link_6')
+        # Per-sample tf2 lookup timeout when querying base_frame → ee_frame
+        # at the image timestamp. Sequence playback can have a small delay
+        # between joint_states arrival and TF availability.
+        self.declare_parameter('handeye_tf_lookup_timeout_s', 0.2)
 
         # ── aruco mode params ──────────────────────────────────────────────
         self.declare_parameter('color_topic', '/camera/camera/color/image_raw')
@@ -111,7 +139,7 @@ class WorldOriginNode(Node):
         # Service: ~/redetect — restart detection without restarting the node.
         self.create_service(Trigger, '~/redetect', self._handle_redetect)
 
-        if self._mode == 'aruco':
+        if self._mode in ('aruco', 'handeye_aruco'):
             self._setup_aruco_mode()
         else:
             self._setup_floor_mode()
@@ -128,8 +156,9 @@ class WorldOriginNode(Node):
         """
         self.published = False
 
-        if self._mode == 'aruco':
+        if self._mode in ('aruco', 'handeye_aruco'):
             self.aruco_samples = []
+            self.handeye_link6_samples = []
             self.aruco_start = self.get_clock().now()
             if not hasattr(self, '_aruco_sub') or self._aruco_sub is None:
                 self._aruco_sub = self.create_subscription(
@@ -216,11 +245,31 @@ class WorldOriginNode(Node):
         ], dtype=np.float32)
 
         self.aruco_samples: list[np.ndarray] = []
+        # Parallel to aruco_samples, only populated in handeye_aruco mode.
+        # Holds the base→ee pose looked up via tf2 at the same image stamp.
+        self.handeye_link6_samples: list[np.ndarray] = []
         self.aruco_start = self.get_clock().now()
         self._aruco_sub = self.create_subscription(
             Image,
             str(self.get_parameter('color_topic').value),
             self._on_color_aruco, 10)
+
+        # Handeye additions — only when computing a wrist-mounted hand-eye.
+        if self._mode == 'handeye_aruco':
+            self.base_frame: str = str(self.get_parameter('base_frame').value)
+            self.ee_frame: str = str(self.get_parameter('ee_frame').value)
+            self._handeye_tf_timeout = float(
+                self.get_parameter('handeye_tf_lookup_timeout_s').value)
+            self.tf_buffer = Buffer()
+            self.tf_listener = TransformListener(self.tf_buffer, self)
+            self.get_logger().info(
+                f'handeye_aruco mode: ID={self.marker_id} dict={dict_name} '
+                f'length={self.marker_length*100:.1f}cm '
+                f'target={self.aruco_samples_req} samples. '
+                f'FK chain: {self.base_frame} → {self.ee_frame}.  Output: '
+                f'{self.ee_frame} → {self.camera_frame} (hand-eye) + '
+                f'{self.world_frame} → {self.base_frame} (identity).')
+            return
 
         self.get_logger().info(
             f'ArUco mode: ID={self.marker_id} dict={dict_name} '
@@ -312,7 +361,19 @@ class WorldOriginNode(Node):
         T_cam_marker = np.eye(4)
         T_cam_marker[:3, :3] = R_cm
         T_cam_marker[:3, 3] = tvec.flatten()
+
+        # In handeye_aruco mode, also pin the per-sample FK pose. If tf2 isn't
+        # ready (joint_states not yet flowing or stamp drift), drop the sample
+        # entirely so the pair lists stay aligned.
+        T_base_ee = None
+        if self._mode == 'handeye_aruco':
+            T_base_ee = self._lookup_base_ee_pose(msg.header.stamp)
+            if T_base_ee is None:
+                return
+
         self.aruco_samples.append(T_cam_marker)
+        if T_base_ee is not None:
+            self.handeye_link6_samples.append(T_base_ee)
 
         n = len(self.aruco_samples)
         dist_cm = float(np.linalg.norm(tvec)) * 100.0
@@ -363,9 +424,121 @@ class WorldOriginNode(Node):
             f'                       Z sign={"+" if t_cam_in_world[2] >= 0 else "−"} (must be + for camera above table)\n'
             f'  → Compare "R_m2b euler_xyz" against params.yaml rot_xyz_deg.')
 
-        self._publish_aruco_origin(T_cam_base)
+        if self._mode == 'handeye_aruco':
+            self._finalize_handeye()
+        else:
+            self._publish_aruco_origin(T_cam_base)
         self.destroy_subscription(self._aruco_sub)
         self._aruco_sub = None
+
+    # ── handeye_aruco helpers ─────────────────────────────────────────────
+
+    def _lookup_base_ee_pose(self, stamp) -> np.ndarray | None:
+        """tf2 lookup of `ee_frame` pose IN `base_frame` at `stamp`.
+
+        Returns a 4x4 SE(3) (pose of ee in base) or None when the FK isn't yet
+        available (joint_states not flowing / extrapolation). Caller drops the
+        ArUco sample on None so the (T_cam_marker, T_base_ee) lists stay aligned.
+        """
+        try:
+            ts = self.tf_buffer.lookup_transform(
+                self.base_frame, self.ee_frame, RclpyTime.from_msg(stamp),
+                timeout=Duration(seconds=self._handeye_tf_timeout))
+        except (LookupException, ConnectivityException,
+                ExtrapolationException) as e:
+            self.get_logger().warn(
+                f'FK lookup {self.base_frame}→{self.ee_frame} failed '
+                f'@stamp({stamp.sec}.{stamp.nanosec:09d}): {e}',
+                throttle_duration_sec=1.0)
+            return None
+        t = ts.transform.translation
+        r = ts.transform.rotation
+        T = np.eye(4)
+        T[:3, :3] = _quat_to_R(r.x, r.y, r.z, r.w)
+        T[:3, 3] = (t.x, t.y, t.z)
+        return T
+
+    def _finalize_handeye(self) -> None:
+        """Per-sample hand-eye T_ee_cam = inv(T_base_ee) · inv(T_cam_base);
+        SE(3)-average over samples and publish the two static TFs:
+          1. world → base_link    (identity — world IS the robot base)
+          2. ee_frame → camera    (the freshly computed hand-eye)
+        """
+        if len(self.aruco_samples) != len(self.handeye_link6_samples):
+            self.get_logger().error(
+                f'handeye sample mismatch: aruco={len(self.aruco_samples)} '
+                f'fk={len(self.handeye_link6_samples)} — aborting publish.')
+            return
+
+        handeye_per_sample: list[np.ndarray] = []
+        cam_in_base_pos: list[np.ndarray] = []
+        for T_cam_marker, T_base_ee in zip(
+                self.aruco_samples, self.handeye_link6_samples):
+            T_cam_base = T_cam_marker @ self.T_marker_base  # base in cam
+            T_base_cam = _invert_se3(T_cam_base[:3, :3], T_cam_base[:3, 3])
+            T_ee_base = _invert_se3(T_base_ee[:3, :3], T_base_ee[:3, 3])
+            T_ee_cam = T_ee_base @ T_base_cam               # cam in ee
+            handeye_per_sample.append(T_ee_cam)
+            cam_in_base_pos.append(T_base_cam[:3, 3])
+
+        T_ee_cam_avg = _se3_average(handeye_per_sample)
+
+        t_avg = T_ee_cam_avg[:3, 3]
+        euler = _R_to_euler_xyz(T_ee_cam_avg[:3, :3])
+        t_std_mm = np.std([T[:3, 3] for T in handeye_per_sample], axis=0) * 1000.0
+        cam_in_base_avg = np.mean(np.stack(cam_in_base_pos, axis=0), axis=0)
+        cam_in_base_std = np.std(np.stack(cam_in_base_pos, axis=0), axis=0) * 1000.0
+
+        self.get_logger().info(
+            f'Handeye calibration complete:\n'
+            f'  ── T_{self.ee_frame}_{self.camera_frame} (averaged) ──\n'
+            f'    pos (cm)        = ({t_avg[0]*100:.2f}, {t_avg[1]*100:.2f}, {t_avg[2]*100:.2f})\n'
+            f'    euler_xyz (deg) = ({euler[0]:.1f}, {euler[1]:.1f}, {euler[2]:.1f})\n'
+            f'    pos std (mm)    = ({t_std_mm[0]:.1f}, {t_std_mm[1]:.1f}, {t_std_mm[2]:.1f})\n'
+            f'  ── camera pose in base at calibration (sanity) ──\n'
+            f'    pos (cm)        = ({cam_in_base_avg[0]*100:.1f}, {cam_in_base_avg[1]*100:.1f}, {cam_in_base_avg[2]*100:.1f})\n'
+            f'    pos std (mm)    = ({cam_in_base_std[0]:.1f}, {cam_in_base_std[1]:.1f}, {cam_in_base_std[2]:.1f})\n'
+            f'  → low std (≲ a few mm/deg) = stable handeye; large std = robot moved '
+            f'or marker pose noisy during the sample window.')
+
+        self._publish_handeye(T_ee_cam_avg)
+
+    def _publish_handeye(self, T_ee_cam: np.ndarray) -> None:
+        """One sendTransform with BOTH static TFs (StaticTransformBroadcaster
+        replaces ALL previously published transforms each call, so they MUST
+        be sent together)."""
+        stamp = self.get_clock().now().to_msg()
+
+        # 1) world → base_link (identity — world IS the robot base).
+        tf_w2b = TransformStamped()
+        tf_w2b.header.stamp = stamp
+        tf_w2b.header.frame_id = self.world_frame
+        tf_w2b.child_frame_id = self.base_frame
+        tf_w2b.transform.rotation.w = 1.0  # identity
+
+        # 2) ee_frame → camera_frame (the computed hand-eye).
+        R_ec = T_ee_cam[:3, :3]
+        t_ec = T_ee_cam[:3, 3]
+        qx, qy, qz, qw = _rot_to_quat(R_ec)
+        tf_e2c = TransformStamped()
+        tf_e2c.header.stamp = stamp
+        tf_e2c.header.frame_id = self.ee_frame
+        tf_e2c.child_frame_id = self.camera_frame
+        tf_e2c.transform.translation.x = float(t_ec[0])
+        tf_e2c.transform.translation.y = float(t_ec[1])
+        tf_e2c.transform.translation.z = float(t_ec[2])
+        tf_e2c.transform.rotation.x = qx
+        tf_e2c.transform.rotation.y = qy
+        tf_e2c.transform.rotation.z = qz
+        tf_e2c.transform.rotation.w = qw
+
+        self.broadcaster.sendTransform([tf_w2b, tf_e2c])
+        self.published = True
+        self.get_logger().info(
+            f'[handeye-aruco] Static TFs: '
+            f'{self.world_frame}→{self.base_frame} (identity) | '
+            f'{self.ee_frame}→{self.camera_frame} '
+            f'pos=({t_ec[0]:.3f},{t_ec[1]:.3f},{t_ec[2]:.3f})m')
 
     # ── Floor mode ─────────────────────────────────────────────────────────
 

@@ -26,12 +26,28 @@ Args:
   rviz_config     : path to .rviz file      (default: package rviz/)
   control_panel   : true|false — show Reset/Redetect popup window (default: true)
 """
+import os
+import tempfile
+
+import yaml
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
+
+
+def _write_node_param_override(node_name: str, params: dict) -> str:
+    """Temp YAML pinning per-node parameters; needed because a wildcard inline
+    dict in `parameters=` cannot override a node-specific entry from the user
+    yaml (rcl precedence). A second --params-file with matching node
+    namespace IS applied (in order) and wins."""
+    fd, path = tempfile.mkstemp(
+        suffix=f'_{node_name}_override.yaml', text=True)
+    with os.fdopen(fd, 'w') as f:
+        yaml.safe_dump({node_name: {'ros__parameters': params}}, f)
+    return path
 
 
 def _make_nodes(context, *args, **kwargs):
@@ -63,13 +79,16 @@ def _make_nodes(context, *args, **kwargs):
              f'{pfx}/aligned_depth_to_color/image_raw'),
         ]
 
-    # Optional YOLO weight override (e.g. a view-specialised model selected
-    # from params.yaml by digital_twin_sequence.launch.py). Empty → use
-    # detection_node.model from params.yaml.
+    # Optional YOLO weight override (view-specialised model selected from
+    # params.yaml by digital_twin_sequence.launch.py).  See
+    # _write_node_param_override above — node-specific yaml beats wildcard
+    # inline dicts, so the override is its own --params-file appended AFTER
+    # params.yaml.
     yolo_model = LaunchConfiguration('yolo_model').perform(context)
     detection_params = list(common_params)
     if yolo_model:
-        detection_params.append({'model': yolo_model})
+        detection_params.append(_write_node_param_override(
+            'detection_node', {'model': yolo_model}))
 
     world_origin = Node(
         package='depth_digital_twin', executable='world_origin_node',

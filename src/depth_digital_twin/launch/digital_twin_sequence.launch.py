@@ -7,13 +7,17 @@ Choose which recorded camera feeds the pipeline with `view:=exo|hand`.
     Frame: camera_color_optical_frame → world (via world_origin_node).
 
   view:=hand
-    FK-based world transform — no ArUco needed (hand camera is wrist-mounted
-    and does not see the marker).  Requires dsr_description2:
+    Runtime hand-eye calibration via ArUco (replaces the prior static npy
+    chain).  The recorded sequence MUST include frames where the hand camera
+    sees the same workspace ArUco marker as exo.  Requires dsr_description2:
       source ~/ros2_ws/install/setup.bash
-    TF chain:
-      world ──(RSP m0609, world_fixed=identity)──► base_link
+    TF chain (after handeye_aruco calibration completes):
+      world ──(world_origin_node, identity)──► base_link
       base_link ──(URDF FK from /joint_states)──► link_6
-      link_6 ──(handeye_tf_node, T_gripper2camera.npy)──► hand_color_optical_frame
+      link_6 ──(world_origin_node handeye_aruco)──► hand_color_optical_frame
+    Each per-sample hand-eye is computed as
+      T_link6_cam = inv(T_base_link6) · inv(T_cam_marker · T_marker_base)
+    over `world_marker_samples_required` ArUco detections, then SE(3)-averaged.
 
 Prerequisites:
   source ~/Projects/ros2-recode-sequence/install/setup.bash
@@ -30,7 +34,9 @@ Args:
   sequence    : absolute path to a recorded sequence dir (REQUIRED)
   view        : exo | hand — camera into pipeline (default exo)
   yolo_model  : override detection_node.model (empty = params.yaml selection)
-  handeye_npy : T_gripper2camera.npy (view:=hand only)
+  handeye_npy : DEPRECATED — view:=hand now uses runtime ArUco-based hand-eye.
+                Argument kept for backwards compat with older invocations; the
+                value is ignored.
   model       : Doosan URDF model name (default m0609, view:=hand only)
   color       : URDF color (default white, view:=hand only)
   name        : robot instance name (default dsr01, view:=hand only)
@@ -41,8 +47,29 @@ Args:
 """
 import json
 import os
+import tempfile
 
 import yaml
+
+
+def _write_node_param_override(node_name: str, params: dict) -> str:
+    """Write a temp YAML pinning per-node parameters under `<node_name>:
+    ros__parameters: …` and return its path.
+
+    Why we need this: when params.yaml stores a key in a node-specific section
+    (`detection_node: ros__parameters: model: …`), ROS 2's parameter loader
+    treats node-specific entries with higher precedence than any wildcard
+    inline-dict that launch_ros serialises for us — so passing the override
+    via `parameters=[{'model': new_path}]` (which becomes `/**: model: new`)
+    silently loses to the user's yaml.  A second --params-file with the SAME
+    node-specific structure DOES override the first (rcl applies them in
+    order), so we generate one on the fly and append it AFTER params.yaml.
+    """
+    fd, path = tempfile.mkstemp(
+        suffix=f'_{node_name}_override.yaml', text=True)
+    with os.fdopen(fd, 'w') as f:
+        yaml.safe_dump({node_name: {'ros__parameters': params}}, f)
+    return path
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (DeclareLaunchArgument, IncludeLaunchDescription,
@@ -214,17 +241,34 @@ def _setup_hand(context, seq, intr, pkg, params, model, common_params,
         parameters=[{'robot_description': ParameterValue(
             robot_description, value_type=str)}])
 
+    # Runtime hand-eye calibration via ArUco (replaces the pre-calibrated
+    # T_gripper2camera.npy). world_origin_node in 'handeye_aruco' mode sees
+    # the SAME marker as exo, looks up base_link→link_6 via tf2 at each
+    # ArUco sample, and publishes:
+    #   world      → base_link            (identity)
+    #   link_6     → hand_color_optical_frame  (computed hand-eye)
     handeye = Node(
-        package='recode_sequence', executable='handeye_tf_node',
-        name='handeye_tf_node', output='screen',
-        parameters=[{
-            'handeye_npy': LaunchConfiguration('handeye_npy').perform(context),
-            'parent_frame': 'link_6',
-            'child_frame': 'hand_color_optical_frame',
-            'units_scale': 0.001,
+        package='depth_digital_twin', executable='world_origin_node',
+        name='world_origin_node', output='screen',
+        parameters=common_params + [{
+            'world_origin_mode': 'handeye_aruco',
+            'color_topic': _PIPE_COLOR,
+            'camera_frame': 'hand_color_optical_frame',
+            'world_frame': 'world',
+            'base_frame': 'base_link',
+            'ee_frame': 'link_6',
+            # Floor-plane fallback doesn't make sense for the hand camera —
+            # without an ArUco view we have no way to anchor world.
+            'aruco_timeout_then_floor': False,
         }])
 
-    det_params = common_params + ([{'model': model}] if model else [])
+    # See _write_node_param_override docstring — node-specific yaml beats
+    # wildcard inline dict, so the override has to be its own --params-file
+    # with the matching node-namespace structure.
+    det_params = list(common_params)
+    if model:
+        det_params.append(_write_node_param_override(
+            'detection_node', {'model': model}))
     detection = Node(
         package='depth_digital_twin', executable='detection_node',
         name='detection_node', output='screen',
@@ -250,7 +294,16 @@ def _setup_hand(context, seq, intr, pkg, params, model, common_params,
         package='recode_sequence', executable='playback_control',
         name='playback_control', output='screen')
 
-    return [player, rsp, handeye, detection, point_cloud, rviz, playback_ctrl]
+    # Redetect ArUco popup — same UI as exo (digital_twin.launch.py wires it
+    # by default).  Calls /world_origin_node/redetect (std_srvs/Trigger);
+    # handeye_aruco mode clears both aruco_samples and the paired
+    # handeye_link6_samples, re-subscribes to color, and recomputes.
+    world_origin_ctrl = Node(
+        package='depth_digital_twin', executable='world_origin_control',
+        name='world_origin_control', output='screen')
+
+    return [player, rsp, handeye, detection, point_cloud, rviz,
+            playback_ctrl, world_origin_ctrl]
 
 
 def generate_launch_description() -> LaunchDescription:
