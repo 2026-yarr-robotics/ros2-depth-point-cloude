@@ -131,7 +131,7 @@ class PickUiNode(Node):
         locked = cup.get('locked', False)
         # box_top = cup TOP centre in `world` (== base_link). Send as raw
         # gripper Z (`z`), NOT cup_bottom_z (which is the cup's bottom).
-        payload = {'x': float(pos[0]), 'y': float(pos[1]), 'z': float(pos[2])}
+        payload = {'x': float(pos[0]), 'y': float(pos[1]), 'nested_count': 1} #, 'cup_top_z': float(pos[2])}
         self.get_logger().info(
             f'[PICK] cup #{tid} locked={locked} '
             f'top_world=({pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f}) '
@@ -144,10 +144,21 @@ class PickUiNode(Node):
         """Daemon-thread HTTP POST to the robot skill-pick API."""
         try:
             data = json.dumps(payload).encode('utf-8')
+            # The API sits behind Cloudflare, which trips its Browser Integrity
+            # Check (HTTP 403 / error 1010) on the default Python-urllib UA.
+            # A standard-looking User-Agent gets the request through to origin.
             req = urllib.request.Request(
                 self._pick_api_url, data=data, method='POST',
-                headers={'Content-Type': 'application/json',
-                         'Accept': 'application/json'})
+                headers={
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json',
+                    'User-Agent': (
+                        'Mozilla/5.0 (X11; Linux x86_64) '
+                        'AppleWebKit/537.36 (KHTML, like Gecko) '
+                        'Chrome/120.0.0.0 Safari/537.36 '
+                        'pick_ui_node/0.1'),
+                    'Accept-Language': 'en-US,en;q=0.9',
+                })
             with urllib.request.urlopen(
                     req, timeout=self._pick_timeout) as resp:
                 body = resp.read().decode('utf-8', 'replace')

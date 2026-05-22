@@ -333,13 +333,32 @@ class PointCloudNode(Node):
                    det_msg: SegmentedObjectArray) -> None:
         """Per-frame: ingest detections into per-track buffers + emit live
         debug images. Heavy work (filter, fit, marker/cloud publish) is
-        deferred to `_finalize_window` which fires every `window_period_s`."""
+        deferred to `_finalize_window` which fires every `window_period_s`.
+
+        TF lookup uses the IMAGE STAMP (with a short blocking timeout) so the
+        cloud is transformed via world←camera AT IMAGE-CAPTURE TIME — critical
+        for the wrist-mounted (handeye_aruco) case where the camera moves
+        with link_6.  Falls back to Time(0) (latest) when the stamped lookup
+        extrapolates, so a fixed exo camera still works the way it did.
+        """
         try:
             tf = self.tf_buffer.lookup_transform(
-                self.world_frame, self.camera_frame, rclpy.time.Time())
+                self.world_frame, self.camera_frame,
+                rclpy.time.Time.from_msg(rgb_msg.header.stamp),
+                timeout=rclpy.duration.Duration(seconds=0.1))
+        except tf2_ros.ExtrapolationException:
+            try:
+                tf = self.tf_buffer.lookup_transform(
+                    self.world_frame, self.camera_frame, rclpy.time.Time())
+            except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                    tf2_ros.ExtrapolationException):
+                self.get_logger().warn(
+                    f'TF {self.world_frame}<-{self.camera_frame} not available '
+                    f'(neither at stamp nor latest)',
+                    throttle_duration_sec=2.0)
+                return
         except (tf2_ros.LookupException,
-                tf2_ros.ConnectivityException,
-                tf2_ros.ExtrapolationException):
+                tf2_ros.ConnectivityException):
             self.get_logger().warn(
                 f'TF {self.world_frame}<-{self.camera_frame} not available yet',
                 throttle_duration_sec=2.0)
@@ -351,6 +370,21 @@ class PointCloudNode(Node):
                          tf.transform.translation.z], dtype=np.float64)
         q = tf.transform.rotation
         R_wc = _quat_to_rot(q.x, q.y, q.z, q.w)
+
+        # Visibility: throttled INFO log of the live camera-in-world position
+        # so it's obvious from the console that this transform IS being
+        # refreshed per frame (esp. for the handeye_aruco hand camera).  Also
+        # log how much t_wc moved since the last print — if EE motion isn't
+        # propagating, this number stays at 0 mm.
+        if not hasattr(self, '_last_t_wc_log'):
+            self._last_t_wc_log = t_wc.copy()
+        delta_mm = float(np.linalg.norm(t_wc - self._last_t_wc_log)) * 1000.0
+        self.get_logger().info(
+            f'world<-{self.camera_frame} '
+            f'pos=({t_wc[0]:+.3f},{t_wc[1]:+.3f},{t_wc[2]:+.3f})m '
+            f'Δ={delta_mm:.1f}mm/frame',
+            throttle_duration_sec=2.0)
+        self._last_t_wc_log = t_wc.copy()
 
         rgb = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding='bgr8')
         depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')

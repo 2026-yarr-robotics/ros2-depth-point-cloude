@@ -21,6 +21,10 @@ Args:
   rviz_config      : path to .rviz file
   intrinsics        : path to intrinsics.yaml
   params            : path to params.yaml
+  camera_ns        : RealSense namespace forwarded to digital_twin.launch.py
+                     'camera' = rs_align_depth_launch.py default (/camera/camera/...)
+                     'exo'    = cameras_only.launch.py view:=exo (/exo/exo/...)
+                     (default: camera)
 """
 import os
 
@@ -67,6 +71,11 @@ def generate_launch_description() -> LaunchDescription:
         'params',
         default_value=PathJoinSubstitution([pkg_dt, 'config', 'params.yaml']),
         description='Absolute path to params.yaml')
+    camera_ns_arg = DeclareLaunchArgument(
+        'camera_ns', default_value='camera',
+        description='RealSense namespace. '
+                    '"camera" = rs_align_depth_launch.py default. '
+                    '"exo" = cameras_only.launch.py view:=exo (/exo/exo/...).')
 
     # ----- robot URDF -----
     robot_description_content = Command([
@@ -122,10 +131,11 @@ def generate_launch_description() -> LaunchDescription:
             'rviz_config': LaunchConfiguration('rviz_config'),
             'intrinsics': LaunchConfiguration('intrinsics'),
             'params': LaunchConfiguration('params'),
+            'camera_ns': LaunchConfiguration('camera_ns'),
         }.items())
 
     return LaunchDescription([
         model_arg, color_arg, name_arg, bridge_arg,
-        rviz_arg, rviz_config_arg, intrinsics_arg, params_arg,
+        rviz_arg, rviz_config_arg, intrinsics_arg, params_arg, camera_ns_arg,
         robot_state_publisher, pose_bridge, world_to_base_tf, digital_twin,
     ])

@@ -49,14 +49,17 @@ import cv2.aruco as aruco
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
-from geometry_msgs.msg import TransformStamped
+from geometry_msgs.msg import (Point as MsgPoint, Pose, PoseStamped, Quaternion,
+                               TransformStamped)
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.time import Time as RclpyTime
 from sensor_msgs.msg import Image
+from std_msgs.msg import ColorRGBA
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, StaticTransformBroadcaster, TransformListener
 from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
+from visualization_msgs.msg import Marker, MarkerArray
 
 from depth_digital_twin.intrinsics import load_intrinsics
 
@@ -80,14 +83,27 @@ class WorldOriginNode(Node):
 
         # ── handeye_aruco mode params ──────────────────────────────────────
         # FK chain endpoints. With m0609, base_link → ... → link_6.
-        # `world` is published as identity onto base_frame so the rest of the
-        # stack (point_cloud_node, etc.) keeps the world_frame convention.
         self.declare_parameter('base_frame', 'base_link')
         self.declare_parameter('ee_frame', 'link_6')
         # Per-sample tf2 lookup timeout when querying base_frame → ee_frame
         # at the image timestamp. Sequence playback can have a small delay
         # between joint_states arrival and TF availability.
         self.declare_parameter('handeye_tf_lookup_timeout_s', 0.2)
+        # m0609's xacro (simple=false, default) already defines a `world` link
+        # and a `world→base_link` fixed joint, so RSP publishes that identity.
+        # If we ALSO publish it from here, two sources collide and tf2 warns.
+        # Default off; only flip on when URDF root is `base_link` (simple=true
+        # or non-Doosan rigs) so the world frame still gets grounded.
+        self.declare_parameter('handeye_emit_world_to_base', False)
+
+        # Visual + diagnostic outputs (always emitted in handeye_aruco mode).
+        # Topic names match the system_state_aggregator/README convention.
+        self.declare_parameter('handeye_viz_topic', '/handeye_markers')
+        self.declare_parameter('handeye_pose_topic',
+                               '/handeye_camera_pose_in_base')
+        # Rate for the live cam-in-base sphere + PoseStamped; the link_6→cam
+        # line is published once (latched) and persists.
+        self.declare_parameter('handeye_viz_rate_hz', 10.0)
 
         # ── aruco mode params ──────────────────────────────────────────────
         self.declare_parameter('color_topic', '/camera/camera/color/image_raw')
@@ -260,15 +276,37 @@ class WorldOriginNode(Node):
             self.ee_frame: str = str(self.get_parameter('ee_frame').value)
             self._handeye_tf_timeout = float(
                 self.get_parameter('handeye_tf_lookup_timeout_s').value)
+            self._handeye_emit_w2b: bool = bool(
+                self.get_parameter('handeye_emit_world_to_base').value)
+            self._handeye_viz_rate: float = max(
+                0.1, float(self.get_parameter('handeye_viz_rate_hz').value))
             self.tf_buffer = Buffer()
             self.tf_listener = TransformListener(self.tf_buffer, self)
+
+            # Live visualization + diagnostic — created up-front so subscribers
+            # (RViz, downstream nodes) can latch onto them before calibration
+            # completes; the timer is a no-op until `self.published` flips.
+            self._handeye_viz_pub = self.create_publisher(
+                MarkerArray,
+                str(self.get_parameter('handeye_viz_topic').value), 5)
+            self._handeye_pose_pub = self.create_publisher(
+                PoseStamped,
+                str(self.get_parameter('handeye_pose_topic').value), 10)
+            self.create_timer(
+                1.0 / self._handeye_viz_rate, self._handeye_viz_tick)
+            # Cached handeye result so the latched line marker can be
+            # republished if a late subscriber appears (RViz reconnect).
+            self._handeye_T_ee_cam: np.ndarray | None = None
+
+            w2b_note = ('+ world→base_link identity'
+                        if self._handeye_emit_w2b
+                        else '(world→base_link NOT emitted — assumed via URDF)')
             self.get_logger().info(
                 f'handeye_aruco mode: ID={self.marker_id} dict={dict_name} '
                 f'length={self.marker_length*100:.1f}cm '
                 f'target={self.aruco_samples_req} samples. '
                 f'FK chain: {self.base_frame} → {self.ee_frame}.  Output: '
-                f'{self.ee_frame} → {self.camera_frame} (hand-eye) + '
-                f'{self.world_frame} → {self.base_frame} (identity).')
+                f'{self.ee_frame} → {self.camera_frame} (hand-eye) {w2b_note}.')
             return
 
         self.get_logger().info(
@@ -504,19 +542,17 @@ class WorldOriginNode(Node):
         self._publish_handeye(T_ee_cam_avg)
 
     def _publish_handeye(self, T_ee_cam: np.ndarray) -> None:
-        """One sendTransform with BOTH static TFs (StaticTransformBroadcaster
-        replaces ALL previously published transforms each call, so they MUST
-        be sent together)."""
+        """Send the handeye static TF (+ optional world→base identity) in ONE
+        sendTransform call.  StaticTransformBroadcaster replaces ALL prior
+        transforms on each call, so they MUST be batched.
+
+        Also fires the link_6→cam line marker (A) here; the live cam-in-base
+        sphere + PoseStamped (B + C) are driven by `_handeye_viz_tick`.
+        """
         stamp = self.get_clock().now().to_msg()
+        tfs: list[TransformStamped] = []
 
-        # 1) world → base_link (identity — world IS the robot base).
-        tf_w2b = TransformStamped()
-        tf_w2b.header.stamp = stamp
-        tf_w2b.header.frame_id = self.world_frame
-        tf_w2b.child_frame_id = self.base_frame
-        tf_w2b.transform.rotation.w = 1.0  # identity
-
-        # 2) ee_frame → camera_frame (the computed hand-eye).
+        # 1) ee_frame → camera_frame (the rigid hand-eye).
         R_ec = T_ee_cam[:3, :3]
         t_ec = T_ee_cam[:3, 3]
         qx, qy, qz, qw = _rot_to_quat(R_ec)
@@ -531,14 +567,173 @@ class WorldOriginNode(Node):
         tf_e2c.transform.rotation.y = qy
         tf_e2c.transform.rotation.z = qz
         tf_e2c.transform.rotation.w = qw
+        tfs.append(tf_e2c)
 
-        self.broadcaster.sendTransform([tf_w2b, tf_e2c])
+        # 2) Optionally world → base_link identity (off by default — see the
+        # `handeye_emit_world_to_base` param docstring; m0609 URDF already
+        # publishes this via RSP, so emitting again causes a TF source clash).
+        w2b_note = ''
+        if self._handeye_emit_w2b:
+            tf_w2b = TransformStamped()
+            tf_w2b.header.stamp = stamp
+            tf_w2b.header.frame_id = self.world_frame
+            tf_w2b.child_frame_id = self.base_frame
+            tf_w2b.transform.rotation.w = 1.0
+            tfs.append(tf_w2b)
+            w2b_note = (
+                f' | {self.world_frame}→{self.base_frame} (identity, emitted)')
+        else:
+            w2b_note = (
+                f' | {self.world_frame}→{self.base_frame} NOT emitted '
+                '(assumed via URDF — set handeye_emit_world_to_base=true if not)')
+
+        self.broadcaster.sendTransform(tfs)
         self.published = True
+        self._handeye_T_ee_cam = T_ee_cam.copy()
+        self._publish_handeye_line_marker(T_ee_cam)
         self.get_logger().info(
-            f'[handeye-aruco] Static TFs: '
-            f'{self.world_frame}→{self.base_frame} (identity) | '
-            f'{self.ee_frame}→{self.camera_frame} '
-            f'pos=({t_ec[0]:.3f},{t_ec[1]:.3f},{t_ec[2]:.3f})m')
+            f'[handeye-aruco] Static TF: {self.ee_frame}→{self.camera_frame} '
+            f'pos=({t_ec[0]:.3f},{t_ec[1]:.3f},{t_ec[2]:.3f})m  '
+            f'|t|={float(np.linalg.norm(t_ec))*100:.1f}cm{w2b_note}')
+
+    # ── A. link_6 → camera 연결 선 마커 (latched, one-shot) ───────────────
+
+    def _publish_handeye_line_marker(self, T_ee_cam: np.ndarray) -> None:
+        """LINE_STRIP + endpoint SPHERE + TEXT in the `ee_frame` so RViz
+        automatically transports them with link_6 as the URDF moves.  Shows
+        the rigid hand-eye as a real connecting segment instead of just two
+        TF axis triads floating in space."""
+        t_ec = T_ee_cam[:3, 3]
+        dist_cm = float(np.linalg.norm(t_ec)) * 100.0
+        stamp = self.get_clock().now().to_msg()
+        ma = MarkerArray()
+
+        # Clear any stale markers from a previous calibration cycle so the
+        # latched output doesn't accumulate stripes.
+        clear = Marker()
+        clear.header.frame_id = self.ee_frame
+        clear.header.stamp = stamp
+        clear.ns = 'handeye_link'
+        clear.action = Marker.DELETEALL
+        ma.markers.append(clear)
+
+        line = Marker()
+        line.header.frame_id = self.ee_frame
+        line.header.stamp = stamp
+        line.ns = 'handeye_link'
+        line.id = 0
+        line.type = Marker.LINE_STRIP
+        line.action = Marker.ADD
+        line.scale.x = 0.004      # line width (m)
+        line.color = ColorRGBA(r=1.0, g=0.6, b=0.0, a=1.0)   # orange
+        line.points.append(MsgPoint(x=0.0, y=0.0, z=0.0))
+        line.points.append(MsgPoint(
+            x=float(t_ec[0]), y=float(t_ec[1]), z=float(t_ec[2])))
+        line.pose.orientation.w = 1.0
+        ma.markers.append(line)
+
+        tip = Marker()
+        tip.header.frame_id = self.ee_frame
+        tip.header.stamp = stamp
+        tip.ns = 'handeye_link'
+        tip.id = 1
+        tip.type = Marker.SPHERE
+        tip.action = Marker.ADD
+        tip.pose.position = MsgPoint(
+            x=float(t_ec[0]), y=float(t_ec[1]), z=float(t_ec[2]))
+        tip.pose.orientation.w = 1.0
+        tip.scale.x = tip.scale.y = tip.scale.z = 0.02
+        tip.color = ColorRGBA(r=1.0, g=0.6, b=0.0, a=1.0)
+        ma.markers.append(tip)
+
+        label = Marker()
+        label.header.frame_id = self.ee_frame
+        label.header.stamp = stamp
+        label.ns = 'handeye_link'
+        label.id = 2
+        label.type = Marker.TEXT_VIEW_FACING
+        label.action = Marker.ADD
+        label.pose.position = MsgPoint(
+            x=float(t_ec[0]), y=float(t_ec[1]),
+            z=float(t_ec[2]) + 0.03)
+        label.pose.orientation.w = 1.0
+        label.scale.z = 0.025
+        label.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
+        label.text = (f'{self.ee_frame}→{self.camera_frame}\n'
+                      f'|t|={dist_cm:.1f}cm')
+        ma.markers.append(label)
+
+        self._handeye_viz_pub.publish(ma)
+
+    # ── B + C. live cam-in-base sphere + PoseStamped (periodic) ───────────
+
+    def _handeye_viz_tick(self) -> None:
+        """At handeye_viz_rate_hz: tf2-lookup the CURRENT world←camera_frame
+        pose (which moves as link_6 moves via the URDF + our rigid handeye)
+        and publish (a) a sphere in `world` (B), (b) a PoseStamped (C).
+
+        No-op until calibration completes — `self.published` flips True only
+        after _publish_handeye is called.
+        """
+        if not getattr(self, 'published', False):
+            return
+        if self._mode != 'handeye_aruco':
+            return
+        try:
+            ts = self.tf_buffer.lookup_transform(
+                self.world_frame, self.camera_frame, RclpyTime(),
+                timeout=Duration(seconds=0.05))
+        except (LookupException, ConnectivityException,
+                ExtrapolationException):
+            return
+
+        # (C) PoseStamped — camera pose in world (= base).
+        pose = PoseStamped()
+        pose.header.stamp = ts.header.stamp
+        pose.header.frame_id = self.world_frame
+        pose.pose.position.x = ts.transform.translation.x
+        pose.pose.position.y = ts.transform.translation.y
+        pose.pose.position.z = ts.transform.translation.z
+        pose.pose.orientation = ts.transform.rotation
+        self._handeye_pose_pub.publish(pose)
+
+        # (B) live sphere at the camera position, in `world` so RViz can
+        # show it alongside the URDF without an extra fixed frame.
+        ma = MarkerArray()
+        s = Marker()
+        s.header.frame_id = self.world_frame
+        s.header.stamp = ts.header.stamp
+        s.ns = 'handeye_camera_in_base'
+        s.id = 0
+        s.type = Marker.SPHERE
+        s.action = Marker.ADD
+        s.pose.position.x = ts.transform.translation.x
+        s.pose.position.y = ts.transform.translation.y
+        s.pose.position.z = ts.transform.translation.z
+        s.pose.orientation = ts.transform.rotation
+        s.scale.x = s.scale.y = s.scale.z = 0.025
+        s.color = ColorRGBA(r=0.0, g=0.7, b=1.0, a=0.9)   # cyan
+        ma.markers.append(s)
+
+        lbl = Marker()
+        lbl.header.frame_id = self.world_frame
+        lbl.header.stamp = ts.header.stamp
+        lbl.ns = 'handeye_camera_in_base'
+        lbl.id = 1
+        lbl.type = Marker.TEXT_VIEW_FACING
+        lbl.action = Marker.ADD
+        lbl.pose.position.x = ts.transform.translation.x
+        lbl.pose.position.y = ts.transform.translation.y
+        lbl.pose.position.z = float(ts.transform.translation.z) + 0.04
+        lbl.pose.orientation.w = 1.0
+        lbl.scale.z = 0.025
+        lbl.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
+        lbl.text = (f'{self.camera_frame} in {self.world_frame}\n'
+                    f'({ts.transform.translation.x:+.3f}, '
+                    f'{ts.transform.translation.y:+.3f}, '
+                    f'{ts.transform.translation.z:+.3f}) m')
+        ma.markers.append(lbl)
+        self._handeye_viz_pub.publish(ma)
 
     # ── Floor mode ─────────────────────────────────────────────────────────
 

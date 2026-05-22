@@ -197,10 +197,10 @@ source ~/Projects/ros2-depth-point-cloude/install/setup.bash
 
 # exo (기본)
 ros2 launch depth_digital_twin digital_twin_sequence.launch.py \
-    sequence:=/home/eunwoosong/Projects/record_sequence/0005
+    sequence:=/home/eunwoosong/Projects/record_sequence/0010
 # hand 카메라로 보기  (ROS2는 --hand 가 아니라 view:=hand)
 ros2 launch depth_digital_twin digital_twin_sequence.launch.py \
-    sequence:=/home/eunwoosong/Projects/record_sequence/0005 view:=hand
+    sequence:=/home/eunwoosong/Projects/record_sequence/0010 view:=hand
 ```
 
 | arg | default | 설명 |

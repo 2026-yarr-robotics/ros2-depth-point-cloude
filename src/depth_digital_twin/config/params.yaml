@@ -43,18 +43,17 @@ world_origin_node:
 
 detection_node:
   ros__parameters:
-    # `model` = default / live-camera weight.
-    model: /home/eunwoosong/Projects/ros2-depth-point-cloude/vision/yolo/yolo26m-seg-best.pt
+    # `model` = default / live-camera weight (digital_twin.launch.py and
+    # digital_twin_with_robot.launch.py when no view-specific override is
+    # passed).  Both exo and hand ship the same 2-class taxonomy now.
+    model: /home/eunwoosong/Projects/ros2-depth-point-cloude/vision/yolo/0522_exo_best.pt
     # Per-view weights for digital_twin_sequence.launch.py (view:=exo|hand).
-    # Replace model_hand with a hand-specialised weight when available.
-    model_exo: /home/eunwoosong/Projects/ros2-depth-point-cloude/vision/yolo/yolo26m-seg-best.pt
+    model_exo: /home/eunwoosong/Projects/ros2-depth-point-cloude/vision/yolo/0522_exo_best.pt
     model_hand: /home/eunwoosong/Projects/ros2-depth-point-cloude/vision/yolo/hand_eye_view_yolo26m_seg_1280_epoch250_roboflow_0518_medium_a100_best.pt
-    # Union of every class our two models emit:
-    #   exo model    : "cup"                   (legacy, single class)
-    #   hand model   : "fallen-cup" (id=1), "upright-cup" (id=2)
-    # Each model only emits its own classes, so passing the union to both is
-    # safe — the irrelevant entries simply never match in the other view.
-    target_classes: ["cup", "fallen-cup", "upright-cup"]
+    # Both models emit the same two classes:
+    #   "fallen-cup"  (id=1)
+    #   "upright-cup" (id=2)
+    target_classes: ["fallen-cup", "upright-cup"]
     confidence: 0.35
     image_topic: /camera/camera/color/image_raw
     detections_topic: /digital_twin/detections
@@ -72,7 +71,7 @@ point_cloud_node:
     box_debug_topic: /digital_twin/box_debug
     downsample: 2
     z_min: 0.1
-    z_max: 4.0
+    z_max: 6.0     # raised from 4.0 — current exo mount sees cups @ ~4.2 m
     box_line_width: 0.0015
     box_alpha: 0.25
     box_standing_ratio: 0.8
@@ -95,12 +94,11 @@ point_cloud_node:
 
     # Classes that get the truncated-cone (Speed Stack standing cup) fit.
     # Anything NOT in this list falls through to _compute_box_world (OBB/AABB
-    # from YOLO mask + depth, no shape prior) — which is the right model for
-    # fallen-cup (axis no longer vertical, the cone fit can't represent it).
-    #   exo  "cup"          → cone fit
-    #   hand "upright-cup"  → cone fit
-    #   hand "fallen-cup"   → OBB fallback (no entry here)
-    cup_class_names: ["cup", "upright-cup"]
+    # from YOLO mask + depth, no shape prior) — the right model for fallen-cup
+    # (axis no longer vertical, the cone fit can't represent it).
+    #   "upright-cup"  → cone fit
+    #   "fallen-cup"   → OBB fallback (intentionally absent)
+    cup_class_names: ["upright-cup"]
 
     # ----- Accumulating-window pipeline -----
     window_period_s: 0.1
