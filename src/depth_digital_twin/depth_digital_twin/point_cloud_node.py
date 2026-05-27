@@ -371,20 +371,37 @@ class PointCloudNode(Node):
         q = tf.transform.rotation
         R_wc = _quat_to_rot(q.x, q.y, q.z, q.w)
 
-        # Visibility: throttled INFO log of the live camera-in-world position
-        # so it's obvious from the console that this transform IS being
-        # refreshed per frame (esp. for the handeye_aruco hand camera).  Also
-        # log how much t_wc moved since the last print — if EE motion isn't
-        # propagating, this number stays at 0 mm.
-        if not hasattr(self, '_last_t_wc_log'):
+        # Diagnostics: print frame-to-frame Δ AND cumulative Δ since the last
+        # logged line, plus the tf stamp actually used.  If tf_stamp doesn't
+        # advance → tf_buffer isn't receiving fresh /tf (RSP / joint_states /
+        # subscription problem).  If tf_stamp advances but pos doesn't →
+        # joint values are constant (recorded sequence motionless).
+        if not hasattr(self, '_last_t_wc_frame'):
+            self._last_t_wc_frame = t_wc.copy()
             self._last_t_wc_log = t_wc.copy()
-        delta_mm = float(np.linalg.norm(t_wc - self._last_t_wc_log)) * 1000.0
-        self.get_logger().info(
+            self._tf_max_frame_mm = 0.0
+        frame_d_mm = float(
+            np.linalg.norm(t_wc - self._last_t_wc_frame)) * 1000.0
+        self._tf_max_frame_mm = max(self._tf_max_frame_mm, frame_d_mm)
+        self._last_t_wc_frame = t_wc.copy()
+
+        cum_d_mm = float(
+            np.linalg.norm(t_wc - self._last_t_wc_log)) * 1000.0
+        ts = tf.header.stamp
+        # Use a local conditional so the throttled INFO does no work most ticks.
+        log_now = self.get_logger().info(
             f'world<-{self.camera_frame} '
             f'pos=({t_wc[0]:+.3f},{t_wc[1]:+.3f},{t_wc[2]:+.3f})m '
-            f'Δ={delta_mm:.1f}mm/frame',
+            f'  Δ_frame={frame_d_mm:.1f}mm '
+            f'  Δ_cum={cum_d_mm:.1f}mm '
+            f'  max_frame={self._tf_max_frame_mm:.1f}mm '
+            f'  tf_stamp={ts.sec}.{ts.nanosec:09d}',
             throttle_duration_sec=2.0)
+        # Only reset cumulative tracking after a log actually went out, but
+        # rclpy throttle doesn't expose that.  Approximate by resetting every
+        # call — cum then = inter-frame.  Use max_frame above to spot any spike.
         self._last_t_wc_log = t_wc.copy()
+        self._tf_max_frame_mm = 0.0
 
         rgb = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding='bgr8')
         depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
