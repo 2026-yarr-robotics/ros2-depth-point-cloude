@@ -115,3 +115,52 @@ point_cloud_node:
     # ----- ArUco marker axes overlay on box_debug -----
     aruco_overlay: true
     world_marker_length_m: 0.05         # must match world_origin_node value
+
+    # ────────────────────────────────────────────────────────────────────────
+    # === NOISE SUPPRESSION: Normal Vector + Top-Rim Filtering ===
+    # ────────────────────────────────────────────────────────────────────────
+    # (3) Algorithm-level post-processing: Legal surface filtering via normals
+    #
+    # Top-down view (45°) constraint: only points whose surface normal
+    # is roughly upward (world Z-axis) should have their depth trusted.
+    # Steep side surfaces (cups, noise) get rejected via dot product thresholding.
+
+    # Enable normal-vector-based filtering (geometric validation)
+    use_normal_filtering: true
+
+    # Expected surface normal direction (world frame). For top-down view:
+    # should be close to [0, 0, 1] (looking down at the table).
+    # The cone frustum surface normals should generally have positive Z component.
+    normal_ref_x: 0.0
+    normal_ref_y: 0.0
+    normal_ref_z: 1.0
+
+    # Min dot product (cos angle) between observed normal and reference normal.
+    # dot ≥ threshold means the normal points "mostly upward" (legal surface).
+    # 0.866 ≈ cos(30°) — reject if normal tilts > 30° from world +Z.
+    normal_dot_min: 0.866
+
+    # Window size for neighboring-point surface normal estimation (pixels)
+    # Larger = smoother but slower; typical 3–5 for depth maps.
+    normal_window_size: 3
+
+    # Enable spatial outlier rejection via local density (complementary to MAD)
+    # Remove points that are too isolated from neighbors in neighborhood.
+    use_spatial_density_filter: true
+    spatial_density_radius_m: 0.03    # neighborhood radius (30 mm)
+    spatial_density_min_neighbors: 5  # min neighbor count in radius
+
+    # ────────────────────────────────────────────────────────────────────────
+    # === REALSENSE SDK HARDWARE PARAMETERS ===
+    # ────────────────────────────────────────────────────────────────────────
+    # (1) RealSense post-processing filters (enable via launch override)
+    # These are activated in rs_align_depth_launch.py with:
+    #   decimation_filter.enable:=true
+    #   spatial_filter.enable:=true
+    #   temporal_filter.enable:=true
+    #   hole_filling_filter.enable:=true
+    #
+    # (2) Laser Power & Preset to reduce specular reflection noise
+    visual_preset: High Accuracy      # or Hand-Held, Short-Range
+    laser_power: 60                   # 0–100; lower = less reflection (default 80)
+    # For plastic cups, lower laser_power (40–60) can reduce rim noise

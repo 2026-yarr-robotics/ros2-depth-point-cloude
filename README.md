@@ -70,12 +70,29 @@ ros2 run depth_digital_twin calibrate \
 
 ### 3.2 카메라 실행 (별도 터미널)
 
+**⭐ 권장: RealSense 필터 활성화 + Laser Power 조절**
+
 ```bash
+# 포인트 클라우드 노이즈 극적 감소 (경사 탑다운 뷰 필수)
 ros2 launch realsense2_camera rs_align_depth_launch.py \
     depth_module.depth_profile:=1280x720x30 \
     rgb_camera.color_profile:=1280x720x30 \
-    initial_reset:=true align_depth.enable:=true
+    initial_reset:=true \
+    align_depth.enable:=true \
+    decimation_filter.enable:=true \
+    spatial_filter.enable:=true \
+    temporal_filter.enable:=true \
+    hole_filling_filter.enable:=true \
+    visual_preset:=High\ Accuracy \
+    laser_power:=60
 ```
+
+**필터 설명:**
+- `decimation_filter` (데시메이션): 해상도 낮춤/전체 노이즈 감소
+- `spatial_filter` (공간): 빈틈채우기 + 부드러운 표면 보정
+- `temporal_filter` (시간): 프레임 간 누적으로 깜빡이는 노이즈 제거
+- `hole_filling_filter` (홀필링): 남은 빈 공간 메우기
+- `laser_power:=60`: 플라스틱 컵 반사 감소 (기본값 80)
 
 > 2대 카메라 사용 시 (exo + hand — 아래 3.4 참고): RealSense 시리얼 번호로 구분.
 > ```bash
