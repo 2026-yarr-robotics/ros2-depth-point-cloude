@@ -68,6 +68,8 @@ point_cloud_node:
     detections_topic: /digital_twin/detections
     points_topic: /digital_twin/points
     boxes_topic: /digital_twin/boxes
+    # Namespaced so the integration aggregator_node sits in front of GSP.
+    cups_on_table_topic: /vision/cups_on_table
     box_debug_topic: /digital_twin/box_debug
     downsample: 2
     z_min: 0.1
