@@ -100,6 +100,63 @@ def _classify_color_bgr(bgr: np.ndarray, allowed: list[str]) -> str | None:
     return cand if cand in allowed else None
 
 
+class PositionKF:
+    """Constant-position Kalman filter on a 3D world-frame centre (metres).
+
+    Replaces the old EMA-smooth + scan-and-lock freeze. A cup is static
+    between relocations, so the motion model is "stays put" with a small
+    per-window process noise `q` that lets the estimate keep creeping toward
+    fresh measurements — this is what continuously corrects a slightly-wrong
+    fit, which the frozen LOCKED box never did.
+
+    State x (3,) is the centre; covariance P (3x3) is diagonal in practice.
+    `update()` gates each measurement on its Mahalanobis distance: a transient
+    depth spike is rejected so the estimate holds, while a *sustained* run of
+    rejections (handled by the caller) is treated as a real relocation and the
+    filter is `reset()` to re-acquire. Q/R are supplied as per-axis variance
+    vectors so the noisier Z axis can be weighted independently.
+    """
+
+    def __init__(self, x0: np.ndarray, p0_diag: np.ndarray,
+                 q_diag: np.ndarray) -> None:
+        self.x = np.asarray(x0, dtype=np.float64).copy()
+        self.P = np.diag(np.asarray(p0_diag, dtype=np.float64))
+        self.q = np.asarray(q_diag, dtype=np.float64)
+
+    def predict(self) -> None:
+        """Constant-position prediction: x unchanged, covariance grows by Q.
+        Called once per window (even on a miss) so a re-appearing cup is not
+        rejected by a stale, over-confident covariance."""
+        self.P = self.P + np.diag(self.q)
+
+    def update(self, z: np.ndarray, r_diag: np.ndarray,
+               gate: float) -> tuple[bool, float]:
+        """Gated Kalman measurement update. Returns (accepted, mahalanobis²).
+        When the innovation's Mahalanobis distance exceeds `gate` (>0) the
+        measurement is rejected and the state is left untouched."""
+        z = np.asarray(z, dtype=np.float64)
+        S = self.P + np.diag(np.asarray(r_diag, dtype=np.float64))
+        Sinv = np.linalg.inv(S)
+        y = z - self.x
+        d2 = float(y @ Sinv @ y)
+        if gate > 0.0 and d2 > gate:
+            return False, d2
+        K = self.P @ Sinv
+        self.x = self.x + K @ y
+        self.P = (np.eye(3) - K) @ self.P
+        return True, d2
+
+    def reset(self, z: np.ndarray, p0_diag: np.ndarray) -> None:
+        """Re-acquire at a new measurement (cup relocated). Restores the large
+        initial covariance so the next few measurements pull hard."""
+        self.x = np.asarray(z, dtype=np.float64).copy()
+        self.P = np.diag(np.asarray(p0_diag, dtype=np.float64))
+
+    def position_std(self) -> float:
+        """Worst-axis 1σ position uncertainty (m). Small ⇒ estimate settled."""
+        return float(np.sqrt(max(0.0, float(np.max(np.diag(self.P))))))
+
+
 class PointCloudNode(Node):
     def __init__(self) -> None:
         super().__init__('point_cloud_node')
@@ -149,24 +206,38 @@ class PointCloudNode(Node):
         # ByteTrack re-ids the same physical cup.
         self.declare_parameter('track_world_merge_dist_m', 0.08)
 
-        # ── Scan-and-lock ──────────────────────────────────────────────────
-        # A track transitions SCANNING → LOCKED after this many consecutive
-        # windows in which the smoothed cup centre stays within
-        # `lock_pose_eps_m` of the streak anchor (pose-stability criterion —
-        # the box is actually steady in space, not merely "the fit math
-        # succeeded N times").
-        self.declare_parameter('scan_lock_min_windows', 5)
-        # Max planar drift (m) from the streak anchor still counted as stable.
-        # Exceeding it re-anchors and restarts the streak.
-        self.declare_parameter('lock_pose_eps_m', 0.008)
-        # While LOCKED, if the fresh-window point centroid departs the frozen
-        # box centre by more than this (m), the cup was moved (robot pick /
-        # relocation) → auto-unlock and re-scan. Hysteresis: must be > eps so
-        # jitter doesn't flap the lock.
-        self.declare_parameter('lock_unlock_dist_m', 0.03)
-        # Windows of zero new points (YOLO miss) before a LOCKED track reverts
-        # to SCANNING and begins fresh accumulation.
-        self.declare_parameter('scan_locked_miss_max', 8)
+        # ── Kalman position filter (replaces EMA + scan-and-lock) ───────────
+        # Per-track constant-position Kalman filter on the cup/object centre.
+        # The estimate is never frozen: every in-gate window nudges it toward
+        # the fresh fit, so a slightly-wrong pose self-corrects over a few
+        # windows instead of sticking until the cup physically moves >3 cm.
+        #
+        # Process noise (per window) — how fast the estimate may drift toward
+        # new measurements. Larger ⇒ faster correction, slightly more jitter.
+        self.declare_parameter('kf_process_std_xy_m', 0.002)
+        self.declare_parameter('kf_process_std_z_m', 0.004)
+        # Base measurement noise — the per-window fit's assumed 1σ error. Z is
+        # noisier than XY on a stereo depth camera. Inflated adaptively by the
+        # cup-fit residual (see kf_resid_infl).
+        self.declare_parameter('kf_meas_std_xy_m', 0.005)
+        self.declare_parameter('kf_meas_std_z_m', 0.010)
+        # Initial / re-acquire covariance std — large so the first measurement
+        # (or a confirmed relocation) is trusted almost fully.
+        self.declare_parameter('kf_init_std_m', 0.05)
+        # Mahalanobis² gate (3 dof). A measurement beyond this is rejected as a
+        # transient spike. 9.0 ≈ χ²(3) at ~97%. 0 disables gating.
+        self.declare_parameter('kf_gate_mahalanobis', 9.0)
+        # Consecutive gated-out windows before the run is judged a real
+        # relocation (robot pick / place) and the filter re-acquires there.
+        # Rejects 1-frame spikes while still following a moved cup.
+        self.declare_parameter('kf_reacquire_windows', 3)
+        # Position 1σ (m) below which the track is reported "settled" ([S] tag).
+        # Replaces the old binary LOCKED state — purely informational now.
+        self.declare_parameter('kf_settled_std_m', 0.006)
+        # Measurement-noise inflation per unit of (residual / cup_fit_residual_max).
+        # Down-weights high-residual fits so a poor window can't yank the
+        # estimate. 0 disables (constant R).
+        self.declare_parameter('kf_resid_infl', 1.0)
 
         # ── Color classification + cups_on_table publish ──────────────────
         # Per-track color votes are accumulated from each frame's masked
@@ -190,7 +261,6 @@ class PointCloudNode(Node):
         self.declare_parameter('cup_bottom_diameter_m', 0.078)
         self.declare_parameter('cup_height_m', 0.095)
         self.declare_parameter('cup_polygon_segments', 24)
-        self.declare_parameter('cup_smoothing_alpha', 0.3)
         self.declare_parameter('cup_track_keepalive_frames', 10)
         self.declare_parameter('cup_fit_residual_max', 0.02)
         self.declare_parameter('cup_class_names', ['cup'])
@@ -213,14 +283,12 @@ class PointCloudNode(Node):
         self.declare_parameter('aruco_overlay', True)
         self.declare_parameter('world_marker_length_m', 0.05)
 
-        # ── Normal-vector & spatial filtering (noise suppression) ──────────
-        # Top-down view constraint: reject steep side surfaces via surface normal.
-        self.declare_parameter('use_normal_filtering', True)
-        self.declare_parameter('normal_ref_x', 0.0)
-        self.declare_parameter('normal_ref_y', 0.0)
-        self.declare_parameter('normal_ref_z', 1.0)
-        self.declare_parameter('normal_dot_min', 0.866)  # cos(30°)
-        self.declare_parameter('normal_window_size', 3)
+        # ── Top-rim & spatial-density filtering (point-cloud noise suppression) ──
+        # Top-rim: keep only points within `top_rim_band_m` of the cluster's
+        # `top_rim_percentile`-th height — isolates the cup rim for a clean
+        # rendered cloud. Set band ≤ 0 to keep the whole cluster (no top-rim cut).
+        self.declare_parameter('top_rim_band_m', 0.008)
+        self.declare_parameter('top_rim_percentile', 95.0)
         self.declare_parameter('use_spatial_density_filter', True)
         self.declare_parameter('spatial_density_radius_m', 0.03)
         self.declare_parameter('spatial_density_min_neighbors', 5)
@@ -252,18 +320,28 @@ class PointCloudNode(Node):
         self.cup_bot_d: float = float(self.get_parameter('cup_bottom_diameter_m').value)
         self.cup_h: float = float(self.get_parameter('cup_height_m').value)
         self.cup_n_seg: int = max(8, int(self.get_parameter('cup_polygon_segments').value))
-        self.cup_alpha: float = float(self.get_parameter('cup_smoothing_alpha').value)
         self.cup_keepalive: int = int(self.get_parameter('cup_track_keepalive_frames').value)
         self._track_merge_dist: float = float(
             self.get_parameter('track_world_merge_dist_m').value)
-        self._lock_min_windows: int = int(
-            self.get_parameter('scan_lock_min_windows').value)
-        self._lock_pose_eps: float = float(
-            self.get_parameter('lock_pose_eps_m').value)
-        self._lock_unlock_dist: float = float(
-            self.get_parameter('lock_unlock_dist_m').value)
-        self._locked_miss_max: int = int(
-            self.get_parameter('scan_locked_miss_max').value)
+        # ── Kalman position-filter coefficients (per-axis variance vectors) ──
+        _q_xy = float(self.get_parameter('kf_process_std_xy_m').value)
+        _q_z = float(self.get_parameter('kf_process_std_z_m').value)
+        self._kf_q = np.array([_q_xy ** 2, _q_xy ** 2, _q_z ** 2],
+                              dtype=np.float64)
+        _r_xy = float(self.get_parameter('kf_meas_std_xy_m').value)
+        _r_z = float(self.get_parameter('kf_meas_std_z_m').value)
+        self._kf_r = np.array([_r_xy ** 2, _r_xy ** 2, _r_z ** 2],
+                              dtype=np.float64)
+        _p0 = float(self.get_parameter('kf_init_std_m').value)
+        self._kf_p0 = np.array([_p0 ** 2, _p0 ** 2, _p0 ** 2], dtype=np.float64)
+        self._kf_gate: float = float(
+            self.get_parameter('kf_gate_mahalanobis').value)
+        self._kf_reacquire_windows: int = max(
+            1, int(self.get_parameter('kf_reacquire_windows').value))
+        self._kf_settled_std: float = float(
+            self.get_parameter('kf_settled_std_m').value)
+        self._kf_resid_infl: float = max(
+            0.0, float(self.get_parameter('kf_resid_infl').value))
         self._color_classes: list[str] = [
             str(c).lower()
             for c in self.get_parameter('color_classes').value]
@@ -282,19 +360,11 @@ class PointCloudNode(Node):
         self.window_period_s: float = max(
             1e-3, float(self.get_parameter('window_period_s').value))
 
-        # ── Normal-vector & spatial filtering parameters ────────────────────
-        self._use_normal_filtering: bool = bool(
-            self.get_parameter('use_normal_filtering').value)
-        self._normal_ref = np.array([
-            float(self.get_parameter('normal_ref_x').value),
-            float(self.get_parameter('normal_ref_y').value),
-            float(self.get_parameter('normal_ref_z').value)
-        ], dtype=np.float32)
-        self._normal_ref = self._normal_ref / np.linalg.norm(self._normal_ref)
-        self._normal_dot_min: float = float(
-            self.get_parameter('normal_dot_min').value)
-        self._normal_window_size: int = max(
-            1, int(self.get_parameter('normal_window_size').value))
+        # ── Top-rim & spatial-density filtering parameters ──────────────────
+        self._top_rim_band: float = float(
+            self.get_parameter('top_rim_band_m').value)
+        self._top_rim_pct: float = float(
+            self.get_parameter('top_rim_percentile').value)
         self._use_spatial_density: bool = bool(
             self.get_parameter('use_spatial_density_filter').value)
         self._spatial_density_radius: float = float(
@@ -305,8 +375,10 @@ class PointCloudNode(Node):
         # Tracks keyed by Ultralytics ByteTrack instance id (forwarded via
         # SegmentedObject.instance_id from detection_node). Per-track state:
         #   class_name              str
-        #   center_xy               np.ndarray (EMA-smoothed cup centre)
-        #   z_base                  float | None  (smoothed; None until first fit)
+        #   kf                      PositionKF | None — 3D centre filter (lazy)
+        #   center_xy               np.ndarray — cached kf.x[:2] (re-association)
+        #   reacquire_count         int — consecutive gated-out (relocation) windows
+        #   settled                 bool — kf position 1σ ≤ kf_settled_std
         #   points_buf, colors_buf  list[np.ndarray] — accumulated within window
         #   miss                    int — windows without any new points
         #   last_state              dict | None — last successful fit / render
@@ -502,8 +574,10 @@ class PointCloudNode(Node):
             if track is None:
                 track = {
                     'class_name': class_name,
+                    'kf': None,                # PositionKF, created on first fit
                     'center_xy': np.asarray(centroid_xy, dtype=np.float64).copy(),
-                    'z_base': None,
+                    'reacquire_count': 0,      # consecutive gated-out windows
+                    'settled': False,          # kf position 1σ ≤ kf_settled_std
                     'points_buf': [],
                     'colors_buf': [],
                     'miss': 0,
@@ -511,11 +585,6 @@ class PointCloudNode(Node):
                     'last_score': 0.0,
                     'last_display_name': obj.class_name or class_name,
                     'last_residual': 0.0,
-                    'state': 'scanning',       # 'scanning' | 'locked'
-                    'stable_streak': 0,        # consecutive windows centre stayed
-                                               # within eps of lock_ref_xy
-                    'lock_ref_xy': None,       # anchor for the stability streak
-                    'lock_miss': 0,            # miss windows since locked
                     'color': None,             # argmax of color_votes
                     'color_votes': {},         # {color_name: vote_count}
                 }
@@ -572,16 +641,15 @@ class PointCloudNode(Node):
         tracks' filtered points and a fresh marker set. This is the only path
         that publishes /points and /boxes.
 
-        Scan-and-lock state machine (per track):
-          SCANNING: fit every window. The box LOCKS once the smoothed centre
-                    holds within `lock_pose_eps_m` of the streak anchor for
-                    `scan_lock_min_windows` consecutive windows (pose
-                    stability, not raw fit-success count).
-          LOCKED:   box pose is frozen; new points still feed the cloud.
-                    Unlocks on EITHER the cup vanishing for
-                    `scan_locked_miss_max` windows OR the fresh-point centroid
-                    departing the frozen centre by `lock_unlock_dist_m`
-                    (robot picked / relocated the cup → re-scan, box follows).
+        Per-track Kalman flow (replaces the old scan-and-lock freeze):
+          1. predict() the constant-position filter once per window — even on a
+             miss, so covariance grows and a re-appearing cup is not rejected.
+          2. On a valid window, feed the fresh cup/OBB centre to the gated
+             filter (see `_fit_and_render_state` → `_kf_update_centre`). The
+             estimate keeps creeping toward good measurements, so a wrong fit
+             self-corrects; transient spikes are gated out; a sustained run of
+             rejections re-acquires (robot picked / relocated the cup).
+          3. A track is evicted after `cup_track_keepalive_frames` empty windows.
         """
         alive_xyz: list[np.ndarray] = []
         alive_rgb: list[np.ndarray] = []
@@ -592,110 +660,47 @@ class PointCloudNode(Node):
             buf_cols = track['colors_buf']
             track['points_buf'] = []
             track['colors_buf'] = []
-            state = track.get('state', 'scanning')
 
-            # ── LOCKED ────────────────────────────────────────────────────
-            if state == 'locked':
-                if not buf_pts:
-                    track['lock_miss'] = track.get('lock_miss', 0) + 1
-                    if track['lock_miss'] > self._locked_miss_max:
-                        self._unlock(track, tid,
-                                     f'cup missing {self._locked_miss_max} '
-                                     f'windows')
-                    # Keep track alive; last_state provides the frozen marker.
-                    continue
+            # Constant-position predict once per window (grows covariance even
+            # on a miss so a re-appearing / relocated cup is not over-rejected).
+            if track.get('kf') is not None:
+                track['kf'].predict()
+                track['settled'] = (
+                    track['kf'].position_std() <= self._kf_settled_std)
 
-                all_pts = np.vstack(buf_pts)
-                all_rgb = np.concatenate(buf_cols)
-                keep = _mad_keep_indices(all_pts, self.outlier_mad_k)
-                if keep is not None and int(keep.sum()) >= 32:
-                    all_pts = all_pts[keep]
-                    all_rgb = all_rgb[keep]
-                if all_pts.shape[0] < 32:
-                    # Too sparse to judge displacement — treat as a miss.
-                    track['lock_miss'] = track.get('lock_miss', 0) + 1
-                    if track['lock_miss'] > self._locked_miss_max:
-                        self._unlock(track, tid,
-                                     f'cup missing {self._locked_miss_max} '
-                                     f'windows')
-                    continue
+            if not buf_pts:
+                track['miss'] += 1
+                if track['miss'] > self.cup_keepalive:
+                    self._tracks.pop(tid, None)
+                # last_state persists → frozen marker until the cup reappears.
+                continue
 
-                ls_locked = track.get('last_state')
-                moved = False
-                if ls_locked is not None:
-                    cur_xy = np.median(all_pts[:, :2], axis=0)
-                    locked_xy = np.asarray(
-                        ls_locked['center'][:2], dtype=np.float64)
-                    moved = (float(np.linalg.norm(cur_xy - locked_xy))
-                             > self._lock_unlock_dist)
+            all_pts = np.vstack(buf_pts)
+            all_rgb = np.concatenate(buf_cols)
+            keep = _mad_keep_indices(all_pts, self.outlier_mad_k)
+            if keep is not None:
+                all_pts = all_pts[keep]
+                all_rgb = all_rgb[keep]
+            if all_pts.shape[0] < 32:
+                track['miss'] += 1
+                if track['miss'] > self.cup_keepalive:
+                    self._tracks.pop(tid, None)
+                continue
 
-                if not moved:
-                    track['lock_miss'] = 0
-                    # Fresh points feed the cloud; box stays frozen.
-                    alive_xyz.append(all_pts.astype(np.float32))
-                    alive_rgb.append(all_rgb)
-                    continue
-
-                # Cup was moved (robot pick / relocation) → unlock and FALL
-                # THROUGH to the fit block so the box follows in this window.
-                self._unlock(
-                    track, tid,
-                    f'cup moved >{self._lock_unlock_dist*100:.0f}cm')
-                # all_pts / all_rgb already filtered above.
-
-            else:
-                # ── SCANNING ──────────────────────────────────────────────
-                if not buf_pts:
-                    track['miss'] += 1
-                    if track['miss'] > self.cup_keepalive:
-                        self._tracks.pop(tid, None)
-                    continue
-
-                all_pts = np.vstack(buf_pts)
-                all_rgb = np.concatenate(buf_cols)
-                keep = _mad_keep_indices(all_pts, self.outlier_mad_k)
-                if keep is not None:
-                    all_pts = all_pts[keep]
-                    all_rgb = all_rgb[keep]
-                if all_pts.shape[0] < 32:
-                    track['miss'] += 1
-                    if track['miss'] > self.cup_keepalive:
-                        self._tracks.pop(tid, None)
-                    continue
-
-            # ── Fit + pose-stability lock test ────────────────────────────
-            # Reached by SCANNING tracks and by just-unlocked (moved) tracks;
-            # all_pts / all_rgb are filtered above in both paths.
             track['miss'] = 0
 
+            # Fit + Kalman-filter the centre (update happens inside).
             ls = self._fit_and_render_state(tid, track, all_pts)
             if ls is not None:
                 track['last_state'] = ls
-                centre_xy = np.asarray(track['center_xy'], dtype=np.float64)
-                ref = track.get('lock_ref_xy')
-                if ref is None or (float(np.linalg.norm(centre_xy - ref))
-                                   > self._lock_pose_eps):
-                    # First fit, or drifted out of the eps ball → re-anchor.
-                    track['lock_ref_xy'] = centre_xy.copy()
-                    track['stable_streak'] = 1
-                else:
-                    track['stable_streak'] = track.get('stable_streak', 0) + 1
-                if track['stable_streak'] >= self._lock_min_windows:
-                    track['state'] = 'locked'
-                    track['lock_miss'] = 0
-                    self.get_logger().info(
-                        f'[scan-lock] #{tid} LOCKED — centre stable within '
-                        f'{self._lock_pose_eps*1000:.0f}mm for '
-                        f'{track["stable_streak"]} windows')
-            else:
-                track['stable_streak'] = 0
-                track['lock_ref_xy'] = None
 
-            # Filter to top-rim only for clean point cloud visualization
-            # (same as fitting logic but applied to rendered cloud)
-            if all_pts.shape[0] > 16:
-                z_top = float(np.percentile(all_pts[:, 2], 95.0))
-                top_mask = all_pts[:, 2] > (z_top - 0.008)  # Top 0.8cm only
+            # Top-rim filter for a clean rendered cloud: keep only points within
+            # `top_rim_band_m` of the cluster's `top_rim_percentile` height.
+            # band ≤ 0 disables it (keep the whole cluster). Applied to the
+            # published cloud only — the fit above already used all points.
+            if self._top_rim_band > 0.0 and all_pts.shape[0] > 16:
+                z_top = float(np.percentile(all_pts[:, 2], self._top_rim_pct))
+                top_mask = all_pts[:, 2] > (z_top - self._top_rim_band)
                 if top_mask.sum() > 16:
                     all_pts = all_pts[top_mask]
                     all_rgb = all_rgb[top_mask]
@@ -731,8 +736,11 @@ class PointCloudNode(Node):
             if ls is None:
                 continue
             colour = _palette(tid - 1)
+            # '[L]' marks a settled (low-covariance) estimate — the stable-pose
+            # signal pick_ui_node parses as `locked`. Kept as '[L]' so that
+            # downstream contract is unchanged; it now means KF-settled.
             label = ('[L]_' + ls['label']
-                     if track.get('state') == 'locked' else ls['label'])
+                     if track.get('settled') else ls['label'])
             self._append_box_markers(
                 markers, tid, ls['center'], ls['R'], ls['size'],
                 ls['top_world'], colour, label, stamp)
@@ -768,11 +776,61 @@ class PointCloudNode(Node):
         self._stacked_ids = {int(x) for x in msg.data}
 
     # ------------------------------------------------------------------
+    def _kf_update_centre(self, tid: int, track: dict,
+                          z: np.ndarray, residual: float) -> np.ndarray:
+        """Run the per-track Kalman measurement update for the 3D centre `z`
+        and return the filtered centre. `predict()` is done once per window in
+        `_finalize_window`; this only does the update / re-acquire bookkeeping.
+
+        - First sight: create the filter anchored at `z`.
+        - In-gate measurement: standard update; reset the relocation counter.
+        - Gated-out measurement: hold the estimate (transient spike). After
+          `kf_reacquire_windows` consecutive rejections, treat it as a real
+          relocation and re-acquire at `z`.
+        Measurement noise is inflated by the cup-fit residual so a poor fit
+        cannot yank the estimate.
+        """
+        z = np.asarray(z, dtype=np.float64)
+        if track.get('kf') is None:
+            track['kf'] = PositionKF(z, self._kf_p0, self._kf_q)
+            track['reacquire_count'] = 0
+            self._sync_track_centre(track)
+            return track['kf'].x.copy()
+
+        kf = track['kf']
+        infl = 1.0
+        if self._kf_resid_infl > 0.0 and self.cup_resid_max > 0.0:
+            infl = 1.0 + self._kf_resid_infl * (residual / self.cup_resid_max)
+        accepted, _d2 = kf.update(z, self._kf_r * infl, self._kf_gate)
+        if accepted:
+            track['reacquire_count'] = 0
+        else:
+            track['reacquire_count'] = track.get('reacquire_count', 0) + 1
+            if track['reacquire_count'] >= self._kf_reacquire_windows:
+                kf.reset(z, self._kf_p0)
+                track['reacquire_count'] = 0
+                self.get_logger().info(
+                    f'[kf] #{tid} re-acquired (relocation) at '
+                    f'({z[0]:+.3f},{z[1]:+.3f},{z[2]:+.3f})m')
+        self._sync_track_centre(track)
+        track['settled'] = kf.position_std() <= self._kf_settled_std
+        return kf.x.copy()
+
+    def _sync_track_centre(self, track: dict) -> None:
+        """Cache the filtered XY so `_resolve_track_id` re-association sees the
+        smoothed centre rather than a raw per-window centroid."""
+        track['center_xy'] = track['kf'].x[:2].astype(np.float64).copy()
+
+    # ------------------------------------------------------------------
     def _fit_and_render_state(self, tid: int, track: dict,
                               all_pts: np.ndarray):
-        """Cup fit (with OBB fallback). EMA-smooth tracked centre + z_base.
-        Return a dict with the geometry + label needed for marker / overlay
-        emission, or None if neither cup nor OBB fit succeeds.
+        """Fit the cup pose (with OBB fallback), Kalman-filter the centre, and
+        return the geometry + label dict for marker / overlay emission, or
+        None if neither cup nor OBB fit succeeds.
+
+        The raw per-window fit is the KF *measurement*; the rendered pose comes
+        from the filtered estimate, so the box tracks continuously and a
+        slightly-wrong fit is pulled back toward truth instead of being frozen.
 
         Labels use underscore separators so each line is a single
         whitespace-free token — TEXT_VIEW_FACING markers spread spaces too
@@ -780,58 +838,46 @@ class PointCloudNode(Node):
         """
         class_name = track['class_name']
         cup_kind = (class_name in self.cup_class_names)
-        cup_done = False
-        cx_smooth = float(track['center_xy'][0])
-        cy_smooth = float(track['center_xy'][1])
-        z_base_smooth = track.get('z_base')
-        residual = 0.0
 
+        # ── Measurement: cup-cone fit (preferred) ─────────────────────────
         if cup_kind:
             fit = _fit_cup_axis_xy(
                 all_pts, top_d=self.cup_top_d, bot_d=self.cup_bot_d,
                 height=self.cup_h)
             if fit is not None and fit[3] <= self.cup_resid_max:
                 cx_new, cy_new, z_base_new, residual = fit
-                a = self.cup_alpha
-                if z_base_smooth is None:
-                    cx_smooth, cy_smooth, z_base_smooth = (
-                        cx_new, cy_new, z_base_new)
-                else:
-                    cx_smooth = a * cx_new + (1.0 - a) * cx_smooth
-                    cy_smooth = a * cy_new + (1.0 - a) * cy_smooth
-                    z_base_smooth = a * z_base_new + (1.0 - a) * z_base_smooth
-                track['center_xy'] = np.array(
-                    [cx_smooth, cy_smooth], dtype=np.float64)
-                track['z_base'] = z_base_smooth
                 track['last_residual'] = residual
-                cup_done = True
+                # KF state is the cup *centre*; z_base = centre_z - h/2.
+                z_meas = np.array(
+                    [cx_new, cy_new, z_base_new + 0.5 * self.cup_h],
+                    dtype=np.float64)
+                filt = self._kf_update_centre(tid, track, z_meas, residual)
+                cx_s, cy_s = float(filt[0]), float(filt[1])
+                z_base_s = float(filt[2]) - 0.5 * self.cup_h
 
-        if cup_done:
-            cz = z_base_smooth + 0.5 * self.cup_h
-            center = np.array([cx_smooth, cy_smooth, cz], dtype=np.float64)
-            R_box = np.eye(3)
-            d_max = max(self.cup_top_d, self.cup_bot_d)
-            size = np.array([d_max, d_max, self.cup_h], dtype=np.float64)
-            top_world = np.array(
-                [cx_smooth, cy_smooth, z_base_smooth + self.cup_h],
-                dtype=np.float64)
-            frustum = _cup_frustum_geometry(
-                cx_smooth, cy_smooth, top_d=self.cup_top_d,
-                bot_d=self.cup_bot_d, height=self.cup_h,
-                floor_z=z_base_smooth, n_seg=self.cup_n_seg)
-            r_mm = residual * 1000.0
-            color_tok = track.get('color') or 'unknown'
-            line1 = (f"#{tid}_c={color_tok}_{track['last_display_name']}_"
-                     f"{track['last_score']:.2f}")
-            line2 = (f"r={r_mm:.0f}mm_"
-                     f"({cx_smooth:.2f},{cy_smooth:.2f},{top_world[2]:.2f})")
-            label = line1.replace(' ', '_') + '\n' + line2.replace(' ', '_')
-            return {
-                'center': center, 'R': R_box, 'size': size,
-                'top_world': top_world, 'frustum': frustum, 'label': label,
-            }
+                center = np.array([cx_s, cy_s, float(filt[2])], dtype=np.float64)
+                R_box = np.eye(3)
+                d_max = max(self.cup_top_d, self.cup_bot_d)
+                size = np.array([d_max, d_max, self.cup_h], dtype=np.float64)
+                top_world = np.array(
+                    [cx_s, cy_s, z_base_s + self.cup_h], dtype=np.float64)
+                frustum = _cup_frustum_geometry(
+                    cx_s, cy_s, top_d=self.cup_top_d, bot_d=self.cup_bot_d,
+                    height=self.cup_h, floor_z=z_base_s, n_seg=self.cup_n_seg)
+                r_mm = residual * 1000.0
+                color_tok = track.get('color') or 'unknown'
+                line1 = (f"#{tid}_c={color_tok}_{track['last_display_name']}_"
+                         f"{track['last_score']:.2f}")
+                line2 = (f"r={r_mm:.0f}mm_"
+                         f"({cx_s:.2f},{cy_s:.2f},{top_world[2]:.2f})")
+                label = (line1.replace(' ', '_') + '\n'
+                         + line2.replace(' ', '_'))
+                return {
+                    'center': center, 'R': R_box, 'size': size,
+                    'top_world': top_world, 'frustum': frustum, 'label': label,
+                }
 
-        # Fallback: OBB / AABB on aggregated points (non-cup or fit failed).
+        # ── Fallback: OBB / AABB (non-cup or cone fit failed) ─────────────
         box = _compute_box_world(
             all_pts,
             standing_ratio=self.standing_ratio,
@@ -839,10 +885,13 @@ class PointCloudNode(Node):
             force_aabb=self.force_aabb)
         if box is None:
             return None
-        center, R_box, size, pose_label = box
+        center_meas, R_box, size, pose_label = box
+        # KF-filter only the centre; orientation / size stay per-window fresh.
+        filt = self._kf_update_centre(
+            tid, track, center_meas.astype(np.float64), 0.0)
+        center = filt.copy()
         top_world = center + R_box @ np.array(
             [0.0, 0.0, float(size[2]) * 0.5], dtype=np.float64)
-        track['center_xy'] = center[:2].astype(np.float64)
         color_tok = track.get('color') or 'unknown'
         line1 = (f"#{tid}_c={color_tok}_{track['last_display_name']}_"
                  f"{track['last_score']:.2f}_[{pose_label}]")
@@ -1054,23 +1103,9 @@ class PointCloudNode(Node):
             markers.markers.append(d)
 
     # ------------------------------------------------------------------
-    def _unlock(self, track: dict, tid: int, reason: str) -> None:
-        """Revert a LOCKED track to SCANNING, clearing streak/anchor state.
-
-        The frozen `last_state` marker persists until the next window fits a
-        fresh pose, so the box does not blink out during re-scan.
-        """
-        track['state'] = 'scanning'
-        track['stable_streak'] = 0
-        track['lock_ref_xy'] = None
-        track['lock_miss'] = 0
-        track['miss'] = 0
-        self.get_logger().info(
-            f'[scan-lock] #{tid} unlocked — {reason}, re-scanning')
-
-    # ------------------------------------------------------------------
     def _on_trigger_scan(self, request, response):
-        """Clear all tracks and restart scanning. Called via ~/trigger_scan."""
+        """Clear all tracks (drops every Kalman filter so each cup re-acquires
+        from scratch). Called via ~/trigger_scan."""
         n = len(self._tracks)
         self._tracks.clear()
         self._last_published_ids.clear()
@@ -1078,7 +1113,7 @@ class PointCloudNode(Node):
         self._publish_clear_markers(self.get_clock().now().to_msg())
         response.success = True
         response.message = f'scan reset: {n} track(s) cleared'
-        self.get_logger().info(f'[scan-lock] trigger_scan → cleared {n} tracks')
+        self.get_logger().info(f'[kf] trigger_scan → cleared {n} tracks')
         return response
 
     def _resolve_track_id(self, inst_id: int, centroid_xy: np.ndarray) -> int:
@@ -1249,91 +1284,6 @@ class PointCloudNode(Node):
 # ----------------------------------------------------------------------
 # Geometry helpers
 # ----------------------------------------------------------------------
-
-def _estimate_surface_normals(z: np.ndarray, K: np.ndarray, window: int = 3) -> np.ndarray | None:
-    """Estimate surface normals from depth map using finite differences.
-    
-    For each pixel, compute the tangent vectors (dX/dx, dX/dy in world frame)
-    via central differences, then cross product → normal.
-    
-    Args:
-        z: depth map (H, W), in meters
-        K: camera intrinsic matrix (3, 3)
-        window: half-size for central differences (1–3 typical)
-    
-    Returns:
-        normals: (H, W, 3) with **normalized** surface normals, or None if failed.
-                 normals[y, x] is the normal at pixel (x, y).
-    """
-    h, w = z.shape[:2]
-    if h < 2 * window + 1 or w < 2 * window + 1:
-        return None
-    
-    fx = K[0, 0]
-    fy = K[1, 1]
-    cx = K[0, 2]
-    cy = K[1, 2]
-    
-    normals = np.zeros((h, w, 3), dtype=np.float32)
-    
-    for y in range(window, h - window):
-        for x in range(window, w - window):
-            # Get central differences in depth
-            dz_dx = (z[y, x + window] - z[y, x - window]) / (2.0 * window)
-            dz_dy = (z[y + window, x] - z[y - window, x]) / (2.0 * window)
-            
-            # Safe depth check
-            if z[y, x] < 1e-6:
-                normals[y, x] = [0, 0, 0]
-                continue
-            
-            # Tangent vectors in world frame
-            # X_right = (X + window, 0, z[y, x+window]) - (X, 0, z[y, x])
-            tx = np.array([window * z[y, x] / fx, 0, dz_dx], dtype=np.float32)
-            # X_down = (0, Y + window, z[y+window, x]) - (0, Y, z[y, x])
-            ty = np.array([0, window * z[y, x] / fy, dz_dy], dtype=np.float32)
-            
-            # Normal = tangent_x × tangent_y (right-hand rule)
-            n = np.cross(tx, ty)
-            norm = np.linalg.norm(n)
-            if norm > 1e-6:
-                normals[y, x] = n / norm
-            else:
-                normals[y, x] = [0, 0, 1]  # default: upward
-    
-    return normals
-
-
-def _filter_by_normal(xyz: np.ndarray, normals: np.ndarray,
-                      normal_ref: np.ndarray, dot_min: float) -> np.ndarray:
-    """Filter 3D points by surface normal orientation.
-    
-    Keep points where normal · reference_normal ≥ dot_min.
-    (Rejects side surfaces / steep slopes.)
-    
-    Args:
-        xyz: (N, 3) point cloud in world frame
-        normals: (H, W, 3) normals from depth map (or None to skip)
-        normal_ref: (3,) normalized reference normal (e.g. [0, 0, 1])
-        dot_min: minimum dot product threshold (e.g. 0.866 for cos(30°))
-    
-    Returns:
-        keep: (N,) boolean mask, True if point is accepted.
-    """
-    if normals is None or xyz.shape[0] == 0:
-        return np.ones(xyz.shape[0], dtype=bool)
-    
-    h, w = normals.shape[:2]
-    keep = np.ones(xyz.shape[0], dtype=bool)
-    
-    # For now, we can't easily map world → pixel for arbitrary points
-    # (would need camera transform). As a simplified approach: we could
-    # cache normal lookups during deprojection in _on_synced. For now,
-    # this is a placeholder — the key is that top-rim filtering (Z-based)
-    # already does most of the work.
-    
-    return keep
-
 
 def _filter_spatial_density(xyz: np.ndarray, radius: float, min_neighbors: int) -> np.ndarray:
     """Remove isolated points via local density.

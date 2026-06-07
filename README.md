@@ -324,9 +324,24 @@ ArUco로 world 보정 → `detection_node`+`point_cloud_node`가 컵 검출. 재
 | `cup_bottom_diameter_m` | `0.078` | 컵 아랫면 지름 (m) |
 | `cup_height_m` | `0.095` | 컵 높이 (m) |
 | `cup_polygon_segments` | `24` | frustum 원 분할 수 (wireframe) |
-| `cup_smoothing_alpha` | `0.3` | 축 위치 EMA 계수 (1.0 = 비활성) |
 | `cup_track_keepalive_frames` | `10` | 검출 소실 후 마커 유지 프레임 수 |
 | `cup_fit_residual_max` | `0.02` | frustum fit 잔차 임계 (m); 초과 시 OBB fallback |
+
+**Kalman 위치 필터** (기존 EMA + scan-and-lock 대체)
+
+트랙별 constant-position 칼만 필터로 컵 중심을 추정한다. 추정값을 **freeze하지 않으므로**, 한 번 잘못 추정돼도 이후 윈도우들이 계속 보정해 스스로 수렴한다 (기존 LOCKED 박스는 컵이 물리적으로 3 cm 이상 움직이기 전까지 고정됨). 일시적 depth spike는 Mahalanobis gate로 기각하고, gate-out이 연속되면 실제 이동(로봇 pick/place)으로 보고 해당 위치로 재획득(re-acquire)한다.
+
+| 파라미터 | 기본값 | 설명 |
+|---|---|---|
+| `kf_process_std_xy_m` | `0.002` | 윈도우당 허용 drift (XY) — 클수록 보정 빠름/지터 증가 |
+| `kf_process_std_z_m` | `0.004` | 윈도우당 허용 drift (Z, depth가 더 noisy) |
+| `kf_meas_std_xy_m` | `0.005` | 윈도우 fit 측정 오차 가정 (XY) |
+| `kf_meas_std_z_m` | `0.010` | 윈도우 fit 측정 오차 가정 (Z) |
+| `kf_init_std_m` | `0.05` | 초기/재획득 공분산 std (첫 측정 신뢰) |
+| `kf_gate_mahalanobis` | `9.0` | χ²(3)≈97% gate; 초과 측정은 spike로 기각, 0=비활성 |
+| `kf_reacquire_windows` | `3` | 연속 gate-out N회 → 이동으로 판정해 재획득 |
+| `kf_settled_std_m` | `0.006` | 위치 1σ가 이 값 이하면 "settled" (마커 `[L]` 표기) |
+| `kf_resid_infl` | `1.0` | residual/cup_fit_residual_max 비례로 측정노이즈 inflate |
 
 **Box 판정**
 

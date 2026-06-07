@@ -79,7 +79,7 @@ point_cloud_node:
     box_standing_ratio: 0.8
     box_min_elongation: 1.5
     box_force_aabb: false
-    mask_erode_px: 5
+    mask_erode_px: 2
     depth_gradient_max_m: 0.015
     box_outlier_mad_k: 3.0
     approx_sync_slop: 0.05
@@ -90,7 +90,6 @@ point_cloud_node:
     cup_bottom_diameter_m: 0.078
     cup_height_m: 0.095
     cup_polygon_segments: 24
-    cup_smoothing_alpha: 0.3
     cup_track_keepalive_frames: 5
     cup_fit_residual_max: 0.02
 
@@ -105,49 +104,37 @@ point_cloud_node:
     # ----- Accumulating-window pipeline -----
     window_period_s: 0.1
 
-    # ----- Scan-and-lock -----
-    # LOCK when the smoothed centre stays within lock_pose_eps_m of the streak
-    # anchor for scan_lock_min_windows consecutive windows (pose stability).
-    scan_lock_min_windows: 5     # stable windows → LOCKED          (5 × 0.1s = 0.5s)
-    lock_pose_eps_m: 0.008       # max planar drift counted as stable (8 mm)
-    # UNLOCK on cup vanishing OR moving (robot pick) past lock_unlock_dist_m.
-    lock_unlock_dist_m: 0.03     # fresh centroid this far from frozen box → moved
-    scan_locked_miss_max: 8      # empty windows before unlock      (8 × 0.1s = 0.8s)
+    # ----- Kalman position filter (replaces EMA + scan-and-lock) -----
+    # Per-track constant-position KF on the cup/object centre. The estimate is
+    # never frozen, so a slightly-wrong pose self-corrects over a few windows
+    # (old LOCKED box stuck until the cup physically moved >3 cm).
+    kf_process_std_xy_m: 0.002   # per-window drift the estimate may absorb (XY)
+    kf_process_std_z_m: 0.004    # per-window drift (Z, depth is noisier)
+    kf_meas_std_xy_m: 0.005      # assumed per-window fit error (XY)
+    kf_meas_std_z_m: 0.010       # assumed per-window fit error (Z)
+    kf_init_std_m: 0.05          # initial / re-acquire uncertainty (trust 1st meas)
+    kf_gate_mahalanobis: 9.0     # χ²(3)≈97%; reject spikes beyond this. 0 disables
+    kf_reacquire_windows: 3      # consecutive gated-out windows → relocation re-acquire
+    kf_settled_std_m: 0.006      # position 1σ below this → "settled" ([S] tag)
+    kf_resid_infl: 1.0           # inflate meas-noise by residual/cup_fit_residual_max
 
     # ----- ArUco marker axes overlay on box_debug -----
     aruco_overlay: true
     world_marker_length_m: 0.05         # must match world_origin_node value
 
     # ────────────────────────────────────────────────────────────────────────
-    # === NOISE SUPPRESSION: Normal Vector + Top-Rim Filtering ===
+    # === NOISE SUPPRESSION: Top-Rim + Spatial-Density Filtering ===
     # ────────────────────────────────────────────────────────────────────────
-    # (3) Algorithm-level post-processing: Legal surface filtering via normals
-    #
-    # Top-down view (45°) constraint: only points whose surface normal
-    # is roughly upward (world Z-axis) should have their depth trusted.
-    # Steep side surfaces (cups, noise) get rejected via dot product thresholding.
+    # Top-rim: rendered cloud keeps only points within `top_rim_band_m` of the
+    # cluster's `top_rim_percentile` height (isolates the cup rim). This only
+    # affects the published /digital_twin/points cloud — the cone fit upstream
+    # still uses ALL points. Increase the band to show more of the cup body;
+    # set it ≤ 0 to keep the whole cluster.
+    top_rim_band_m: 0.000       # keep top 8 mm below the rim (0 or less = off)
+    top_rim_percentile: 95.0    # height percentile treated as "the top"
 
-    # Enable normal-vector-based filtering (geometric validation)
-    use_normal_filtering: true
-
-    # Expected surface normal direction (world frame). For top-down view:
-    # should be close to [0, 0, 1] (looking down at the table).
-    # The cone frustum surface normals should generally have positive Z component.
-    normal_ref_x: 0.0
-    normal_ref_y: 0.0
-    normal_ref_z: 1.0
-
-    # Min dot product (cos angle) between observed normal and reference normal.
-    # dot ≥ threshold means the normal points "mostly upward" (legal surface).
-    # 0.866 ≈ cos(30°) — reject if normal tilts > 30° from world +Z.
-    normal_dot_min: 0.866
-
-    # Window size for neighboring-point surface normal estimation (pixels)
-    # Larger = smoother but slower; typical 3–5 for depth maps.
-    normal_window_size: 3
-
-    # Enable spatial outlier rejection via local density (complementary to MAD)
-    # Remove points that are too isolated from neighbors in neighborhood.
+    # Spatial outlier rejection via local density (complementary to MAD).
+    # Remove points with too few neighbors in `radius`.
     use_spatial_density_filter: true
     spatial_density_radius_m: 0.03    # neighborhood radius (30 mm)
     spatial_density_min_neighbors: 5  # min neighbor count in radius
