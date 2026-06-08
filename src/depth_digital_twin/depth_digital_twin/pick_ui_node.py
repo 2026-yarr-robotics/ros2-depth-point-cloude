@@ -26,7 +26,7 @@ Usage:
   ros2 run depth_digital_twin pick_ui_node --ros-args \\
       -p boxes_topic:=/digital_twin/boxes_exo \\
       -p trigger_scan_service:=/point_cloud_node/trigger_scan \\
-      -p pick_api_url:=https://yarr-api.simplyimg.com/api/robot/skill/pick
+      -p pick_api_url:=https://yarr-api-31.simplyimg.com/api/robot/skill/pick
 """
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ class PickUiNode(Node):
                                '/point_cloud_node/trigger_scan')
         self.declare_parameter(
             'pick_api_url',
-            'https://yarr-api.simplyimg.com/api/robot/skill/pick')
+            'https://yarr-api-31.simplyimg.com/api/robot/skill/pick')
         self.declare_parameter('pick_api_timeout_s', 15.0)
 
         boxes_topic = str(self.get_parameter('boxes_topic').value)

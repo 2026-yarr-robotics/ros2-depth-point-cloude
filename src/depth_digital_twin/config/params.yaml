@@ -24,8 +24,8 @@ world_origin_node:
     aruco_timeout_then_floor: true
 
     # Marker position in the ROBOT BASE frame (metres, measured physically).
-    world_marker_offset_x_m: 0.367
-    world_marker_offset_y_m: 0.003
+    world_marker_offset_x_m: 0.375
+    world_marker_offset_y_m: 0.001
     world_marker_offset_z_m: 0.0         # height of marker surface in base frame
 
     # Marker frame orientation relative to BASE frame (Euler intrinsic XYZ, deg).
@@ -46,10 +46,10 @@ detection_node:
     # `model` = default / live-camera weight (digital_twin.launch.py and
     # digital_twin_with_robot.launch.py when no view-specific override is
     # passed).  Both exo and hand ship the same 2-class taxonomy now.
-    model: /home/eunwoosong/Projects/ros2-depth-point-cloude/vision/yolo/0522_exo_best.pt
+    model: /home/ssu/cup-stack-integration/vision/ros2-depth-point-cloude/vision/yolo/0522_exo_best.pt
     # Per-view weights for digital_twin_sequence.launch.py (view:=exo|hand).
-    model_exo: /home/eunwoosong/Projects/ros2-depth-point-cloude/vision/yolo/0522_exo_best.pt
-    model_hand: /home/eunwoosong/Projects/ros2-depth-point-cloude/vision/yolo/hand_eye_view_yolo26m_seg_1280_epoch250_roboflow_0518_medium_a100_best.pt
+    model_exo: /home/ssu/cup-stack-integration/vision/ros2-depth-point-cloude/vision/yolo/0522_exo_best.pt
+    model_hand: /home/ssu/cup-stack-integration/vision/ros2-depth-point-cloude/vision/yolo/hand_eye_view_yolo26m_seg_1280_epoch250_roboflow_0518_medium_a100_best.pt
     # Both models emit the same two classes:
     #   "fallen-cup"  (id=1)
     #   "upright-cup" (id=2)
