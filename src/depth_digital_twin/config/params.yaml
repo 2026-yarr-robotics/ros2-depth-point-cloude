@@ -58,19 +58,19 @@ detection_node:
     # `model` = default / live-camera weight (digital_twin.launch.py and
     # digital_twin_with_robot.launch.py when no view-specific override is
     # passed).  Both exo and hand ship the same 2-class taxonomy now.
-    model: /home/eunwoo/Projects/yarr_projects/src/ros2-depth-point-cloude/vision/yolo/0522_exo_best.pt
+    model: /home/ssu/cup-stack-integration/vision/ros2-depth-point-cloude/vision/yolo/0522_exo_best.pt
     # Per-view weights for digital_twin_sequence.launch.py (view:=exo|hand).
-    model_exo: /home/eunwoo/Projects/yarr_projects/src/ros2-depth-point-cloude/vision/yolo/0522_exo_best.pt
-    model_hand: /home/eunwoo/Projects/yarr_projects/src/ros2-depth-point-cloude/vision/yolo/hand_eye_view_yolo26m_seg_1280_epoch250_roboflow_0518_medium_a100_best.pt
+    model_exo: /home/ssu/cup-stack-integration/vision/ros2-depth-point-cloude/vision/yolo/0522_exo_best.pt
+    model_hand: /home/ssu/cup-stack-integration/vision/ros2-depth-point-cloude/vision/yolo/hand_eye_view_yolo26m_seg_1280_epoch250_roboflow_0518_medium_a100_best.pt
     # Both models emit the same two classes:
     #   "fallen-cup"  (id=1)
     #   "upright-cup" (id=2)
     target_classes: ["fallen-cup", "upright-cup"]
-    confidence: 0.35
+    confidence: 0.45   # 0.35→0.45: cut YOLO false positives feeding cups_on_table noise
     image_topic: /camera/camera/color/image_raw
     detections_topic: /digital_twin/detections
     debug_topic: /digital_twin/detection_debug
-    device: ""
+    device: "cuda"   # GPU 명시 고정 (""=auto 였음; CPU 추론으로 새지 않게)
     imgsz: 1280
 
 point_cloud_node:
@@ -96,7 +96,10 @@ point_cloud_node:
     #                              tripped the old 15mm gate and dropped far cups
     box_outlier_mad_k: 3.0
     approx_sync_slop: 0.05
-    track_world_merge_dist_m: 0.02  # world-frame re-association radius (m)
+    track_world_merge_dist_m: 0.05  # 0.02→0.05: absorb ByteTrack re-IDs of the
+                                    # same cup (jittering centroid) instead of
+                                    # spawning duplicate tracks → cups_on_table
+                                    # over-count. Still < cup spacing (0.078).
 
     # ----- Cup model (Speed Stack truncated cone, standing only) -----
     cup_top_diameter_m: 0.054
