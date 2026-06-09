@@ -220,13 +220,19 @@ class CupFusionNode(Node):
         # lock. Arrival is detected by matching /joint_states to the waypoints
         # (mapped BY NAME — the M0609 wire order is 1,2,4,5,3,6).
         gp('scan_lock_active', False)
+        # false = HAND frozen + exo LIVE (re-fuse the frozen hand scan with the
+        # latest exo cloud every tick → new cups exo sees appear; a picked cup
+        # stays from the hand lock). true = freeze BOTH into one static lock.
+        gp('scan_lock_exo', False)
         gp('scan_joint_states_topic', '/joint_states')
         gp('scan_joint_names',
            ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6'])
-        gp('scan_wp1_deg',
-           [57.4585, 10.3361, 75.0595, -31.1839, 127.2512, 44.6653])
-        gp('scan_wp2_deg',
-           [-42.1911, 12.8098, 66.9024, 25.0818, 107.6920, -18.8562])
+        # Scan waypoints: a FLAT list of 6 joint angles (deg) per waypoint,
+        # concatenated. The arm visits each in order; arrival at any is
+        # auto-detected by joint match (order-agnostic). Default = a SINGLE
+        # waypoint (pos1). Append 6 more values to add pos2, etc.
+        gp('scan_waypoints_deg',
+           [103.4671, -4.3731, 100.2539, -29.3674, 115.5776, -139.6331])
         gp('scan_arrival_tol_rad', 0.02)     # per-joint |q-wp| arrival gate
         gp('scan_settle_vel_rad_s', 0.05)    # max joint speed to be "settled"
         gp('scan_wait_s', 1.0)               # dwell-in wait before capturing
@@ -289,12 +295,19 @@ class CupFusionNode(Node):
 
         # ── scan & lock: read params, precompute waypoints, init FSM state ──
         self.scan_lock_active = bool(P('scan_lock_active'))
+        self.scan_lock_exo = bool(P('scan_lock_exo'))
         self.scan_joint_states_topic = str(P('scan_joint_states_topic'))
         self.scan_joint_names = list(P('scan_joint_names'))
-        self._wp_rad = {
-            1: np.deg2rad(np.asarray(P('scan_wp1_deg'), dtype=float)),
-            2: np.deg2rad(np.asarray(P('scan_wp2_deg'), dtype=float)),
-        }
+        # Parse N waypoints from the flat (N*6) list → {1: rad6, 2: rad6, ...}.
+        _wps = np.asarray(P('scan_waypoints_deg'), dtype=float)
+        if _wps.size == 0 or _wps.size % 6 != 0:
+            self.get_logger().error(
+                f'scan_waypoints_deg length {_wps.size} is not a positive '
+                f'multiple of 6 — using one zero waypoint')
+            _wps = np.zeros(6)
+        _wps = _wps.reshape(-1, 6)
+        self._wp_rad = {i + 1: np.deg2rad(_wps[i]) for i in range(len(_wps))}
+        self._wp_keys = tuple(self._wp_rad)     # (1,) single | (1,2,...) multi
         self.scan_tol = float(P('scan_arrival_tol_rad'))
         self.scan_settle_vel = float(P('scan_settle_vel_rad_s'))
         self.scan_wait_s = float(P('scan_wait_s'))
@@ -310,19 +323,19 @@ class CupFusionNode(Node):
         self.scan_max_cup_footprint = float(P('scan_max_cup_footprint_m'))
         self.scan_fit_voxel = float(P('scan_fit_voxel_m'))
         self.scan_max_points = int(P('scan_max_points_per_cup'))
-        for k in (1, 2):
-            if self._wp_rad[k].shape[0] != 6:
-                self.get_logger().error(
-                    f'scan_wp{k}_deg must have 6 values, '
-                    f'got {self._wp_rad[k].shape[0]}')
         if not (0.005 <= self.scan_tol <= 0.1):
             self.get_logger().warn(
                 f'scan_arrival_tol_rad={self.scan_tol} outside [0.005, 0.1]')
-        wp_sep = float(np.max(np.abs(self._wp_rad[1] - self._wp_rad[2])))
-        if wp_sep < 2.0 * self.scan_tol:
-            self.get_logger().warn(
-                f'scan waypoints close (inf-norm {wp_sep:.3f} rad < 2*tol) — '
-                f'captures may be mis-attributed')
+        if len(self._wp_keys) >= 2:     # only multi-waypoint can mis-attribute
+            seps = [float(np.max(np.abs(self._wp_rad[a] - self._wp_rad[b])))
+                    for a in self._wp_keys for b in self._wp_keys if a < b]
+            if min(seps) < 2.0 * self.scan_tol:
+                self.get_logger().warn(
+                    f'two scan waypoints are within 2*tol (min inf-norm '
+                    f'{min(seps):.3f} rad) — captures may be mis-attributed')
+        self.get_logger().info(
+            f'scan: {len(self._wp_keys)} waypoint(s) configured '
+            f'(pos{list(self._wp_keys)})')
         # SINGLE-THREADED executor (rclpy.spin): the joint_states callback, the
         # 2 cloud callbacks, the timer, ~/clear_scan and the param callback are
         # all serialized on ONE thread → no locks needed for the state below.
@@ -331,7 +344,7 @@ class CupFusionNode(Node):
         self._cur_wp = None
         self._t_arrive = None
         self._t_cap = None
-        self._captured = {1: False, 2: False}
+        self._captured = {k: False for k in self._wp_keys}
         self._scan_visited: set = set()   # waypoints captured this pass
         self._scan_done = False           # both captured → stop diag logging
         self._have_lock = False
@@ -418,6 +431,7 @@ class CupFusionNode(Node):
             'cup_fit_residual_max': ('cup_resid_max', float),
             # scan & lock live-tunables (scan_lock_active drives the mode)
             'scan_lock_active': ('scan_lock_active', bool),
+            'scan_lock_exo': ('scan_lock_exo', bool),
             'scan_arrival_tol_rad': ('scan_tol', float),
             'scan_settle_vel_rad_s': ('scan_settle_vel', float),
             'scan_wait_s': ('scan_wait_s', float),
@@ -637,10 +651,11 @@ class CupFusionNode(Node):
                    or not np.isfinite(self._cur_vmax)
                    or (now - self._js_t).nanoseconds * 1e-9 > self.scan_js_timeout)
         if unknown:
-            return False, {1: False, 2: False}, {1: False, 2: False}, True
+            return (False, {k: False for k in self._wp_keys},
+                    {k: False for k in self._wp_keys}, True)
         settled = self._cur_vmax < self.scan_settle_vel
         ne, nl = {}, {}
-        for k in (1, 2):
+        for k in self._wp_keys:
             d = float(np.max(np.abs(self._cur_q - self._wp_rad[k])))
             ne[k] = d <= self.scan_tol
             nl[k] = d <= 1.5 * self.scan_tol    # hysteresis band for "leaving"
@@ -650,9 +665,9 @@ class CupFusionNode(Node):
         settled, near, near_leave, unknown = self._scan_snapshot(now)
 
         # Leave-latch: re-arm a waypoint once the arm has clearly left it, so a
-        # 2nd scan pass re-captures (and accumulates) at both waypoints. Runs
+        # 2nd scan pass re-captures (and accumulates) at each waypoint. Runs
         # every tick, including PAUSED.
-        for k in (1, 2):
+        for k in self._wp_keys:
             if self._captured[k] and not near_leave[k]:
                 self._captured[k] = False
 
@@ -678,7 +693,7 @@ class CupFusionNode(Node):
                     throttle_duration_sec=3.0)
                 return
             tol_deg = np.degrees(self.scan_tol)
-            cand = [k for k in (1, 2)
+            cand = [k for k in self._wp_keys
                     if near[k] and settled and not self._captured[k]]
             if cand:                            # nearest wins (loose-tol tie)
                 k = min(cand, key=lambda j: float(
@@ -693,14 +708,16 @@ class CupFusionNode(Node):
                 self._scan_state = 'WAIT'
             elif not self._scan_done:
                 # Approaching diagnostic — ONCE PER SECOND, and ONLY until the
-                # pass is done (both waypoints captured). Shows how far the arm
-                # is from each waypoint so the motion + arrival detection can be
+                # pass is done (all waypoints captured). Shows how far the arm
+                # is from EACH waypoint so the motion + arrival detection can be
                 # verified live. Goes silent after the scan finishes.
-                d1 = np.degrees(np.max(np.abs(self._cur_q - self._wp_rad[1])))
-                d2 = np.degrees(np.max(np.abs(self._cur_q - self._wp_rad[2])))
+                errs = ', '.join(
+                    f'pos{k} '
+                    f'{np.degrees(np.max(np.abs(self._cur_q - self._wp_rad[k]))):.1f}°'
+                    for k in self._wp_keys)
                 self.get_logger().info(
-                    f'scan: waiting for a waypoint — pos1 err {d1:.1f}°, pos2 '
-                    f'err {d2:.1f}° (tol {tol_deg:.1f}°), settled={settled}',
+                    f'scan: waiting for a waypoint — {errs} '
+                    f'(tol {tol_deg:.1f}°), settled={settled}',
                     throttle_duration_sec=1.0)
         elif self._scan_state == 'WAIT':
             if (now - self._t_arrive).nanoseconds * 1e-9 >= self.scan_wait_s:
@@ -727,19 +744,52 @@ class CupFusionNode(Node):
                 self._scan_visited.add(k)
                 self._cur_wp = None
                 self._scan_state = 'IDLE'
-                if self._scan_visited >= {1, 2} and not self._scan_done:
+                if (self._scan_visited >= set(self._wp_keys)
+                        and not self._scan_done):
                     self._scan_done = True
                     self.get_logger().info(
-                        'scan: ✔ pass complete — pos1 & pos2 captured, lock '
-                        'published; diagnostic logging stops (clear or '
-                        're-activate to scan again)')
+                        f'scan: ✔ pass complete — all {len(self._wp_keys)} '
+                        f'waypoint(s) captured, lock published; diagnostic '
+                        f'logging stops (clear or re-activate to scan again)')
+
+    def _build_cam_objs(self, cam, msg):
+        """Detection-objs (world-frame already) for one camera's cloud message
+        — same shape _gather builds, incl. the 'aabb' _premerge needs."""
+        out = []
+        for o in msg.objects:
+            if cam == 'hand' and o.moving and self.hand_gating:
+                continue
+            xyz, rgb = _pc2_xyzrgb(o.points)
+            if xyz.shape[0] < 32:
+                continue
+            out.append({
+                'cam': cam, 'xyz': xyz, 'rgb': rgb,
+                'centroid': np.array([o.centroid.x, o.centroid.y,
+                                      o.centroid.z], dtype=np.float64),
+                'aabb': _aabb_robust(xyz),
+                'score': float(o.score), 'class_name': o.class_name,
+                'moving': bool(o.moving),
+                'w': self.w_hand_base if cam == 'hand' else self.w_exo_base,
+            })
+        return out
+
+    def _latest_cam_objs(self, cam):
+        """Objs from the LATEST cached cloud of `cam` (within max_age) — used to
+        overlay LIVE exo on the frozen hand lock each tick."""
+        msg, t = self._latest[cam]
+        if (msg is None
+                or (self.get_clock().now() - t).nanoseconds * 1e-9 > self.max_age):
+            return []
+        return self._build_cam_objs(cam, msg)
 
     def _capture_into_accum(self) -> None:
-        """Append fresh per-camera detection-objs (already world-frame) to the
-        accumulation buffer. Dedups by per-camera stamp so a slow producer's
-        repeated latest-cloud isn't appended every tick."""
+        """Append fresh per-camera detection-objs into the accumulation buffer
+        (dedup by per-camera stamp). When scan_lock_exo is False, accumulate the
+        HAND camera ONLY — exo stays LIVE and is re-fused each tick in the
+        locked branch; freezing it here would double-count it."""
         now = self.get_clock().now()
-        for cam in ('exo', 'hand'):
+        cams = ('exo', 'hand') if self.scan_lock_exo else ('hand',)
+        for cam in cams:
             msg, t = self._latest[cam]
             if msg is None or (now - t).nanoseconds * 1e-9 > self.max_age:
                 continue
@@ -747,21 +797,7 @@ class CupFusionNode(Node):
             if stamp <= self._scan_proc_stamp[cam]:
                 continue                        # same cloud already captured
             self._scan_proc_stamp[cam] = stamp
-            for o in msg.objects:
-                if cam == 'hand' and o.moving and self.hand_gating:
-                    continue
-                xyz, rgb = _pc2_xyzrgb(o.points)
-                if xyz.shape[0] < 32:
-                    continue
-                self._accum.append({
-                    'cam': cam, 'xyz': xyz, 'rgb': rgb,
-                    'centroid': np.array([o.centroid.x, o.centroid.y,
-                                          o.centroid.z], dtype=np.float64),
-                    'aabb': _aabb_robust(xyz),
-                    'score': float(o.score), 'class_name': o.class_name,
-                    'moving': bool(o.moving),
-                    'w': self.w_hand_base if cam == 'hand' else self.w_exo_base,
-                })
+            self._accum.extend(self._build_cam_objs(cam, msg))
 
     @contextmanager
     def _scan_params(self):
@@ -919,7 +955,7 @@ class CupFusionNode(Node):
         """OFF → ACTIVE: start a fresh scan session. Live boxes keep rendering
         until the first lock exists (then _compute_locked wipes them)."""
         self._accum = []
-        self._captured = {1: False, 2: False}
+        self._captured = {k: False for k in self._wp_keys}
         self._scan_visited = set()
         self._scan_done = False
         self._scan_state = 'IDLE'
@@ -948,7 +984,7 @@ class CupFusionNode(Node):
         self._locked_points_xyz = None
         self._locked_points_rgb = None
         self._accum = []
-        self._captured = {1: False, 2: False}
+        self._captured = {k: False for k in self._wp_keys}
         self._scan_visited = set()
         self._scan_done = False
         self._scan_state = 'IDLE'
@@ -1006,14 +1042,46 @@ class CupFusionNode(Node):
         if not self._have_lock:
             return self._tick_live()            # no lock yet → keep live alive
 
-        # Locked: republish the cached union on the VOLATILE /points each tick
-        # (a late RViz subscriber can't get a latched volatile cloud). Lock
+        if not self.scan_lock_exo:
+            # HAND frozen + exo LIVE: re-fuse the frozen hand scan with the
+            # latest exo cloud every tick, so cups exo newly sees appear and a
+            # picked cup stays from the hand lock.
+            return self._publish_hand_lock_live_exo(stamp)
+
+        # BOTH frozen: republish the cached union on the VOLATILE /points each
+        # tick (a late RViz subscriber can't get a latched volatile cloud). Lock
         # boxes are latched from _compute_locked, so no per-tick marker publish.
         # Republish even a 0-point cloud so a stale live frame can't linger.
         if self._locked_points_xyz is not None:
             self.points_pub.publish(_make_pointcloud2(
                 Header(stamp=stamp, frame_id=self.world_frame),
                 self._locked_points_xyz, self._locked_points_rgb))
+
+    def _publish_hand_lock_live_exo(self, stamp) -> None:
+        """Hand-only lock: fuse the frozen (consolidated) hand accumulation with
+        the LATEST exo objs, re-fit, and publish boxes + /points every tick. The
+        dense frozen hand points dominate each shared cup's fit (stable), while
+        exo adds live coverage and any cup it newly sees."""
+        combined = list(self._accum) + self._latest_cam_objs('exo')
+        with self._scan_params():
+            fits = self._run_fit_pipeline(combined)
+        tracks, ids = {}, set()
+        for i, f in enumerate(fits, start=1):
+            cams = {m['cam'] for m in f['members']}
+            tracks[i] = self._render_state(
+                i, f['center'], f['R'], f['size'], f['kind'],
+                f['frustum'], f['residual'], cams)
+            ids.add(i)
+        self._locked_tracks = tracks
+        self._publish_lock_markers(stamp, ids)
+        if combined:
+            xyz = np.vstack([o['xyz'] for o in combined]).astype(np.float32)
+            rgb = np.concatenate([o['rgb'] for o in combined])
+        else:
+            xyz = np.zeros((0, 3), np.float32)
+            rgb = np.zeros((0,), np.float32)
+        self.points_pub.publish(_make_pointcloud2(
+            Header(stamp=stamp, frame_id=self.world_frame), xyz, rgb))
 
     def _tick_live(self) -> None:
         objs = self._gather()

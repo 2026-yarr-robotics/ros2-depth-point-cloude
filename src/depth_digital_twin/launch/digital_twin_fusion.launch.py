@@ -53,8 +53,10 @@ Args:
   params      : pipeline params.yaml (default: package config)
   rviz        : launch RViz2 overlay (default true)
 """
+import glob
 import json
 import os
+import re
 
 import yaml
 from ament_index_python.packages import get_package_share_directory
@@ -100,6 +102,19 @@ def _namespace_group(ns: str, actions: list):
     relative names) and remap the absolute colliding names above into it."""
     remaps = [SetRemap(src=n, dst=f'/{ns}{n}') for n in _NS_REMAP_NAMES]
     return GroupAction([PushRosNamespace(ns), *remaps, *actions])
+
+
+_TUNING_RE = re.compile(r'^params_\d{6}_\d{6}\.yaml$')
+
+
+def _latest_tuning(cfg_dir: str):
+    """Newest panel-saved tuning snapshot (params_YYMMDD_HHMMSS.yaml) in
+    cfg_dir, or None. Matches ONLY the timestamped name so params.yaml and
+    params_back.yaml (which sorts AFTER digits!) are never picked. Snapshots
+    are PARTIAL — the caller must OVERLAY them on params.yaml, not replace it."""
+    snaps = [f for f in glob.glob(os.path.join(cfg_dir, 'params_*.yaml'))
+             if _TUNING_RE.match(os.path.basename(f))]
+    return max(snaps, key=os.path.basename) if snaps else None
 
 
 def _export_intrinsics(seq_dir: str, view: str) -> str:
@@ -171,6 +186,16 @@ def _setup(context, *_, **__):
               f'{("  namespace=/" + ns) if ns else "  (root)"}')
 
     params = LaunchConfiguration('params').perform(context)
+    # Optionally OVERLAY the newest panel-saved tuning snapshot on top of
+    # params.yaml (snapshots are partial → later files win, base stays intact).
+    base_params = [params]
+    if LaunchConfiguration('load_latest_tuning').perform(context) == 'true':
+        latest = _latest_tuning(os.path.dirname(params))
+        if latest:
+            base_params.append(latest)
+            print(f'[fusion] tuning overlay → {latest}')
+        else:
+            print('[fusion] load_latest_tuning: no params_*.yaml snapshot found')
     with open(params) as f:
         _y = yaml.safe_load(f) or {}
     dn = (_y.get('detection_node') or {}).get('ros__parameters') or {}
@@ -244,7 +269,7 @@ def _setup(context, *_, **__):
             robot_description, value_type=str)}])
 
     # ---- exo: ArUco world origin + detection + point cloud (producer) ----
-    common_exo = [params, {'intrinsics_path': intr_exo}]
+    common_exo = [*base_params, {'intrinsics_path': intr_exo}]
     world_origin_exo = Node(
         package='depth_digital_twin', executable='world_origin_node',
         name='world_origin_node_exo', output='screen',
@@ -255,7 +280,7 @@ def _setup(context, *_, **__):
             'camera_frame': EXO_F,
             'world_frame': 'world',
         }])
-    common_hand = [params, {'intrinsics_path': intr_hand}]
+    common_hand = [*base_params, {'intrinsics_path': intr_hand}]
     world_origin_hand = Node(
         package='depth_digital_twin', executable='world_origin_node',
         name='world_origin_node_hand', output='screen',
@@ -322,7 +347,7 @@ def _setup(context, *_, **__):
     fusion = Node(
         package='depth_digital_twin', executable='cup_fusion_node',
         name='cup_fusion_node', output='screen',
-        parameters=[params, dict({
+        parameters=[*base_params, dict({
             'exo_clouds_topic': '/digital_twin/cups_exo',
             'hand_clouds_topic': '/digital_twin/cups_hand',
             'boxes_topic': '/digital_twin/boxes',
@@ -392,5 +417,10 @@ def generate_launch_description() -> LaunchDescription:
             'params',
             default_value=os.path.join(pkg, 'config', 'params.yaml')),
         DeclareLaunchArgument('rviz', default_value='true'),
+        DeclareLaunchArgument(
+            'load_latest_tuning', default_value='true',
+            description='Overlay the newest panel-saved params_<ts>.yaml '
+                        'snapshot on top of params.yaml at startup '
+                        '(false = base params.yaml only).'),
         OpaqueFunction(function=_setup),
     ])
