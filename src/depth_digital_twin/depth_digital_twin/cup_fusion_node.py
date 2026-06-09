@@ -20,6 +20,7 @@ Phase C adds the hand/exo adaptive view weighting + voxel normalisation.
 """
 from __future__ import annotations
 
+import json
 from contextlib import contextmanager
 
 import numpy as np
@@ -30,7 +31,7 @@ from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
 from geometry_msgs.msg import Point as MsgPoint, Quaternion, Vector3
 from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import JointState, PointCloud2
-from std_msgs.msg import ColorRGBA, Header
+from std_msgs.msg import ColorRGBA, Header, Int32MultiArray, String
 from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker, MarkerArray
 from scipy.spatial import cKDTree
@@ -43,7 +44,7 @@ from depth_digital_twin_msgs.msg import WorldObjectCloudArray
 # side-effect-free because main() is guarded by __main__.)
 from depth_digital_twin.point_cloud_node import (
     PositionKF, _fit_cup_axis_xy, _compute_box_world, _make_pointcloud2,
-    _cup_frustum_geometry, _palette, _rot_to_quat)
+    _cup_frustum_geometry, _palette, _rot_to_quat, _classify_color_bgr)
 
 
 def _pc2_xyzrgb(cloud: PointCloud2):
@@ -56,6 +57,20 @@ def _pc2_xyzrgb(cloud: PointCloud2):
     xyz = arr[:, :3].astype(np.float64)
     rgb = arr[:, 3].copy() if arr.shape[1] >= 4 else np.zeros((n,), np.float32)
     return xyz, rgb
+
+
+def _color_from_packed_rgb(rgb_packed, allowed):
+    """Median-HSV color name from a producer's packed-float32 rgb array
+    (PointCloud2 'rgb' convention r<<16|g<<8|b), or None. Reuses the standalone
+    point_cloud_node bucketing so fused cups carry the SAME color meaning."""
+    if rgb_packed is None or len(rgb_packed) == 0:
+        return None
+    u = np.ascontiguousarray(rgb_packed, dtype=np.float32).view(np.uint32)
+    r = ((u >> 16) & 255).astype(np.uint8)
+    g = ((u >> 8) & 255).astype(np.uint8)
+    b = (u & 255).astype(np.uint8)
+    bgr = np.stack([b, g, r], axis=1)
+    return _classify_color_bgr(bgr, allowed)
 
 
 def _voxel_idx(pts: np.ndarray, voxel: float) -> np.ndarray:
@@ -147,6 +162,8 @@ class CupFusionNode(Node):
         gp('exo_clouds_topic', '/digital_twin/cups_exo')
         gp('hand_clouds_topic', '/digital_twin/cups_hand')
         gp('boxes_topic', '/digital_twin/boxes')
+        gp('cups_on_table_topic', '/vision/cups_on_table')
+        gp('stack_track_ids_topic', '/stack_track_ids')
         gp('points_topic', '/digital_twin/points')
         gp('world_frame', 'world')
         # Debug-visualisation toggles (driven live by the Tk panel checkboxes).
@@ -196,6 +213,17 @@ class CupFusionNode(Node):
         gp('cup_fit_residual_max', 0.02)
         gp('cup_polygon_segments', 24)
         gp('cup_class_names', ['upright-cup'])
+        # Color contract: fused cups must carry the SAME color identity the
+        # standalone pipeline emitted (verifier/plan_executor parse `c=<color>`).
+        gp('cup_colors', ['red', 'orange', 'yellow', 'green', 'blue',
+                          'purple', 'white', 'black', 'gray'])
+        # Per-view vote weight (hand cam down-weighted until calib verified).
+        gp('color_exo_weight', 1.0)
+        gp('color_hand_weight', 0.7)
+        # Bounded, correctable color vote: gate tiny views, decay stale
+        # votes so an early mis-classification self-corrects.
+        gp('color_min_points', 64)
+        gp('color_vote_decay', 0.9)
         gp('box_standing_ratio', 0.8)
         gp('box_min_elongation', 1.5)
 
@@ -270,6 +298,11 @@ class CupFusionNode(Node):
         self.cup_resid_max = float(P('cup_fit_residual_max'))
         self.cup_n_seg = int(P('cup_polygon_segments'))
         self.cup_class_names = set(P('cup_class_names'))
+        self._cup_colors = list(P('cup_colors'))
+        self._color_w = {'exo': float(P('color_exo_weight')),
+                         'hand': float(P('color_hand_weight'))}
+        self._color_min_points = int(P('color_min_points'))
+        self._color_vote_decay = float(P('color_vote_decay'))
         self.standing_ratio = float(P('box_standing_ratio'))
         self.min_elongation = float(P('box_min_elongation'))
         self.w_hand_base = float(P('w_hand_base'))
@@ -358,6 +391,7 @@ class CupFusionNode(Node):
         # (which would make the filter over-confident and the box flicker).
         self._proc_stamp: dict[str, float] = {'exo': -1.0, 'hand': -1.0}
         self._tracks: dict[int, dict] = {}
+        self._stacked_ids: set = set()
         self._next_gid = 1
         self._last_ids: set[int] = set()
 
@@ -378,6 +412,11 @@ class CupFusionNode(Node):
 
         self.boxes_pub = self.create_publisher(
             MarkerArray, str(P('boxes_topic')), latched)
+        self.cups_on_table_pub = self.create_publisher(
+            String, str(P('cups_on_table_topic')), latched)
+        self.create_subscription(
+            Int32MultiArray, str(P('stack_track_ids_topic')),
+            self._on_stack_ids, 10)
         self.points_pub = self.create_publisher(
             PointCloud2, str(P('points_topic')), 5)
         self.dbg_det_pub = self.create_publisher(
@@ -1079,9 +1118,35 @@ class CupFusionNode(Node):
                 tr['hits'] += 1
             tr['cams'] = {m['cam'] for m in f['members']}
             tr['miss'] = 0
+            # ── Color: per-view HSV vote with decay (recency-weighted, ──
+            # bounded ~= weight/(1-decay)). Each measurement event decays prior
+            # votes then adds a FIXED per-view weight (not point-count), so an
+            # early mis-classification self-corrects; tiny views are gated by
+            # color_min_points. argmax of known colors = track color.
+            votes = tr.setdefault('color_votes', {})
+            for k in votes:
+                votes[k] *= self._color_vote_decay
+            by_cam: dict = {}
+            for m in f['members']:
+                by_cam.setdefault(m['cam'], []).append(m['rgb'])
+            for cam, rgbs in by_cam.items():
+                packed = np.concatenate(rgbs) if rgbs else None
+                if packed is None or len(packed) < self._color_min_points:
+                    continue
+                col = _color_from_packed_rgb(packed, self._cup_colors)
+                if col is None:
+                    continue
+                votes[col] = votes.get(col, 0.0) + self._color_w.get(cam, 1.0)
+            tr['color'] = max(votes, key=votes.get) if votes else 'unknown'
+            cls = next((m['class_name'] for m in f['members']
+                        if m['class_name'] in self.cup_class_names),
+                       f['members'][0]['class_name'] if f['members'] else 'cup')
+            score = max((m['score'] for m in f['members']), default=0.0)
+            tr['cls'] = cls
             tr['last_state'] = self._render_state(
                 gid, tr['kf'].x.copy(), f['R'], f['size'], f['kind'],
-                f['frustum'], f['residual'], tr['cams'])
+                f['frustum'], f['residual'], tr['cams'],
+                tr['color'], cls, score)
             alive.add(gid)
 
         # STAGE-4: coast/evict after keepalive measurement events with no match.
@@ -1095,6 +1160,7 @@ class CupFusionNode(Node):
         # is on (it is by default). /points = the FULL raw union (every point).
         stamp = self.get_clock().now().to_msg()
         self._publish_markers(stamp, enabled=self.dbg_fit2)
+        self._publish_cups_on_table()
         if objs:
             xyz = np.vstack([o['xyz'] for o in objs]).astype(np.float32)
             rgb = np.concatenate([o['rgb'] for o in objs])
@@ -1135,7 +1201,8 @@ class CupFusionNode(Node):
                     for f in fits]
         self._emit_dbg(self.dbg_fit1_pub, self.dbg_fit1, f1_boxes, stamp)
 
-    def _render_state(self, gid, center, R, size, kind, frustum, residual, cams):
+    def _render_state(self, gid, center, R, size, kind, frustum, residual,
+                      cams, color='unknown', cls='cup', score=0.0):
         """Box geometry for marker emission, using the KF-filtered centre."""
         if kind == 'standing' and frustum is not None:
             cx, cy, cz = float(center[0]), float(center[1]), float(center[2])
@@ -1146,10 +1213,38 @@ class CupFusionNode(Node):
             top_world = np.array([cx, cy, z_base + self.cup_h])
         else:
             top_world = center + R @ np.array([0.0, 0.0, float(size[2]) * 0.5])
-        views = '+'.join(sorted(cams))
-        label = f"#{gid}_{kind}_{views}_r={residual * 1000:.0f}mm"
+        # parse_label-compatible (verifier / plan_executor / boxes_to_detections
+        # all read `c=<color>` + class): `#<id>_c=<color>_<class>_<score>`.
+        label = f"#{gid}_c={color}_{cls}_{score:.2f}"
         return {'center': np.asarray(center), 'R': R, 'size': np.asarray(size),
                 'top_world': top_world, 'frustum': frustum, 'label': label}
+
+    def _is_publishable_track(self, tr) -> bool:
+        """A track contributes to /digital_twin/boxes (and thus cups_on_table)
+        only after min_hits consecutive matches with a rendered state — the same
+        gate _publish_markers uses, so boxes and cups_on_table stay consistent."""
+        return (tr.get('last_state') is not None
+                and tr.get('hits', 0) >= self.min_hits)
+
+    def _on_stack_ids(self, msg) -> None:
+        self._stacked_ids = {int(x) for x in msg.data}
+
+    def _publish_cups_on_table(self) -> None:
+        """Color counts of upright, non-stacked cups (same {color:int} JSON the
+        standalone point_cloud_node emitted) so the agent count lane survives in
+        fusion mode. Excludes ids currently in /stack_track_ids."""
+        counts = {c: 0 for c in self._cup_colors}
+        counts['unknown'] = 0
+        for gid, tr in self._tracks.items():
+            if not self._is_publishable_track(tr):
+                continue
+            if gid in self._stacked_ids:
+                continue
+            if tr.get('cls') not in self.cup_class_names:
+                continue
+            col = tr.get('color') or 'unknown'
+            counts[col] = counts.get(col, 0) + 1
+        self.cups_on_table_pub.publish(String(data=json.dumps(counts)))
 
     # ------------------------------------------------------------------
     def _emit_dbg(self, pub, enabled, boxes, stamp) -> None:
@@ -1231,7 +1326,7 @@ class CupFusionNode(Node):
             ls = tr.get('last_state')
             # min_hits: don't render a track until it has been matched a few
             # consecutive events — kills 1-2 frame spurious fits (anti-flicker).
-            if ls is None or tr.get('hits', 0) < self.min_hits:
+            if not self._is_publishable_track(tr):
                 continue
             colour = _palette(gid - 1)
             self._box_markers(markers, gid, ls, colour, stamp,
