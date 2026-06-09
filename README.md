@@ -432,7 +432,58 @@ ros2 launch depth_digital_twin digital_twin_sequence.launch.py \
 
 ---
 
-## UC-4. pick UI 재스캔 트리거
+## UC-4. Hand/Exo 통합 재생 및 실행
+
+녹화 시퀀스에서 **exo + hand 두 카메라를 동시에** 파이프라인에 투입하고, 두 뷰의
+컵 검출을 **하나의 물리 컵으로 융합**해 통합 추정한다. 이미지는 RViz가 아니라
+**통합 Tk 패널**(`digital_twin_panel`)에 뜬다.
+
+```bash
+# 세 워크스페이스 모두 source
+source ~/ros2_ws/install/setup.bash   # dsr_description2 (m0609 URDF, joint FK)
+source ~/Projects/ros2-recode-sequence/install/setup.bash
+source ~/Projects/yarr_projects/install/setup.bash
+
+ros2 launch depth_digital_twin digital_twin_fusion.launch.py \
+    sequence:=/home/eunwoo/Projects/yarr_projects/seq_record/0013 \
+    loop:=true
+```
+
+### 토폴로지 (Producer → Fusion)
+
+```
+sequence_player ─► /camera_exo/*, /camera_hand/*, /joint_states
+  ├─ world_origin_node_exo  (ArUco)        → world ← exo_color_optical_frame
+  ├─ world_origin_node_hand (handeye_aruco)→ link_6 → hand_color_optical_frame
+  ├─ detection_node_exo|hand (YOLO-seg)    → /digital_twin/detections_*
+  ├─ point_cloud_node_exo|hand (role=producer)
+  │      → /digital_twin/cups_exo, /cups_hand   (per-object world 점군; fit/KF 안 함)
+  └─ cup_fusion_node
+         · world 기하로 연관(중복·교차카메라 병합) → 가중 merge → fit → 컵당 KF
+         → /digital_twin/boxes (통합), /digital_twin/points
+```
+
+핵심: per-camera 노드는 **점 생산자**일 뿐, 컵 fit·Kalman·박스 발행은 모두
+`cup_fusion_node`가 단독으로 한다. 단일 뷰(`view:=`)와 이중 뷰가 같은 경로다.
+
+### 통합 Tk 패널 (`digital_twin_panel`)
+
+- 상단: **ArUco 재검출 버튼 3개 / 2행** — `ArUco Re-detect All (hand, exo)`,
+  그 아래 `ArUco Exo` · `ArUco Hand` (고정 크기, 가운데 정렬). 각 버튼은 해당
+  카메라의 `world_origin_node_{exo,hand}/redetect` 서비스를 호출한다.
+- 본문: **2행 × 3열 이미지 그리드** — (exo/hand) × (RGB, Depth, 3D). 세 열이 항상
+  균일 1/3, 창 크기 변경에 맞춰 각 셀이 비율을 유지하며 잘리지 않게 리사이즈된다.
+- 기존 `world_origin_control` 팝업은 이 패널로 대체된다.
+
+> ⚠ 라이브 `dsr_bringup2`가 켜져 있으면 `world→base_link→…→link_6` TF가 충돌한다.
+> 종료 후 실행하거나 `ROS_DOMAIN_ID`/`ns:=`로 분리한다.
+>
+> ⚠ 듀얼 YOLO + 듀얼 point_cloud는 무겁다. 전송 폭주로 `/tf`가 밀리면 컵이 어긋나므로
+> 필요시 `playback_rate:=`(저속 재생)로 대역폭을 낮춘다.
+
+---
+
+## UC-5. pick UI 재스캔 트리거
 
 pick 전 최신 포즈로 갱신하고 싶을 때:
 

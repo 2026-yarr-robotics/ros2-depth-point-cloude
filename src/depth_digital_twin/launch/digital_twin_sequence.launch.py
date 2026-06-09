@@ -29,10 +29,17 @@ Usage:
       sequence:=/home/eunwoosong/Projects/record_sequence/0010
   ros2 launch depth_digital_twin digital_twin_sequence.launch.py \\
       sequence:=/home/eunwoosong/Projects/record_sequence/0010 view:=hand
+  # isolate the replay so it can run next to a live bringup:
+  ros2 launch depth_digital_twin digital_twin_sequence.launch.py \\
+      sequence:=/home/eunwoosong/Projects/record_sequence/0010 ns:=record
 
 Args:
   sequence    : absolute path to a recorded sequence dir (REQUIRED)
   view        : exo | hand — camera into pipeline (default exo)
+  ns          : namespace for the WHOLE replay stack (default empty = root).
+                ns:=record ⇒ joint_states / TF / camera / /digital_twin/* all
+                move under /record, so a recorded replay coexists with a live
+                bringup.  A dedicated RViz comes up reading /record/tf.
   yolo_model  : override detection_node.model (empty = params.yaml selection)
   handeye_npy : DEPRECATED — view:=hand now uses runtime ArUco-based hand-eye.
                 Argument kept for backwards compat with older invocations; the
@@ -72,13 +79,13 @@ def _write_node_param_override(node_name: str, params: dict) -> str:
     return path
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import (DeclareLaunchArgument, IncludeLaunchDescription,
-                            OpaqueFunction)
+from launch.actions import (DeclareLaunchArgument, GroupAction,
+                            IncludeLaunchDescription, OpaqueFunction)
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import (Command, FindExecutable, LaunchConfiguration,
                                   PathJoinSubstitution)
-from launch_ros.actions import Node
+from launch_ros.actions import Node, PushRosNamespace, SetRemap
 from launch_ros.descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
@@ -88,6 +95,38 @@ _HANDEYE_DEFAULT = ('/home/eunwoosong/Projects/ros2-recode-sequence/'
 _PIPE_COLOR = '/camera/camera/color/image_raw'
 _PIPE_DEPTH = '/camera/camera/aligned_depth_to_color/image_raw'
 _PIPE_INFO = '/camera/camera/color/camera_info'
+
+# Absolute names the replay stack pub/subs that ALSO exist in a live bringup.
+# When `ns:=<name>` is set we redirect each to /<ns>/… so a recorded replay
+# can run next to the real robot without fighting over /joint_states, the TF
+# tree, the camera feed, or the /digital_twin/* pipeline topics.  PushRosNamespace
+# moves node names + relative/private names; these absolute ones (hardcoded here
+# and in params.yaml) ignore the namespace, so they need explicit remaps.
+#   • /tf, /tf_static — isolating the TF *topic* gives the replay its own TF
+#     buffer, so identical frame ids (world/base_link/link_6) no longer clash;
+#     no frame-prefix needed.
+#   • /world_origin_node/redetect — world_origin_control calls this absolute
+#     service name, so it must follow the namespaced server.
+_NS_REMAP_NAMES = (
+    _PIPE_COLOR, _PIPE_DEPTH, _PIPE_INFO,
+    '/joint_states',
+    '/tf', '/tf_static',
+    '/digital_twin/detections', '/digital_twin/detection_debug',
+    '/digital_twin/points', '/digital_twin/boxes', '/digital_twin/box_debug',
+    '/vision/cups_on_table',
+    '/world_origin_node/redetect',
+)
+
+
+def _namespace_group(ns: str, actions: list):
+    """Wrap every replay action under `/<ns>`: push the namespace (node names +
+    relative names) and remap the absolute colliding names above into it.
+    SetRemap/PushRosNamespace both propagate into the included
+    digital_twin.launch.py pipeline, so no node/params.yaml edits are needed."""
+    remaps = [SetRemap(src=n, dst=f'/{ns}{n}') for n in _NS_REMAP_NAMES]
+    return GroupAction([PushRosNamespace(ns), *remaps, *actions])
+
+
 _IDLE = {
     'exo': {'c': '/exo/exo/color/image_raw',
             'd': '/exo/exo/aligned_depth_to_color/image_raw',
@@ -150,15 +189,25 @@ def _setup(context, *_, **__):
     loop_flag = LaunchConfiguration('loop').perform(context) == 'true'
     common_params = [params, {'intrinsics_path': intr}]
 
+    # Empty (default) ⇒ run at root namespace exactly as before.  Set
+    # ns:=record (etc.) to isolate the whole replay stack under /record so it
+    # can coexist with a live bringup — see _namespace_group above.
+    ns = LaunchConfiguration('ns').perform(context).strip().strip('/')
+    if ns:
+        print(f'[seq] namespace → /{ns}  (isolated from live bringup)')
+
     if view == 'exo':
-        return _setup_exo(context, seq, intr, pkg, params, model,
-                          autostart, loop_flag)
+        actions = _setup_exo(context, seq, intr, pkg, params, model,
+                             autostart, loop_flag, ns)
     else:
-        return _setup_hand(context, seq, intr, pkg, params, model,
-                           common_params, autostart, loop_flag)
+        actions = _setup_hand(context, seq, intr, pkg, params, model,
+                              common_params, autostart, loop_flag, ns)
+
+    return [_namespace_group(ns, actions)] if ns else actions
 
 
-def _setup_exo(context, seq, intr, pkg, params, model, autostart, loop_flag):
+def _setup_exo(context, seq, intr, pkg, params, model, autostart, loop_flag,
+               ns):
     """Exo view: ArUco world calibration via world_origin_node (existing approach)."""
     player = Node(
         package='recode_sequence', executable='sequence_player_node',
@@ -190,13 +239,15 @@ def _setup_exo(context, seq, intr, pkg, params, model, autostart, loop_flag):
 
     playback_ctrl = Node(
         package='recode_sequence', executable='playback_control',
-        name='playback_control', output='screen')
+        name='playback_control', output='screen',
+        parameters=[{'player_ns': f'/{ns}/sequence_player_node'}] if ns
+        else [])
 
     return [player, pipeline, playback_ctrl]
 
 
 def _setup_hand(context, seq, intr, pkg, params, model, common_params,
-                autostart, loop_flag):
+                autostart, loop_flag, ns):
     """Hand view: FK-based world transform (joint_states → RSP → handeye_tf)."""
     try:
         get_package_share_directory('dsr_description2')
@@ -222,6 +273,11 @@ def _setup_hand(context, seq, intr, pkg, params, model, common_params,
             'joint_states_topic': '/joint_states',
             'autostart': autostart,
             'loop': loop_flag,
+            # Slow the replay (Hz; 0 = recording rate) so the raw image stream
+            # doesn't saturate DDS and delay /tf — handeye/point_cloud look up
+            # base_link→link_6 at the image stamp and a lagging /tf breaks it.
+            'rate_hz': float(
+                LaunchConfiguration('playback_rate').perform(context) or 0),
         }])
 
     robot_description = Command([
@@ -247,20 +303,28 @@ def _setup_hand(context, seq, intr, pkg, params, model, common_params,
     # ArUco sample, and publishes:
     #   world      → base_link            (identity)
     #   link_6     → hand_color_optical_frame  (computed hand-eye)
+    # NOTE: these MUST go through a node-specific override file, not an inline
+    # dict.  params.yaml pins `world_origin_node: world_origin_mode: aruco`
+    # (and aruco_timeout_then_floor: true) in a node-specific section, which
+    # ROS 2 ranks ABOVE any wildcard inline dict launch_ros serialises — so an
+    # inline {'world_origin_mode': 'handeye_aruco'} silently loses and the node
+    # boots in exo `aruco` mode (camera frozen to world, never follows link_6).
+    # See _write_node_param_override docstring.
     handeye = Node(
         package='depth_digital_twin', executable='world_origin_node',
         name='world_origin_node', output='screen',
-        parameters=common_params + [{
-            'world_origin_mode': 'handeye_aruco',
-            'color_topic': _PIPE_COLOR,
-            'camera_frame': 'hand_color_optical_frame',
-            'world_frame': 'world',
-            'base_frame': 'base_link',
-            'ee_frame': 'link_6',
-            # Floor-plane fallback doesn't make sense for the hand camera —
-            # without an ArUco view we have no way to anchor world.
-            'aruco_timeout_then_floor': False,
-        }])
+        parameters=common_params + [_write_node_param_override(
+            'world_origin_node', {
+                'world_origin_mode': 'handeye_aruco',
+                'color_topic': _PIPE_COLOR,
+                'camera_frame': 'hand_color_optical_frame',
+                'world_frame': 'world',
+                'base_frame': 'base_link',
+                'ee_frame': 'link_6',
+                # Floor-plane fallback doesn't make sense for the hand camera —
+                # without an ArUco view we have no way to anchor world.
+                'aruco_timeout_then_floor': False,
+            })])
 
     # See _write_node_param_override docstring — node-specific yaml beats
     # wildcard inline dict, so the override has to be its own --params-file
@@ -292,7 +356,9 @@ def _setup_hand(context, seq, intr, pkg, params, model, common_params,
 
     playback_ctrl = Node(
         package='recode_sequence', executable='playback_control',
-        name='playback_control', output='screen')
+        name='playback_control', output='screen',
+        parameters=[{'player_ns': f'/{ns}/sequence_player_node'}] if ns
+        else [])
 
     # Redetect ArUco popup — same UI as exo (digital_twin.launch.py wires it
     # by default).  Calls /world_origin_node/redetect (std_srvs/Trigger);
@@ -325,6 +391,18 @@ def generate_launch_description() -> LaunchDescription:
                               description='Robot instance name (view:=hand)'),
         DeclareLaunchArgument('loop', default_value='false'),
         DeclareLaunchArgument('autostart', default_value='true'),
+        DeclareLaunchArgument(
+            'playback_rate', default_value='0',
+            description='Replay rate in Hz (0 = recording rate). Lower it '
+                        '(e.g. 5) if the raw image stream saturates DDS and '
+                        '/tf arrives late, breaking the image-stamp FK lookup '
+                        'in handeye_aruco / point_cloud.'),
+        DeclareLaunchArgument(
+            'ns', default_value='',
+            description='Empty = root namespace (current behaviour). Set e.g. '
+                        'ns:=record to isolate the whole replay stack under '
+                        '/record (joint_states, TF, camera, /digital_twin/*) so '
+                        'it can run alongside a live bringup without conflicts.'),
         DeclareLaunchArgument(
             'params',
             default_value=os.path.join(pkg, 'config', 'params.yaml')),

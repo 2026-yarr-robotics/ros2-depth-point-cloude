@@ -105,6 +105,19 @@ class WorldOriginNode(Node):
         # line is published once (latched) and persists.
         self.declare_parameter('handeye_viz_rate_hz', 10.0)
 
+        # ── Pre-calibrated hand-eye (skip the live ArUco+FK calibration) ──────
+        # The hand-eye ee_frame→camera_frame transform is a fixed rigid offset.
+        # With handeye_use_param_offset=true, handeye_aruco mode publishes the
+        # offset below DIRECTLY on startup and does NOT subscribe to the color
+        # topic — no per-frame ArUco, no tf2 FK lookup (which is fragile when
+        # /tf lags the images during playback). Re-detection then happens ONLY
+        # when the ~/redetect service is called. The two arrays match a prior
+        # calibration log: translation in metres (= "pos (cm)"/100) and rotation
+        # Euler-XYZ intrinsic in degrees (= "euler_xyz (deg)").
+        self.declare_parameter('handeye_use_param_offset', False)
+        self.declare_parameter('handeye_offset_xyz_m', [0.0, 0.0, 0.0])
+        self.declare_parameter('handeye_offset_rpy_deg', [0.0, 0.0, 0.0])
+
         # ── aruco mode params ──────────────────────────────────────────────
         self.declare_parameter('color_topic', '/camera/camera/color/image_raw')
         self.declare_parameter('world_marker_id', 0)
@@ -265,10 +278,20 @@ class WorldOriginNode(Node):
         # Holds the base→ee pose looked up via tf2 at the same image stamp.
         self.handeye_link6_samples: list[np.ndarray] = []
         self.aruco_start = self.get_clock().now()
-        self._aruco_sub = self.create_subscription(
-            Image,
-            str(self.get_parameter('color_topic').value),
-            self._on_color_aruco, 10)
+
+        # handeye_aruco may skip the live calibration and use a fixed param
+        # offset; in that case no startup color subscription is created —
+        # ~/redetect re-creates it on demand to recalibrate.
+        self._use_param_offset = (
+            self._mode == 'handeye_aruco'
+            and bool(self.get_parameter('handeye_use_param_offset').value))
+        if self._use_param_offset:
+            self._aruco_sub = None
+        else:
+            self._aruco_sub = self.create_subscription(
+                Image,
+                str(self.get_parameter('color_topic').value),
+                self._on_color_aruco, 10)
 
         # Handeye additions — only when computing a wrist-mounted hand-eye.
         if self._mode == 'handeye_aruco':
@@ -297,6 +320,18 @@ class WorldOriginNode(Node):
             # Cached handeye result so the latched line marker can be
             # republished if a late subscriber appears (RViz reconnect).
             self._handeye_T_ee_cam: np.ndarray | None = None
+
+            # Fixed param offset: publish the rigid hand-eye immediately and
+            # skip live calibration (no ArUco, no FK lookup). ~/redetect can
+            # still recalibrate later.
+            if self._use_param_offset:
+                T_ee_cam = self._handeye_T_from_params()
+                self.get_logger().info(
+                    'handeye_aruco: using FIXED param offset '
+                    '(handeye_use_param_offset=true) — skipping live '
+                    'ArUco/FK calibration. Call ~/redetect to recalibrate.')
+                self._publish_handeye(T_ee_cam)
+                return
 
             w2b_note = ('+ world→base_link identity'
                         if self._handeye_emit_w2b
@@ -540,6 +575,21 @@ class WorldOriginNode(Node):
             f'or marker pose noisy during the sample window.')
 
         self._publish_handeye(T_ee_cam_avg)
+
+    def _handeye_T_from_params(self) -> np.ndarray:
+        """Build the fixed ee_frame→camera_frame SE(3) from the
+        handeye_offset_* params (translation metres, Euler-XYZ intrinsic deg).
+        Exact inverse of what _finalize_handeye logs (pos + euler_xyz)."""
+        xyz = list(self.get_parameter('handeye_offset_xyz_m').value)
+        rpy = list(self.get_parameter('handeye_offset_rpy_deg').value)
+        if len(xyz) != 3 or len(rpy) != 3:
+            raise ValueError(
+                'handeye_offset_xyz_m and handeye_offset_rpy_deg must each '
+                f'have 3 elements (got {xyz!r}, {rpy!r}).')
+        T = np.eye(4)
+        T[:3, :3] = _euler_xyz_to_R(float(rpy[0]), float(rpy[1]), float(rpy[2]))
+        T[:3, 3] = np.array([float(v) for v in xyz], dtype=np.float64)
+        return T
 
     def _publish_handeye(self, T_ee_cam: np.ndarray) -> None:
         """Send the handeye static TF (+ optional world→base identity) in ONE

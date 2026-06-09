@@ -165,41 +165,4 @@ point_cloud_node:
     # (2) Laser Power & Preset to reduce specular reflection noise
     visual_preset: High Accuracy      # or Hand-Held, Short-Range
     laser_power: 60                   # 0–100; lower = less reflection (default 80)
-
-cup_fusion_node:
-  ros__parameters:
-    # ────────────────────────────────────────────────────────────────────────
-    # === SCAN & LOCK (multi-view accumulate-at-waypoints) ===
-    # ────────────────────────────────────────────────────────────────────────
-    # Enabled via the Tk "Scan & Lock" checkbox (or skill_manager). While the
-    # arm dwells at scan waypoints, the node accumulates that view's world
-    # clouds per cup, fits once, and publishes a STABLE latched lock on
-    # /digital_twin/boxes + /points. Unchecking PAUSES (lock kept); the
-    # ~/clear_scan service (skill_manager) wipes and returns to live detection.
-    scan_lock_active: false
-    scan_joint_states_topic: /joint_states
-    # Joint names in SEMANTIC J1..J6 order — code maps BY NAME, so the M0609
-    # wire order (1,2,4,5,3,6) is irrelevant. Underscored to match the driver.
-    scan_joint_names: ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"]
-    # Scan waypoints (J1..J6 degrees). Arrival = every joint within tol AND
-    # settled; the start/return pose is NOT a waypoint so it is skipped.
-    scan_wp1_deg: [57.4585, 10.3361, 75.0595, -31.1839, 127.2512, 44.6653]
-    scan_wp2_deg: [-42.1911, 12.8098, 66.9024, 25.0818, 107.6920, -18.8562]
-    scan_arrival_tol_rad: 0.02       # per-joint arrival gate (~1.15°)
-    scan_settle_vel_rad_s: 0.05      # max joint speed to count as "settled"
-    scan_wait_s: 1.0                 # settle wait after arrival before capture
-    scan_capture_s: 1.0              # accumulation window per waypoint visit
-    scan_js_timeout_s: 0.5           # joints older than this → arm state UNKNOWN
-    # Looser merge/fit gates for the COMPUTE pass (a multi-view union of one cup
-    # is more spread than a single view; inter-cup distance stays the splitter).
-    scan_merge_dist_m: 0.06
-    scan_premerge_dxy_m: 0.045
-    scan_premerge_dz_m: 0.05
-    scan_premerge_iou: 0.20
-    scan_premerge_radius_m: 0.07
-    scan_postmerge_dxy_m: 0.04
-    scan_postmerge_dz_m: 0.04
-    scan_max_cup_footprint_m: 0.14
-    scan_fit_voxel_m: 0.004          # consolidation voxel (bounds growth)
-    scan_max_points_per_cup: 6000
     # For plastic cups, lower laser_power (40–60) can reduce rim noise

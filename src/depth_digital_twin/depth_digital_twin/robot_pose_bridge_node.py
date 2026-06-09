@@ -31,8 +31,12 @@ from sensor_msgs.msg import JointState
 
 
 # Doosan 6-DOF joint names (m0609 / m1013 share the same convention).
+# UNDERSCORED to match the URDF/driver and the recorded /joint_states
+# (['joint_1','joint_2','joint_4','joint_5','joint_3','joint_6']). The old
+# non-underscored fallback ('joint1'…) silently broke any name-based consumer
+# (e.g. cup_fusion scan-lock arrival detection) whenever this idle fallback ran.
 _DEFAULT_JOINT_NAMES = (
-    'joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6')
+    'joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6')
 
 
 class RobotPoseBridge(Node):

@@ -22,36 +22,37 @@ Visualization Manager:
       Show Axes: true
       Show Arrows: false
     - Class: rviz_default_plugins/PointCloud2
-      Name: points_exo
+      Name: points_fused
       Enabled: true
       Topic:
-        Value: /digital_twin/points_exo
+        Value: /digital_twin/points
         Reliability Policy: Reliable
       Size (m): 0.004
       Style: Points
-      Color Transformer: FlatColor
-      Color: 0; 200; 255
-    - Class: rviz_default_plugins/PointCloud2
-      Name: points_hand
-      Enabled: true
-      Topic:
-        Value: /digital_twin/points_hand
-        Reliability Policy: Reliable
-      Size (m): 0.004
-      Style: Points
-      Color Transformer: FlatColor
-      Color: 255; 140; 0
+      Color Transformer: RGB8
     - Class: rviz_default_plugins/MarkerArray
-      Name: boxes_exo
+      Name: boxes_fused
       Enabled: true
       Topic:
-        Value: /digital_twin/boxes_exo
+        Value: /digital_twin/boxes
         Reliability Policy: Reliable
     - Class: rviz_default_plugins/MarkerArray
-      Name: boxes_hand
+      Name: dbg_detections
       Enabled: true
       Topic:
-        Value: /digital_twin/boxes_hand
+        Value: /digital_twin/dbg_detections
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/MarkerArray
+      Name: dbg_premerge
+      Enabled: true
+      Topic:
+        Value: /digital_twin/dbg_premerge
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/MarkerArray
+      Name: dbg_fit1
+      Enabled: true
+      Topic:
+        Value: /digital_twin/dbg_fit1
         Reliability Policy: Reliable
   Global Options:
     Background Color: 48; 48; 48

@@ -1,0 +1,32 @@
+cup_fusion_node:
+  ros__parameters:
+    merge_dist_m: 0.035
+    max_cup_footprint_m: 0.11
+    premerge_iou: 0.62
+    premerge_dxy_m: 0.018
+    premerge_dz_m: 0.022
+    postmerge_dxy_m: 0.015
+    postmerge_dz_m: 0.015
+    assoc_gate_xy_m: 0.04
+    assoc_gate_z_m: 0.03
+    max_age_s: 1.5
+    min_hits: 3
+    keepalive_ticks: 8
+    w_hand_base: 0.6
+    w_exo_base: 0.4
+    kf_gate_mahalanobis: 9.0
+    kf_meas_std_xy_m: 0.005
+    kf_meas_std_z_m: 0.01
+    kf_process_std_xy_m: 0.002
+    kf_process_std_z_m: 0.004
+    cup_fit_residual_max: 0.02
+    dbg_detections: false
+    dbg_premerge: false
+    dbg_fit1: false
+    dbg_fit2: true
+point_cloud_node_exo:
+  ros__parameters:
+    depth_gradient_max_m: 0.06
+point_cloud_node_hand:
+  ros__parameters:
+    depth_gradient_max_m: 0.06

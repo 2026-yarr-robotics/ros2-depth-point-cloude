@@ -23,7 +23,7 @@ from cv_bridge import CvBridge
 from geometry_msgs.msg import Point as MsgPoint, Quaternion
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
-from sensor_msgs.msg import Image, PointCloud2, PointField
+from sensor_msgs.msg import Image, JointState, PointCloud2, PointField
 from std_msgs.msg import ColorRGBA, Header, Int32MultiArray, String
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -34,8 +34,11 @@ from scipy.spatial import cKDTree
 import tf2_ros
 from std_srvs.srv import Trigger
 
+from rcl_interfaces.msg import SetParametersResult
 from depth_digital_twin.intrinsics import load_intrinsics
-from depth_digital_twin_msgs.msg import SegmentedObjectArray
+from depth_digital_twin_msgs.msg import (SegmentedObjectArray,
+                                         WorldObjectCloud,
+                                         WorldObjectCloudArray)
 
 
 # Edge index pairs for the 12 edges of a box given the 8-corner layout used
@@ -174,6 +177,23 @@ class PointCloudNode(Node):
         self.declare_parameter('world_frame', 'world')
         self.declare_parameter('depth_unit', 0.001)
         self.declare_parameter('downsample', 2)
+        # Hard cap on accumulated points per track fed to the per-window fit /
+        # density / publish passes (0 = unlimited). Bounds worst-case window
+        # cost when a mask spikes; excess points are randomly subsampled.
+        self.declare_parameter('max_points_per_track', 6000)
+        # role = standalone (default: this node fits + Kalman-filters + emits
+        # /boxes, the existing single-camera behaviour) | producer (fusion mode:
+        # emit per-object world-frame clouds on WorldObjectCloudArray and let
+        # cup_fusion_node do the fit/KF/merge — no fit/KF/markers here).
+        self.declare_parameter('role', 'standalone')
+        self.declare_parameter('camera_name', 'exo')
+        self.declare_parameter('world_clouds_topic', '/digital_twin/world_clouds')
+        # Hand motion gate (Phase C): when enabled, producer stamps moving=True
+        # on its clouds whenever a joint velocity exceeds the threshold, so the
+        # fusion node can drop a wrist-camera frame captured mid-motion.
+        self.declare_parameter('hand_motion_gating', False)
+        self.declare_parameter('joint_states_topic', '/joint_states')
+        self.declare_parameter('joint_vel_thresh', 0.05)   # rad/s, max joint
         self.declare_parameter('z_min', 0.1)
         self.declare_parameter('z_max', 4.0)
         self.declare_parameter('box_line_width', 0.0015)
@@ -303,6 +323,18 @@ class PointCloudNode(Node):
         self.world_frame: str = self.get_parameter('world_frame').value
         self.depth_unit: float = float(self.get_parameter('depth_unit').value)
         self.downsample: int = max(1, int(self.get_parameter('downsample').value))
+        self.max_points_per_track: int = max(
+            0, int(self.get_parameter('max_points_per_track').value))
+        self.role: str = str(self.get_parameter('role').value).strip().lower()
+        self.camera_name: str = str(self.get_parameter('camera_name').value)
+        # Set by the joint-velocity gate (Phase C); producer stamps it onto each
+        # emitted cloud so the fusion node can down-weight a moving hand view.
+        self._joints_moving: bool = False
+        self._motion_gating: bool = bool(
+            self.get_parameter('hand_motion_gating').value)
+        self._joint_vel_thresh: float = float(
+            self.get_parameter('joint_vel_thresh').value)
+        self._last_js: tuple | None = None
         self.z_min: float = float(self.get_parameter('z_min').value)
         self.z_max: float = float(self.get_parameter('z_max').value)
         self.box_line_w: float = float(self.get_parameter('box_line_width').value)
@@ -412,6 +444,24 @@ class PointCloudNode(Node):
         # late-joining subscriber sees the most recent snapshot.
         self.cups_on_table_pub = self.create_publisher(
             String, self.get_parameter('cups_on_table_topic').value, latched)
+        # Producer-role output: per-object world clouds for cup_fusion_node.
+        self.world_clouds_pub = None
+        if self.role == 'producer':
+            self.world_clouds_pub = self.create_publisher(
+                WorldObjectCloudArray,
+                self.get_parameter('world_clouds_topic').value, 5)
+            self.get_logger().info(
+                f"point_cloud_node role=producer (camera='{self.camera_name}') "
+                f"→ {self.get_parameter('world_clouds_topic').value}; "
+                f"fit/KF/markers deferred to cup_fusion_node")
+            if self._motion_gating:
+                self.create_subscription(
+                    JointState,
+                    str(self.get_parameter('joint_states_topic').value),
+                    self._on_joint_states, 10)
+                self.get_logger().info(
+                    f'hand motion gating ON (|q̇| > {self._joint_vel_thresh} '
+                    f'rad/s ⇒ moving)')
         self.create_subscription(
             Int32MultiArray,
             self.get_parameter('stack_track_ids_topic').value,
@@ -435,6 +485,41 @@ class PointCloudNode(Node):
         self._aruco_axis_len = float(
             self.get_parameter('world_marker_length_m').value) * 0.8
 
+        # Live-tunable point-extraction knobs — `ros2 param set
+        # /point_cloud_node_exo depth_gradient_max_m 0.08` etc. takes effect
+        # immediately so each camera can be dialed in without a relaunch.
+        self._tunable = {
+            'depth_gradient_max_m': ('depth_grad_max', float),
+            'max_points_per_track': ('max_points_per_track', int),
+            'mask_erode_px': ('mask_erode_px', int),
+            'downsample': ('downsample', int),
+            'z_min': ('z_min', float),
+            'z_max': ('z_max', float),
+        }
+        self.add_on_set_parameters_callback(self._on_set_params)
+
+    def _on_set_params(self, params):
+        for p in params:
+            spec = self._tunable.get(p.name)
+            if spec is not None:
+                attr, cast = spec
+                setattr(self, attr, cast(p.value))
+        return SetParametersResult(successful=True)
+
+    # ------------------------------------------------------------------
+    def _on_joint_states(self, msg: JointState) -> None:
+        """Estimate max joint speed; set _joints_moving for the producer to
+        stamp onto its clouds. (Phase C hand motion gate.)"""
+        t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        pos = np.asarray(msg.position, dtype=np.float64)
+        if self._last_js is not None:
+            t0, p0 = self._last_js
+            dt = t - t0
+            if dt > 1e-3 and pos.shape == p0.shape and pos.size:
+                self._joints_moving = bool(
+                    np.max(np.abs(pos - p0)) / dt > self._joint_vel_thresh)
+        self._last_js = (t, pos)
+
     # ------------------------------------------------------------------
     def _on_synced(self, rgb_msg: Image, depth_msg: Image,
                    det_msg: SegmentedObjectArray) -> None:
@@ -452,7 +537,11 @@ class PointCloudNode(Node):
             tf = self.tf_buffer.lookup_transform(
                 self.world_frame, self.camera_frame,
                 rclpy.time.Time.from_msg(rgb_msg.header.stamp),
-                timeout=rclpy.duration.Duration(seconds=0.1))
+                # Non-blocking: in a single-threaded executor the /tf callback
+                # can't run while THIS callback blocks, so a non-zero timeout
+                # just burns up to 0.1s/frame (hand mode, FK lags the image)
+                # before falling back to latest anyway. 0 = fail fast → latest.
+                timeout=rclpy.duration.Duration(seconds=0.0))
         except tf2_ros.ExtrapolationException:
             try:
                 tf = self.tf_buffer.lookup_transform(
@@ -551,6 +640,13 @@ class PointCloudNode(Node):
             if obj_valid.sum() < 32:
                 continue
             oy, ox = np.where(obj_valid)
+            # Apply the configured pixel stride (this param was declared+read but
+            # never actually used). Bounds points-per-frame so a large/close
+            # mask can't blow up the per-window cost — every downstream pass
+            # (vstack, MAD, least_squares fit, KDTree density, serialize) is ~O(N).
+            if self.downsample > 1:
+                oy = oy[::self.downsample]
+                ox = ox[::self.downsample]
             oz = z[oy, ox]
             ocx_c = (ox.astype(np.float32) - self.intr.cx) * oz / self.intr.fx
             ocy_c = (oy.astype(np.float32) - self.intr.cy) * oz / self.intr.fy
@@ -653,6 +749,7 @@ class PointCloudNode(Node):
         """
         alive_xyz: list[np.ndarray] = []
         alive_rgb: list[np.ndarray] = []
+        world_objs: list = []   # producer role only: per-object world clouds
 
         for tid in list(self._tracks.keys()):
             track = self._tracks[tid]
@@ -689,6 +786,39 @@ class PointCloudNode(Node):
 
             track['miss'] = 0
 
+            # Cap points before the heavy passes (least_squares cup fit, KDTree
+            # density filter, PointCloud2 serialize). All scale with N, so an
+            # unbounded mask spike is what saturates the single-threaded loop.
+            if self.max_points_per_track and \
+                    all_pts.shape[0] > self.max_points_per_track:
+                # Deterministic stride (not random) so the producer emits a
+                # STABLE point set frame-to-frame — random subsampling made the
+                # fused fit jitter and the /points cloud dance.
+                k = int(np.ceil(all_pts.shape[0] / self.max_points_per_track))
+                all_pts = all_pts[::k]
+                all_rgb = all_rgb[::k]
+
+            # Producer role: emit this object's world cloud and skip the local
+            # fit/KF/markers — cup_fusion_node owns those. Density filtering is
+            # intentionally NOT applied here (left to fusion so the side-arc
+            # geometry survives the cross-view merge).
+            if self.role == 'producer':
+                world_objs.append(WorldObjectCloud(
+                    camera=self.camera_name,
+                    instance_id=int(tid),
+                    class_name=track['class_name'],
+                    score=float(track['last_score']),
+                    moving=self._joints_moving,
+                    centroid=MsgPoint(
+                        x=float(all_pts[:, 0].mean()),
+                        y=float(all_pts[:, 1].mean()),
+                        z=float(all_pts[:, 2].mean())),
+                    points=_make_pointcloud2(
+                        Header(stamp=stamp, frame_id=self.world_frame),
+                        all_pts.astype(np.float32),
+                        all_rgb.astype(np.float32))))
+                continue
+
             # Fit + Kalman-filter the centre (update happens inside).
             ls = self._fit_and_render_state(tid, track, all_pts)
             if ls is not None:
@@ -716,6 +846,14 @@ class PointCloudNode(Node):
 
             alive_xyz.append(all_pts.astype(np.float32))
             alive_rgb.append(all_rgb)
+
+        # Producer role: publish the per-object world clouds and stop here —
+        # no /points, /boxes, or cups_on_table from this node in fusion mode.
+        if self.role == 'producer':
+            self.world_clouds_pub.publish(WorldObjectCloudArray(
+                header=Header(stamp=stamp, frame_id=self.world_frame),
+                objects=world_objs))
+            return
 
         # Combined cloud — every (filtered) accumulated point is plotted.
         if alive_xyz:
@@ -1128,6 +1266,14 @@ class PointCloudNode(Node):
         """
         if inst_id in self._tracks:
             return inst_id
+        if self.role == 'producer':
+            # In fusion mode the downstream cup_fusion_node does the geometric
+            # association ACROSS cameras. The producer must NOT pre-merge here:
+            # at far range (exo ~4.2 m) the noisy world centroids of distinct
+            # YOLO masks collapse within _track_merge_dist, so several cups would
+            # fold into ONE big contaminated cloud → one huge OBB. Keep one
+            # cloud (one OBB) per YOLO instance id.
+            return inst_id
         best_id = inst_id
         best_dist = self._track_merge_dist
         for tid, track in self._tracks.items():
@@ -1302,11 +1448,13 @@ def _filter_spatial_density(xyz: np.ndarray, radius: float, min_neighbors: int) 
     if xyz.shape[0] < min_neighbors:
         return np.ones(xyz.shape[0], dtype=bool)
     
-    # KDTree for fast neighbor search
+    # KDTree for fast neighbor search. return_length counts neighbors in C
+    # (avoids building an O(N*K) Python list-of-lists + per-point loop that
+    # spikes memory and time on dense clusters); workers=-1 uses all cores.
     tree = cKDTree(xyz)
-    neighbors = tree.query_ball_point(xyz, radius)
-    keep = np.array([len(nn) >= min_neighbors for nn in neighbors], dtype=bool)
-    return keep
+    counts = tree.query_ball_point(
+        xyz, radius, workers=-1, return_length=True)
+    return counts >= min_neighbors
 
 
 # def _fit_cup_axis_xy(points: np.ndarray, *, top_d: float, bot_d: float,
@@ -1371,11 +1519,23 @@ def _fit_cup_axis_xy(points: np.ndarray, *, top_d: float, bot_d: float,
     cx, cy = float(res.x[0]), float(res.x[1])
     if not (np.isfinite(cx) and np.isfinite(cy)):
         return None
-    
-    # 실제 모델 에러(RMSE) 계산
+
     rho = np.sqrt((x - cx)**2 + (y - cy)**2)
+    # Recover z_base from the KNOWN truncated-cone profile instead of assuming
+    # the lowest visible point IS the base. Each point's radius tells WHERE on
+    # the cone it sits (narrow top r_top ↔ wide bottom r_bot), so the base is
+    # placed correctly even from a TOP-ONLY (hand looking down) view — which the
+    # 5th-percentile assumption mis-placed to the rim. (r_top != r_bot required.)
+    dr = r_top - r_bot
+    if abs(dr) > 1e-4:
+        z_rel_implied = np.clip((rho - r_bot) / dr * height, 0.0, height)
+        z_base = float(np.median(z - z_rel_implied))
+
+    # Model error (RMSE) at the recovered base.
+    z_rel = np.clip(z - z_base, 0.0, height)
+    r_z = r_bot + (r_top - r_bot) * (z_rel / height)
     rmse = float(np.sqrt(np.mean((rho - r_z)**2)))
-    
+
     return cx, cy, z_base, rmse
 
 def _cup_frustum_geometry(cx: float, cy: float, *, top_d: float, bot_d: float,
