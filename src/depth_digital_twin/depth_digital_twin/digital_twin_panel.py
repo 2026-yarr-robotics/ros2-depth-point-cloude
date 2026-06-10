@@ -78,6 +78,11 @@ class DigitalTwinPanel(Node):
         gp('exo_redetect_srv', '/world_origin_node/redetect')
         gp('hand_redetect_srv', '/world_origin_node_hand/redetect')
         gp('fusion_node_name', 'cup_fusion_node')   # for checkboxes + tuning
+        # Producer node names differ per topology: the fusion launch
+        # uses point_cloud_node_exo/_hand, the live start.sh stack
+        # names the exo producer plain 'point_cloud_node'.
+        gp('exo_pc_node', 'point_cloud_node_exo')
+        gp('hand_pc_node', 'point_cloud_node_hand')
         gp('tuning_save_dir', '')                   # '' → package share config dir
 
         def P(n):
@@ -109,6 +114,8 @@ class DigitalTwinPanel(Node):
         self._param_q: queue.Queue = queue.Queue()
         self._param_clis: dict = {}
         self.fusion_node = P('fusion_node_name')
+        self._node_alias = {'point_cloud_node_exo': str(P('exo_pc_node')),
+                            'point_cloud_node_hand': str(P('hand_pc_node'))}
         # Scan&Lock clear: Trigger service on the fusion node (~/clear_scan).
         self._clear_q: queue.Queue = queue.Queue()
         self._clear_scan_cli = self.create_client(
@@ -166,6 +173,7 @@ class DigitalTwinPanel(Node):
 
     def request_param(self, node_name: str, name: str, value,
                       ptype: str = 'double') -> None:
+        node_name = self._node_alias.get(node_name, node_name)
         self._param_q.put((node_name, name, value, ptype))
 
     def request_clear_scan(self) -> None:

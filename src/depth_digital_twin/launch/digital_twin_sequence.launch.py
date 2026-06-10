@@ -108,6 +108,8 @@ _PIPE_INFO = '/camera/camera/color/camera_info'
 #   • /world_origin_node/redetect — world_origin_control calls this absolute
 #     service name, so it must follow the namespaced server.
 _NS_REMAP_NAMES = (
+    '/digital_twin/cup_obs', '/digital_twin/rim_debug',
+    '/digital_twin/depth_debug', '/stack_track_ids',
     _PIPE_COLOR, _PIPE_DEPTH, _PIPE_INFO,
     '/joint_states',
     '/tf', '/tf_static',

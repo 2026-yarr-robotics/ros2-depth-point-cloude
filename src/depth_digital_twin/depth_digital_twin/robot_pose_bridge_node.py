@@ -72,9 +72,14 @@ class RobotPoseBridge(Node):
 
     def _on_input(self, msg: JointState) -> None:
         self._last_real_msg = self.get_clock().now()
-        # Mirror untouched (header restamped so RViz prefers the latest).
+        # Mirror with the SOURCE stamp preserved: robot_state_publisher's
+        # /tf inherits this stamp, and the rim pipeline looks up
+        # world<-camera at IMAGE-CAPTURE time — restamping to now() shifted
+        # the whole FK chain and defeated that pairing.
         out = JointState()
-        out.header.stamp = self.get_clock().now().to_msg()
+        out.header.stamp = msg.header.stamp \
+            if (msg.header.stamp.sec or msg.header.stamp.nanosec) \
+            else self.get_clock().now().to_msg()
         out.header.frame_id = msg.header.frame_id
         out.name = list(msg.name)
         out.position = list(msg.position)

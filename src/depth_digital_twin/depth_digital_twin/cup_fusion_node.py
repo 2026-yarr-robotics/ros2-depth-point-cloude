@@ -373,7 +373,8 @@ class CupFusionNode(Node):
         gp('rim_level_hyst_m', 0.008)
         # Pyramid-lattice preference window: if the pyramid snap error is
         # within this, take it over a (numerically closer) nest snap.
-        gp('rim_layer_pref_tol_m', 0.007)
+        gp('rim_layer_pref_tol_m', 0.005)  # 0.007 collided with nest L5
+        #                                    (|5*0.02-0.093|=0.007) and L9
         # Wall-time track keepalive for rim mode (s). Slightly above the obs
         # cache age so a track survives an occlusion exactly as long as its
         # observations can.
@@ -531,6 +532,11 @@ class CupFusionNode(Node):
             JointState, self.scan_joint_states_topic, self._on_joint_states, 10)
         self._clear_scan_srv = self.create_service(
             Trigger, '~/clear_scan', self._on_clear_scan)
+        # Call after an ArUco redetect: the learned extrinsic bias belongs to
+        # the OLD calibration and would otherwise be applied (up to 50 mm)
+        # to every exo observation under the new one.
+        self._reset_bias_srv = self.create_service(
+            Trigger, '~/reset_bias', self._on_reset_bias)
         self.dbg_detections = bool(P('dbg_detections'))
         self.dbg_premerge = bool(P('dbg_premerge'))
         self.dbg_fit1 = bool(P('dbg_fit1'))
@@ -573,25 +579,35 @@ class CupFusionNode(Node):
         self.rim_bias_delta_max = float(P('rim_bias_delta_max_m'))
         self._cam_bias: dict[str, np.ndarray] = {}  # cam → world-XY bias (m)
         self._cam_bias_n: dict[str, int] = {}       # cam → update count
+        self._bias_fresh: set = set()      # cams with an unconsumed fresh obs
+        self._rim_meas_fresh = False       # new obs since last KF consumption
+        self._rim_arr_miss: dict[tuple, int] = {}   # (cam,iid) absence count
         self.rim_level_hyst = float(P('rim_level_hyst_m'))
         self.rim_layer_pref_tol = float(P('rim_layer_pref_tol_m'))
         self.rim_keepalive_s = float(P('rim_keepalive_s'))
         self._rim_ests_tick = None      # per-tick shared estimate cache
         self._rim_prev_lvl: list = []   # (key_xy, z_base, k) of last tick
         self._rim_csv = None                        # lazy-opened file handle
-        self.rim_dbg_pub = None
-        self.health_pub = None
-        if self.rim_enabled:
-            self.create_subscription(
-                CupObservationArray, str(P('exo_obs_topic')),
-                lambda m: self._on_cup_obs(m, 'exo'), 10)
-            self.create_subscription(
-                CupObservationArray, str(P('hand_obs_topic')),
-                lambda m: self._on_cup_obs(m, 'hand'), 10)
-            self.rim_dbg_pub = self.create_publisher(
-                MarkerArray, str(P('rim_boxes_dbg_topic')), latched)
-            self.health_pub = self.create_publisher(
-                String, str(P('fusion_health_topic')), 10)
+        # Observation subscriptions are UNCONDITIONAL: with fit_source=rim
+        # they are the only upright measurement — creating them only under
+        # rim_enabled produced a silent zero-upright-output mode (and a live
+        # rim_enabled toggle could never create them). rim_enabled now gates
+        # only the debug estimator tick.
+        self.create_subscription(
+            CupObservationArray, str(P('exo_obs_topic')),
+            lambda m: self._on_cup_obs(m, 'exo'), 10)
+        self.create_subscription(
+            CupObservationArray, str(P('hand_obs_topic')),
+            lambda m: self._on_cup_obs(m, 'hand'), 10)
+        self.rim_dbg_pub = self.create_publisher(
+            MarkerArray, str(P('rim_boxes_dbg_topic')), latched)
+        self.health_pub = self.create_publisher(
+            String, str(P('fusion_health_topic')), 10)
+        if self.fit_source == 'rim' and not self.rim_enabled:
+            self.get_logger().warning(
+                'fit_source=rim with rim_enabled=false — debug/health ticks '
+                'are off but observations still drive the boxes')
+        if True:
             self.get_logger().info(
                 f"rim path ON: obs={P('exo_obs_topic')},{P('hand_obs_topic')} "
                 f"→ {P('rim_boxes_dbg_topic')} + {P('fusion_health_topic')}"
@@ -1315,13 +1331,40 @@ class CupFusionNode(Node):
 
     # ================= tick dispatcher + live pipeline ==================
     # ── Rim/silhouette observation path (Phase 1: parallel A/B) ───────────
+    def _on_reset_bias(self, request, response):
+        n = {c: round(1e3 * float(np.linalg.norm(b)), 1)
+             for c, b in self._cam_bias.items()}
+        self._cam_bias.clear()
+        self._cam_bias_n.clear()
+        response.success = True
+        response.message = f'extrinsic bias cleared (was {n})'
+        self.get_logger().info(response.message)
+        return response
+
     def _obs_ok(self, ob) -> bool:
+        if not np.all(np.isfinite([
+                ob.x0, ob.y0, ob.z_base0, ob.z_top_rough_m, ob.sigma_px,
+                ob.focal_px, ob.ray_dir.x, ob.ray_dir.y, ob.ray_dir.z])):
+            return False      # a NaN field would hijack the fusion weights
         return (ob.mask_iou >= self.rim_min_iou
                 and ob.chamfer_rms_px <= self.rim_max_rms
                 and not (self.rim_drop_moving and ob.moving))
 
     def _on_cup_obs(self, msg: CupObservationArray, cam: str) -> None:
         now_s = self.get_clock().now().nanoseconds * 1e-9
+        # Negative evidence: a (cam, iid) repeatedly ABSENT from this
+        # camera's arrays is gone (picked cup / ByteTrack re-id) — without
+        # this the 3 s cache + keepalive ghosted removed cups for ~6.5 s.
+        present = {(cam, int(ob.instance_id)) for ob in msg.observations}
+        for key in [k for k in self._rim_latest if k[0] == cam]:
+            if key in present:
+                self._rim_arr_miss.pop(key, None)
+                continue
+            n = self._rim_arr_miss.get(key, 0) + 1
+            self._rim_arr_miss[key] = n
+            if n > 15:        # ~1.5-3 s of arrays without this iid
+                self._rim_latest.pop(key, None)
+                self._rim_arr_miss.pop(key, None)
         for ob in msg.observations:
             key = (cam, int(ob.instance_id))
             if not self._obs_ok(ob):
@@ -1336,6 +1379,8 @@ class CupFusionNode(Node):
             self._rim_latest[key] = (ob, now_s)
         if msg.observations:
             self._rim_fresh = True
+            self._rim_meas_fresh = True
+            self._bias_fresh.add(cam)
 
     def _rim_collect(self) -> list:
         """Quality-gated, age-pruned snapshot of the cached observations —
@@ -1371,8 +1416,9 @@ class CupFusionNode(Node):
             # exactly when gating (motion/occlusion) made the next snap
             # noisiest — a level flip then slid the exo measurement ~55 mm
             # along its ray and minted a duplicate track (blink).
+            mem_s = max(self.rim_obs_max_age, self.rim_keepalive_s) + 1.5
             self._rim_prev_lvl = [e for e in self._rim_prev_lvl
-                                  if now_s - e[3] < 5.0]
+                                  if now_s - e[3] < mem_s]
             return []
         new_prev: list = []     # (key_xy, z_base, k, t) for hysteresis
         # 3D ellipsoidal clustering: XY and Z gated separately. XY-only
@@ -1414,14 +1460,18 @@ class CupFusionNode(Node):
             key_xy = np.array([
                 float(np.mean([o.x0 for o in by_cam.values()])),
                 float(np.mean([o.y0 for o in by_cam.values()]))])
-            for pxy, pzb, pk, _pt in self._rim_prev_lvl:
-                if float(np.hypot(*(key_xy - pxy))) > 0.03:
-                    continue
+            cand = [e for e in self._rim_prev_lvl
+                    if float(np.hypot(*(key_xy - e[0]))) <= 0.03]
+            if cand:
+                # nearest in Z, not first-in-list: pyramid layers k and k+2
+                # share the same XY column — first-match could recall the
+                # OTHER cup's level and break instead of checking ours.
+                _, pzb, pk, _pt = min(
+                    cand, key=lambda e: abs(z_top - (e[1] + self.cup_h)))
                 if pzb != z_base and (abs(z_top - (pzb + self.cup_h))
                                       <= abs(lvl_err) + self.rim_level_hyst):
                     k, z_base = pk, pzb
                     lvl_err = z_top - (z_base + self.cup_h)
-                break
             new_prev.append((key_xy, z_base, k, now_s))
             slids: dict[str, tuple] = {}    # cam → (raw xy, cov, obs)
             for o in by_cam.values():
@@ -1444,8 +1494,13 @@ class CupFusionNode(Node):
             if self.rim_bias_ref in slids:
                 ref_xy = slids[self.rim_bias_ref][0]
                 for cam, (xy, _, o) in slids.items():
-                    if cam == self.rim_bias_ref or o.moving:
+                    if (cam == self.rim_bias_ref or o.moving
+                            or cam not in self._bias_fresh):
+                        # freshness gate: the estimator runs at 10 Hz off the
+                        # CACHE — without it the EMA stepped ~30x faster than
+                        # the per-shared-cup-event design.
                         continue
+                    self._bias_fresh.discard(cam)
                     delta = xy - ref_xy
                     if float(np.linalg.norm(delta)) > self.rim_bias_delta_max:
                         continue
@@ -1485,10 +1540,12 @@ class CupFusionNode(Node):
             })
         # Merge: fresh entries win; carry over recent memory for cups not
         # observed THIS call (brief occlusion must not lose their level).
+        mem_s = max(self.rim_obs_max_age, self.rim_keepalive_s) + 1.5
         for e in self._rim_prev_lvl:
-            if now_s - e[3] >= 5.0:
+            if now_s - e[3] >= mem_s:
                 continue
             if all(float(np.hypot(*(e[0] - npv[0]))) > 0.03
+                   or abs(e[1] - npv[1]) > 0.04   # other layer = other cup
                    for npv in new_prev):
                 new_prev.append(e)
         self._rim_prev_lvl = new_prev
@@ -1783,7 +1840,21 @@ class CupFusionNode(Node):
                                'members': members})
 
         if rim_mode:
-            final_fits = self._rim_final_fits() + final_fits
+            rim_fits = []
+            if self._rim_meas_fresh:
+                # Only consume rim estimates when an observation actually
+                # arrived since the last event: cloud events fire at
+                # 10-20 Hz, and re-feeding the same cached estimate
+                # re-updated the KF with correlated 'measurements',
+                # shrinking covariance without information.
+                self._rim_meas_fresh = False
+                try:
+                    rim_fits = self._rim_final_fits()
+                except Exception as e:
+                    self.get_logger().warn(
+                        f'rim measurement error: {e}',
+                        throttle_duration_sec=5.0)
+            final_fits = rim_fits + final_fits
 
         # STAGE-3: 3D-ellipsoidal association + KF + hit count.
         now_s = self.get_clock().now().nanoseconds * 1e-9

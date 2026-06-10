@@ -208,6 +208,12 @@ def fit_silhouette_xy(mask_u8: np.ndarray, *, K: np.ndarray, dist: np.ndarray,
             return np.full(n_samples, 1e3)
         if fit_boundary_offset:
             sil = sil + float(p[2]) * _polyline_normals(sil)
+        # Penalise silhouette samples leaving the IMAGE: at a truncated mask
+        # the ROI is clamped to the border where the distance transform is
+        # legitimately small, so without this the model can drift out of
+        # frame for free.
+        oob = ((sil[:, 0] < -2.0) | (sil[:, 0] > w + 1.0)
+               | (sil[:, 1] < -2.0) | (sil[:, 1] > h + 1.0))
         # Bilinear DT sampling — keeps the residual continuous in (x, y) so
         # finite-difference gradients are meaningful at sub-pixel steps
         # (nearest-pixel sampling plateaus and stalls the optimizer mm-scale).
@@ -221,8 +227,10 @@ def fit_silhouette_xy(mask_u8: np.ndarray, *, K: np.ndarray, dist: np.ndarray,
         d01 = dt[iv, iu + 1]
         d10 = dt[iv + 1, iu]
         d11 = dt[iv + 1, iu + 1]
-        return ((1 - av) * ((1 - au) * d00 + au * d01)
-                + av * ((1 - au) * d10 + au * d11)).astype(np.float64)
+        r = ((1 - av) * ((1 - au) * d00 + au * d01)
+             + av * ((1 - au) * d10 + au * d11)).astype(np.float64)
+        r[oob] = float(roi_pad_px)
+        return r
 
     if fit_boundary_offset:
         x0 = np.array([xy0[0], xy0[1], 0.0])
@@ -281,7 +289,8 @@ def edge_snap_fit(gray: np.ndarray, *, K: np.ndarray, dist: np.ndarray,
                   xy0: tuple[float, float], search_px: float = 6.0,
                   min_grad: float = 8.0, n_theta: int = 36,
                   n_samples: int = 120, iters: int = 2,
-                  min_cov: float = 0.3) -> dict:
+                  min_cov: float = 0.3,
+                  grad_mag: np.ndarray | None = None) -> dict:
     """Refine a silhouette fit by snapping the model boundary to IMAGE
     gradient edges instead of the YOLO mask contour.
 
@@ -296,9 +305,14 @@ def edge_snap_fit(gray: np.ndarray, *, K: np.ndarray, dist: np.ndarray,
     """
     from scipy.optimize import least_squares
 
-    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-    mag = cv2.magnitude(gx, gy)
+    if grad_mag is not None:
+        # Caller-cached |∇I| (one Sobel per FRAME instead of per cup — with
+        # 8 cups the per-call full-frame Sobel dominated the fit cost).
+        mag = grad_mag
+    else:
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        mag = cv2.magnitude(gx, gy)
     h, w = gray.shape[:2]
     offs = np.linspace(-search_px, search_px, int(search_px * 4) + 1)
     step = offs[1] - offs[0]
@@ -329,7 +343,10 @@ def edge_snap_fit(gray: np.ndarray, *, K: np.ndarray, dist: np.ndarray,
         k = np.argmax(m, axis=1)
         ar = np.arange(len(k))
         peak = m[ar, k]
-        valid = peak >= min_grad
+        # A peak AT the search-window end means the true edge likely lies
+        # outside the window — snapping to it would bias the fit toward the
+        # window border (and the parabolic refinement degenerates there).
+        valid = (peak >= min_grad) & (k > 0) & (k < len(offs) - 1)
         n_snap = int(valid.sum())
         cov = n_snap / float(n_samples)
         if cov < min_cov:
@@ -414,6 +431,13 @@ def xy_cov_from_px(sigma_px: float, range_m: float, f_px: float,
     (|dz|→1) is isotropic. This is what lets a vertical hand view and an
     oblique exo view fuse with mathematically correct weights.
     """
+    # NaN-safety first: max(const, nan) returns the CONST in Python, which
+    # would turn a garbage observation into the maximally-confident one and
+    # let it dominate the inverse-covariance fusion.
+    if not (math.isfinite(float(sigma_px)) and math.isfinite(float(range_m))
+            and math.isfinite(float(f_px))
+            and np.all(np.isfinite(np.asarray(ray_dir, dtype=np.float64)))):
+        return 1.0 * np.eye(2)          # ~1 m std: effectively ignored
     sigma_m = max(1e-4, float(sigma_px) * max(0.05, float(range_m))
                   / max(1.0, float(f_px)))
     base = sigma_m ** 2
@@ -455,8 +479,10 @@ def snap_level(z_top_rough: float, *, table_z: float, cup_h: float,
 
     Level k means the cup's base sits k nesting offsets above the table
     (k=0: directly on the table). Returns (k, z_base, err_m) where err_m is
-    the lattice mismatch — |err| > nest_off/2 never happens by construction,
-    but a large err relative to nest_off flags an ambiguous classification.
+    the lattice mismatch. NOTE: |err| <= nest_off/2 holds only while the
+    [0, max_levels] clamp does NOT engage — a z_top below the table-level
+    cup top (occluded mask) or above the top level yields an unbounded err,
+    which callers should treat as "does not fit this lattice".
     """
     if nest_off <= 1e-6:
         return 0, table_z, z_top_rough - (table_z + cup_h)

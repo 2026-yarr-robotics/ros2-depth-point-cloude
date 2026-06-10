@@ -453,6 +453,13 @@ class PointCloudNode(Node):
         self._tf_pending: list = []   # frames awaiting their stamped TF
         self._upright_clouds: bool = bool(
             self.get_parameter('upright_clouds').value)
+        if not self._upright_clouds and \
+                str(self.get_parameter('role').value).strip().lower() \
+                != 'producer':
+            self.get_logger().warning(
+                'upright_clouds=false in STANDALONE role: upright cups get '
+                'no cloud, no fit, no /digital_twin/boxes output. This mode '
+                'only makes sense feeding cup_fusion_node (role=producer).')
         self.patch_radius: int = max(1, int(self.get_parameter('window_radius').value))
         self.patch_cx_px: int = int(self.get_parameter('window_center_x_px').value)
         self.patch_cy_px: int = int(self.get_parameter('window_center_y_px').value)
@@ -615,13 +622,30 @@ class PointCloudNode(Node):
         frame older than `rim_tf_defer_s` falls back to latest, marked
         tf_stamped_ok=False (rim observations from a moving camera skip it).
         """
-        retry = self._tf_pending
+        retry = self._tf_pending[:3]      # bounded drain: no burst stalls
+        carry = self._tf_pending[3:]
         self._tf_pending = []
         for item in retry:
-            self._try_process_frame(*item)
-        self._try_process_frame(rgb_msg, depth_msg, det_msg)
+            try:
+                self._try_process_frame(*item)
+            except Exception as e:           # one bad frame must not kill spin
+                self.get_logger().error(
+                    f'frame processing failed: {e}', throttle_duration_sec=5.0)
+        self._tf_pending.extend(carry)
+        try:
+            self._try_process_frame(rgb_msg, depth_msg, det_msg,
+                                    self._joints_moving)
+        except Exception as e:
+            self.get_logger().error(
+                f'frame processing failed: {e}', throttle_duration_sec=5.0)
 
-    def _try_process_frame(self, rgb_msg, depth_msg, det_msg) -> None:
+    def _try_process_frame(self, rgb_msg, depth_msg, det_msg,
+                           moving_at=None) -> None:
+        # Latch the motion state AT CAPTURE: a deferred frame retried
+        # 0.1-0.25 s later must not be judged by the CURRENT flag (the
+        # arm may have stopped — the frame is still mid-motion data).
+        if moving_at is None:
+            moving_at = self._joints_moving
         stamp = rclpy.time.Time.from_msg(rgb_msg.header.stamp)
         tf_stamped_ok = True
         try:
@@ -635,7 +659,8 @@ class PointCloudNode(Node):
             if age_s < self._tf_defer_s:
                 # FK not in the buffer yet — requeue for the next callback.
                 if len(self._tf_pending) < 8:
-                    self._tf_pending.append((rgb_msg, depth_msg, det_msg))
+                    self._tf_pending.append(
+                        (rgb_msg, depth_msg, det_msg, moving_at))
                 else:
                     self.get_logger().warning(
                         'TF defer queue full — dropping a frame',
@@ -662,10 +687,11 @@ class PointCloudNode(Node):
                 f'TF {self.world_frame}<-{self.camera_frame} not available yet',
                 throttle_duration_sec=2.0)
             return
-        self._process_frame(rgb_msg, depth_msg, det_msg, tf, tf_stamped_ok)
+        self._process_frame(rgb_msg, depth_msg, det_msg, tf,
+                            tf_stamped_ok, moving_at)
 
     def _process_frame(self, rgb_msg, depth_msg, det_msg, tf,
-                       tf_stamped_ok: bool) -> None:
+                       tf_stamped_ok: bool, moving_at: bool = False) -> None:
         """Ingest detections into per-track buffers + emit live debug images.
         Heavy work (filter, fit, marker/cloud publish) is deferred to
         `_finalize_window` which fires every `window_period_s`."""
@@ -749,8 +775,9 @@ class PointCloudNode(Node):
         # Always-on canvas: the debug stream must be a LIVE video (panel 3D
         # pane), not a sparse one that only updates when a throttled fit
         # fires — that read as "rim detection randomly stops".
-        rim_dbg = {'canvas': None, 'gray': None, 'fresh': set()}
-        if self.rim_debug_pub is not None and self._rim_enabled:
+        rim_dbg = {'canvas': None, 'gray': None, 'mag': None, 'fresh': set()}
+        if (self.rim_debug_pub is not None and self._rim_enabled
+                and self.rim_debug_pub.get_subscription_count() > 0):
             rim_dbg['canvas'] = rgb.copy()
         for obj, mb in per_object_masks:
             if rim_dbg['canvas'] is not None:
@@ -811,6 +838,7 @@ class PointCloudNode(Node):
             # buffer here removes their whole per-window cost (MAD, KDTree,
             # serialize). obj_world above is still computed: rim needs the
             # rough z (level) and xy init from it.
+            track['seen'] = True
             if self._upright_clouds or class_name not in self.cup_class_names:
                 track['points_buf'].append(obj_world)
                 track['colors_buf'].append(obj_rgb_packed)
@@ -832,13 +860,17 @@ class PointCloudNode(Node):
                 # 97th depth percentile of a single frame jitters cm-scale
                 # and used to flip the level snap downstream — a running
                 # median over ~0.5 s stabilises the level evidence.
-                hist = track.setdefault('ztop_hist', [])
-                hist.append(float(np.percentile(obj_world[:, 2], 97.0)))
-                if len(hist) > 7:
-                    hist.pop(0)
+                # Do not let a mis-paired (fallback-TF while moving) frame
+                # contaminate the level-evidence median that the NEXT seven
+                # good fits will consume.
+                if tf_stamped_ok or not moving_at:
+                    hist = track.setdefault('ztop_hist', [])
+                    hist.append(float(np.percentile(obj_world[:, 2], 97.0)))
+                    if len(hist) > 7:
+                        hist.pop(0)
                 ob = self._rim_observe(
                     obj, mb, oz, obj_world, R_wc, t_wc, track, class_name,
-                    tid, rgb, rim_dbg, tf_stamped_ok)
+                    tid, rgb, rim_dbg, tf_stamped_ok, moving_at)
                 if ob is not None:
                     rim_obs.append(ob)
 
@@ -925,7 +957,8 @@ class PointCloudNode(Node):
 
     # ------------------------------------------------------------------
     def _rim_observe(self, obj, mb, oz, obj_world, R_wc, t_wc, track,
-                     class_name, tid, rgb, rim_dbg, tf_stamped_ok=True):
+                     class_name, tid, rgb, rim_dbg, tf_stamped_ok=True,
+                     moving_at=False):
         """Throttled silhouette chamfer fit for one upright-cup detection.
 
         Returns a CupObservation or None. The fit aligns the KNOWN truncated
@@ -946,14 +979,19 @@ class PointCloudNode(Node):
         # physically, so the fallback pairing is safe — without this
         # exemption a paused replay (stamped lookup unlucky every frame)
         # starves the fusion of hand observations entirely.
-        if not tf_stamped_ok and self.camera_name != 'exo' \
-                and self._joints_moving:
+        if not tf_stamped_ok and self.camera_name != 'exo' and moving_at:
             self.get_logger().info(
                 'rim: skipping fallback-TF frame while moving',
                 throttle_duration_sec=5.0)
             return None
         now_s = self.get_clock().now().nanoseconds * 1e-9
-        if now_s - track.get('rim_last_t', 0.0) < self._rim_fit_period:
+        if 'rim_last_t' not in track:
+            # De-phase first fits across tracks: with a shared epoch all N
+            # cups fit on the SAME frame every period (a 6 ms x N callback
+            # spike); a tid-keyed offset spreads them evenly.
+            track['rim_last_t'] = now_s - self._rim_fit_period * (
+                (tid * 0.37) % 1.0)
+        if now_s - track['rim_last_t'] < self._rim_fit_period:
             return None
         track['rim_last_t'] = now_s
 
@@ -987,13 +1025,18 @@ class PointCloudNode(Node):
             if gray is None:
                 gray = rim_dbg['gray'] = cv2.cvtColor(
                     rgb, cv2.COLOR_BGR2GRAY)
+            mag = rim_dbg.get('mag')
+            if mag is None:
+                gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+                gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+                mag = rim_dbg['mag'] = cv2.magnitude(gx, gy)
             try:
                 snap = edge_snap_fit(
                     gray, K=self.K, dist=self.intr.dist, R_wc=R_wc,
                     t_wc=t_wc, r_top=self.cup_top_d * 0.5,
                     r_bot=self.cup_bot_d * 0.5, height=self.cup_h,
                     z_base=z_base0, xy0=(fit['x'], fit['y']),
-                    min_grad=self._rim_edge_min_grad)
+                    min_grad=self._rim_edge_min_grad, grad_mag=mag)
             except Exception:
                 snap = {'ok': False}
             if snap.get('ok'):
@@ -1038,7 +1081,7 @@ class PointCloudNode(Node):
             return None
 
         sigma = self._rim_sigma_px
-        if self._joints_moving:
+        if moving_at:
             sigma *= 3.0
         if fit['truncated']:
             sigma *= 2.0
@@ -1047,7 +1090,11 @@ class PointCloudNode(Node):
 
         ob = CupObservation()
         ob.camera = self.camera_name
-        ob.instance_id = int(getattr(obj, 'instance_id', -1))
+        # The resolved tid, NOT the raw YOLO id: in standalone role a
+        # re-ID is absorbed into an existing track whose color/level
+        # state this observation carries — the consumer's per-(cam,id)
+        # cache must follow the same identity.
+        ob.instance_id = int(tid)
         ob.class_name = class_name
         ob.score = float(obj.score)
         ob.color = str(track.get('color') or '')
@@ -1058,7 +1105,7 @@ class PointCloudNode(Node):
             x=float(origin[0]), y=float(origin[1]), z=float(origin[2]))
         ob.ray_dir = Vector3(
             x=float(ray_d[0]), y=float(ray_d[1]), z=float(ray_d[2]))
-        ob.focal_px = float(self.intr.fx)
+        ob.focal_px = float(np.sqrt(self.intr.fx * self.intr.fy))
         ob.sigma_px = float(sigma)
         ob.chamfer_rms_px = float(fit['rms_px'])
         ob.mask_iou = float(fit['iou'])
@@ -1067,7 +1114,7 @@ class PointCloudNode(Node):
         ob.edge_coverage = edge_cov
         ob.median_depth_m = float(np.median(oz)) if oz.size else 0.0
         ob.z_top_rough_m = z_top_rough
-        ob.moving = bool(self._joints_moving)
+        ob.moving = bool(moving_at)
         return ob
 
     # ------------------------------------------------------------------
@@ -1105,10 +1152,18 @@ class PointCloudNode(Node):
                 track['settled'] = (
                     track['kf'].position_std() <= self._kf_settled_std)
 
+            seen = track.pop('seen', False)
             if not buf_pts:
-                track['miss'] += 1
-                if track['miss'] > self.cup_keepalive:
-                    self._tracks.pop(tid, None)
+                # A cup that WAS detected this window (rim-only mode:
+                # upright_clouds=false buffers no points) is not a miss —
+                # event-counting an actively-seen track evicted it every
+                # keepalive cycle, wiping ztop_hist/color/rim state.
+                if not seen:
+                    track['miss'] += 1
+                    if track['miss'] > self.cup_keepalive:
+                        self._tracks.pop(tid, None)
+                else:
+                    track['miss'] = 0
                 # last_state persists → frozen marker until the cup reappears.
                 continue
 
@@ -1588,7 +1643,11 @@ class PointCloudNode(Node):
         self._tracks.clear()
         self._last_published_ids.clear()
         self._window_start_stamp = None
-        self._publish_clear_markers(self.get_clock().now().to_msg())
+        if self.role != 'producer':
+            # producer shares /digital_twin/boxes' default name with the
+            # fusion node — a latched DELETEALL from here would wipe the
+            # fused display that this node does not own.
+            self._publish_clear_markers(self.get_clock().now().to_msg())
         response.success = True
         response.message = f'scan reset: {n} track(s) cleared'
         self.get_logger().info(f'[kf] trigger_scan → cleared {n} tracks')

@@ -178,11 +178,14 @@ def _make_nodes(context, *args, **kwargs):
             parameters=[{
                 'exo_color_topic': '/exo/exo/color/image_raw',
                 'exo_depth_topic': '/exo/exo/aligned_depth_to_color/image_raw',
-                'exo_debug_topic': '/digital_twin/detection_debug',
+                # 3D pane = rim-fit overlay (the actual live measurement);
+            # raw YOLO stays on /digital_twin/detection_debug*
+            'exo_debug_topic': '/digital_twin/rim_debug_exo',
+            'exo_pc_node': 'point_cloud_node',
                 'hand_color_topic': '/hand/hand/color/image_raw',
                 'hand_depth_topic':
                     '/hand/hand/aligned_depth_to_color/image_raw',
-                'hand_debug_topic': '/digital_twin/detection_debug_hand',
+                'hand_debug_topic': '/digital_twin/rim_debug_hand',
                 'exo_redetect_srv': '/world_origin_node/redetect',
                 # Hand redetect is the handeye_aruco node added by
                 # hand_fusion_add.launch.py (VISION_MODE=fusion_dual). In
