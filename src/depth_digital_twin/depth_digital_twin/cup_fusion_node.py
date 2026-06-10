@@ -226,6 +226,10 @@ class CupFusionNode(Node):
         gp('w_hand_base', 0.6)
         gp('w_exo_base', 0.4)
         gp('hand_motion_gating', True)
+        # LIVE-mode hand-view toggle (Tk checkbox). True (default) = hand cloud
+        # contributes to the live fit; False = exclude it (exo only). Scan
+        # capture/lock ALWAYS use the hand view regardless of this.
+        gp('live_use_hand', True)
 
         # Kalman filter (per physical cup; mirror point_cloud_node defaults).
         gp('kf_process_std_xy_m', 0.005)
@@ -312,6 +316,7 @@ class CupFusionNode(Node):
         self.w_hand_base = float(P('w_hand_base'))
         self.w_exo_base = float(P('w_exo_base'))
         self.hand_gating = bool(P('hand_motion_gating'))
+        self.live_use_hand = bool(P('live_use_hand'))
         self.kf_gate = float(P('kf_gate_mahalanobis'))
         self.kf_settled_std = float(P('kf_settled_std_m'))
         self.keepalive = int(P('keepalive_ticks'))
@@ -482,6 +487,7 @@ class CupFusionNode(Node):
             # scan & lock live-tunables (scan_lock_active drives the mode)
             'scan_lock_active': ('scan_lock_active', bool),
             'scan_lock_exo': ('scan_lock_exo', bool),
+            'live_use_hand': ('live_use_hand', bool),
             'scan_arrival_tol_rad': ('scan_tol', float),
             'scan_settle_vel_rad_s': ('scan_settle_vel', float),
             'scan_wait_s': ('scan_wait_s', float),
@@ -543,6 +549,8 @@ class CupFusionNode(Node):
         active = []
         fresh = False
         for cam in ('exo', 'hand'):
+            if cam == 'hand' and not self.live_use_hand:
+                continue                 # live: exclude hand view (Tk toggle)
             msg, t = self._latest[cam]
             if msg is None or (now - t).nanoseconds * 1e-9 > self.max_age:
                 continue

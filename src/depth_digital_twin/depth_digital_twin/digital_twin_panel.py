@@ -366,6 +366,23 @@ class PanelUI:
                     self.node.fusion_node, p, v.get(), 'bool')
             ).pack(side='left', padx=4)
 
+        # Live hand-view toggle (not a debug plot): unchecked excludes the hand
+        # cloud from the LIVE fit (exo only); scan/lock always use hand.
+        tk.Label(dbg, text='  |  ', bg='#1e1e1e', fg='#555').pack(side='left')
+        self._use_hand_var = tk.BooleanVar(value=True)
+        uh = tk.Checkbutton(
+            dbg, text='Use hand (live)', variable=self._use_hand_var,
+            bg='#1e1e1e', fg='#9cdcfe', selectcolor='#333333',
+            activebackground='#1e1e1e', activeforeground='#ffffff',
+            command=lambda: self.node.request_param(
+                self.node.fusion_node, 'live_use_hand',
+                self._use_hand_var.get(), 'bool'))
+        uh.pack(side='left', padx=4)
+        _Tooltip(uh, 'live_use_hand\n'
+                     '체크(기본): 라이브 fit에 hand 클라우드 포함.\n'
+                     '해제: 라이브에서 hand 제외(exo만).\n'
+                     '스캔/lock은 이 설정과 무관하게 항상 hand 사용.')
+
         # Scan & Lock: multi-view accumulate-at-waypoints. Checkbox toggles the
         # cup_fusion scan_lock_active param; Clear Lock calls ~/clear_scan.
         scan = tk.Frame(bar, bg='#1e1e1e')
