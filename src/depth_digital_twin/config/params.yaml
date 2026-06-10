@@ -169,6 +169,10 @@ point_cloud_node:
 
 cup_fusion_node:
   ros__parameters:
+    # Doosan M0609 publishes joint states under the /dsr01 namespace
+    # (global /joint_states has no publisher). scan-lock arrival
+    # detection reads this; joint names already match joint_1..6.
+    scan_joint_states_topic: /dsr01/joint_states
     # ── Scan & Lock (multi-view accumulate-at-waypoints) ──────────────────
     # Edit here and relaunch (no rebuild — params.yaml is symlink-installed).
     # Waypoints: a FLAT list of 6 joint angles (deg) per waypoint, concatenated.

@@ -61,14 +61,21 @@ class DigitalTwinPanel(Node):
         super().__init__('digital_twin_panel')
         gp = self.declare_parameter
         # Per-camera image topics (color, depth, "3D" debug overlay).
-        gp('exo_color_topic', '/camera_exo/color/image_raw')
-        gp('exo_depth_topic', '/camera_exo/aligned_depth_to_color/image_raw')
-        gp('exo_debug_topic', '/digital_twin/detection_debug_exo')
-        gp('hand_color_topic', '/camera_hand/color/image_raw')
-        gp('hand_depth_topic', '/camera_hand/aligned_depth_to_color/image_raw')
+        # Defaults match the live exo-only fusion topology
+        # (digital_twin.launch.py fusion:=true → cameras_only.launch.py
+        # publishes /exo/exo/... and /hand/hand/...). The fusion launch file
+        # still overrides these explicitly, so standalone `ros2 run` works too.
+        gp('exo_color_topic', '/exo/exo/color/image_raw')
+        gp('exo_depth_topic', '/exo/exo/aligned_depth_to_color/image_raw')
+        gp('exo_debug_topic', '/digital_twin/detection_debug')
+        gp('hand_color_topic', '/hand/hand/color/image_raw')
+        gp('hand_depth_topic', '/hand/hand/aligned_depth_to_color/image_raw')
         gp('hand_debug_topic', '/digital_twin/detection_debug_hand')
-        # Redetect services (Trigger) for each camera's world_origin node.
-        gp('exo_redetect_srv', '/world_origin_node_exo/redetect')
+        # Redetect services (Trigger). Exo ArUco world origin = world_origin_node;
+        # hand handeye_aruco = world_origin_node_hand (added by
+        # hand_fusion_add.launch.py in fusion_dual). The launch files override
+        # these; in exo-only fusion the hand node is absent (Hand button no-op).
+        gp('exo_redetect_srv', '/world_origin_node/redetect')
         gp('hand_redetect_srv', '/world_origin_node_hand/redetect')
         gp('fusion_node_name', 'cup_fusion_node')   # for checkboxes + tuning
         gp('tuning_save_dir', '')                   # '' → package share config dir

@@ -26,7 +26,9 @@ Args:
   rviz_config     : path to .rviz file      (default: package rviz/)
   control_panel   : true|false — show Reset/Redetect popup window (default: true)
 """
+import glob
 import os
+import re
 import tempfile
 
 import yaml
@@ -36,6 +38,20 @@ from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
+
+
+# Mirror digital_twin_fusion.launch.py: overlay the newest panel-saved tuning
+# snapshot (params_YYMMDD_HHMMSS.yaml) on top of params.yaml so cup_fusion_node
+# slider tuning + debug-plot toggles persist across restarts. Matches ONLY the
+# timestamped name (never params.yaml / params_back.yaml). Snapshots are PARTIAL
+# (per-node sections) — they OVERLAY, never replace.
+_TUNING_RE = re.compile(r'^params_\d{6}_\d{6}\.yaml$')
+
+
+def _latest_tuning(cfg_dir: str):
+    snaps = [f for f in glob.glob(os.path.join(cfg_dir, 'params_*.yaml'))
+             if _TUNING_RE.match(os.path.basename(f))]
+    return max(snaps, key=os.path.basename) if snaps else None
 
 
 def _write_node_param_override(node_name: str, params: dict) -> str:
@@ -55,6 +71,19 @@ def _make_nodes(context, *args, **kwargs):
     params = LaunchConfiguration('params').perform(context)
     rviz_cfg = LaunchConfiguration('rviz_config').perform(context)
     camera_ns = LaunchConfiguration('camera_ns').perform(context).strip()
+
+    # Newest panel-saved tuning snapshot, overlaid on cup_fusion_node so the
+    # slider tuning + debug-plot toggles survive a restart (parity with
+    # digital_twin_fusion.launch.py). Only applies in fusion mode (cup_fusion).
+    tuning: list = []
+    if LaunchConfiguration('load_latest_tuning').perform(context) == 'true':
+        latest = _latest_tuning(os.path.dirname(params))
+        if latest:
+            tuning = [latest]
+            print(f'[digital_twin] tuning overlay → {latest}')
+        else:
+            print('[digital_twin] load_latest_tuning: no params_*.yaml '
+                  'snapshot found')
 
     common_params = [params, {'intrinsics_path': intrinsics}]
     # When a non-default camera namespace is used (cameras_only.launch.py
@@ -125,7 +154,7 @@ def _make_nodes(context, *args, **kwargs):
         remappings=cam_remaps)
     cup_fusion = Node(
         package='depth_digital_twin', executable='cup_fusion_node',
-        name='cup_fusion_node', output='screen', parameters=[params],
+        name='cup_fusion_node', output='screen', parameters=[params, *tuning],
         condition=IfCondition(LaunchConfiguration('fusion')))
     rviz = Node(
         package='rviz2', executable='rviz2', name='rviz2',
@@ -148,7 +177,11 @@ def _make_nodes(context, *args, **kwargs):
                     '/hand/hand/aligned_depth_to_color/image_raw',
                 'hand_debug_topic': '/digital_twin/detection_debug_hand',
                 'exo_redetect_srv': '/world_origin_node/redetect',
-                'hand_redetect_srv': '/world_origin_node/redetect',
+                # Hand redetect is the handeye_aruco node added by
+                # hand_fusion_add.launch.py (VISION_MODE=fusion_dual). In
+                # exo-only fusion that node is absent, so the Hand button is a
+                # no-op there — expected, since there is no hand camera.
+                'hand_redetect_srv': '/world_origin_node_hand/redetect',
             }],
             condition=IfCondition(LaunchConfiguration('control_panel')))
     else:
@@ -196,5 +229,10 @@ def generate_launch_description() -> LaunchDescription:
             description='exo-only fusion: point_cloud as producer + '
                         'cup_fusion_node owns /digital_twin/boxes + '
                         '/vision/cups_on_table (default false = standalone)'),
+        DeclareLaunchArgument(
+            'load_latest_tuning', default_value='true',
+            description='Overlay the newest panel-saved params_<ts>.yaml '
+                        'snapshot on cup_fusion_node (false = params.yaml '
+                        'only).'),
         OpaqueFunction(function=_make_nodes),
     ])

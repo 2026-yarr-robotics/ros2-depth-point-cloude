@@ -368,6 +368,16 @@ def _setup(context, *_, **__):
         package='depth_digital_twin', executable='digital_twin_panel',
         name='digital_twin_panel', output='screen',
         parameters=[{
+            # This launch uses /camera_exo|hand/* feeds and the _exo/_hand
+            # world-origin nodes. Set image topics EXPLICITLY (do not rely on
+            # the panel's code defaults, which target start.sh's /exo/exo,
+            # /hand/hand split-launch topology).
+            'exo_color_topic': '/camera_exo/color/image_raw',
+            'exo_depth_topic': '/camera_exo/aligned_depth_to_color/image_raw',
+            'exo_debug_topic': '/digital_twin/detection_debug_exo',
+            'hand_color_topic': '/camera_hand/color/image_raw',
+            'hand_depth_topic': '/camera_hand/aligned_depth_to_color/image_raw',
+            'hand_debug_topic': '/digital_twin/detection_debug_hand',
             'exo_redetect_srv': '/world_origin_node_exo/redetect',
             'hand_redetect_srv': '/world_origin_node_hand/redetect',
         }])
