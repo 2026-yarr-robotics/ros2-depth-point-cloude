@@ -185,6 +185,11 @@ cup_fusion_node:
     # static lock. Toggle live from the Tk "Lock exo too" checkbox.
     scan_lock_exo: false
 
+    # Live hand-view toggle (Tk "Use hand (live)" checkbox). true (default) =
+    # hand cloud contributes to the LIVE fit; false = exo only. Scan/lock always
+    # use the hand view regardless.
+    live_use_hand: true
+
     # ── Live noise suppression ────────────────────────────────────────────
     # (A) Temporal frame accumulation: union each camera's clouds over this
     # window before fitting → averages out raw per-frame depth noise (far exo
