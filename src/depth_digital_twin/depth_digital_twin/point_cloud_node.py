@@ -35,8 +35,15 @@ import tf2_ros
 from std_srvs.srv import Trigger
 
 from rcl_interfaces.msg import SetParametersResult
+from geometry_msgs.msg import Vector3
 from depth_digital_twin.intrinsics import load_intrinsics
-from depth_digital_twin_msgs.msg import (SegmentedObjectArray,
+from depth_digital_twin.cup_geometry import (cone_silhouette_px,
+                                             edge_snap_fit,
+                                             fit_silhouette_xy,
+                                             ray_through_point)
+from depth_digital_twin_msgs.msg import (CupObservation,
+                                         CupObservationArray,
+                                         SegmentedObjectArray,
                                          WorldObjectCloud,
                                          WorldObjectCloudArray)
 
@@ -285,6 +292,47 @@ class PointCloudNode(Node):
         self.declare_parameter('cup_fit_residual_max', 0.02)
         self.declare_parameter('cup_class_names', ['cup'])
 
+        # ── Rim/silhouette observations (depth-light measurement path) ─────
+        # Per-cup 2D silhouette chamfer fit (cup_geometry.fit_silhouette_xy):
+        # the YOLO mask contour + calibration constrain the axis (x, y) far
+        # more precisely than the depth cloud. Published as CupObservationArray
+        # ALONGSIDE the existing cloud path (Phase 1: parallel instrumentation;
+        # cup_fusion_node logs/compares, /digital_twin/boxes is unchanged).
+        self.declare_parameter('rim_obs_enabled', True)
+        self.declare_parameter('cup_obs_topic', '/digital_twin/cup_obs')
+        # Min seconds between silhouette fits per track (a fit is ~5-10 ms;
+        # throttling bounds worst-case callback cost with many cups).
+        self.declare_parameter('rim_fit_period_s', 0.3)
+        # Assumed 1σ contour-pixel noise; inflated x3 when the wrist camera is
+        # moving and x2 when the mask is cut by the image border.
+        self.declare_parameter('rim_sigma_px', 2.0)
+        # Drop fits whose rendered-silhouette-vs-mask IoU is below this (the
+        # consumer applies its own, stricter gate on top).
+        self.declare_parameter('rim_min_iou', 0.2)
+        # 3rd fit parameter b: uniform mask-boundary bias (px). Absorbs YOLO
+        # over/under-segmentation so it cannot leak into (x, y); reported per
+        # observation as boundary_offset_px.
+        self.declare_parameter('rim_boundary_offset', True)
+        # Edge-snap refinement: re-anchor the boundary to the image-gradient
+        # peak along each silhouette normal (the mask only initialises). Off
+        # → the chamfer/mask fit is published as-is.
+        self.declare_parameter('rim_edge_snap', True)
+        self.declare_parameter('rim_edge_min_grad', 8.0)
+        # Max seconds a frame may wait for its stamped TF before falling back
+        # to latest (fallback frames produce NO rim observation on a moving
+        # camera — the image↔FK pairing would be wrong).
+        self.declare_parameter('rim_tf_defer_s', 0.25)
+        # Emit world point clouds for UPRIGHT cups. False = rim observations
+        # are the sole upright measurement (fusion fit_source=rim) and the
+        # noisy upright clouds are not built at all — skips the per-window
+        # MAD/density/serialize passes for those tracks. Clouds for other
+        # classes (fallen-cup → OBB) are always kept.
+        self.declare_parameter('upright_clouds', True)
+        # Image-space debug overlay of every ATTEMPTED silhouette fit:
+        # observed contour (green), fitted silhouette (cyan), depth init
+        # (red dot), per-cup text incl. the failure reason when a fit drops.
+        self.declare_parameter('rim_debug_topic', '/digital_twin/rim_debug')
+
         # Accumulating-window pipeline. Per-frame depth is too noisy at one
         # shot; we ingest into per-track buffers and only fit + publish at
         # `window_period_s` cadence. With more samples per cluster the MAD
@@ -386,6 +434,25 @@ class PointCloudNode(Node):
         self.cup_resid_max: float = float(self.get_parameter('cup_fit_residual_max').value)
         self.cup_class_names: set[str] = {
             s.lower() for s in self.get_parameter('cup_class_names').value}
+        self._rim_enabled: bool = bool(
+            self.get_parameter('rim_obs_enabled').value)
+        self._rim_fit_period: float = max(
+            0.05, float(self.get_parameter('rim_fit_period_s').value))
+        self._rim_sigma_px: float = float(
+            self.get_parameter('rim_sigma_px').value)
+        self._rim_min_iou: float = float(
+            self.get_parameter('rim_min_iou').value)
+        self._rim_boundary_offset: bool = bool(
+            self.get_parameter('rim_boundary_offset').value)
+        self._rim_edge_snap: bool = bool(
+            self.get_parameter('rim_edge_snap').value)
+        self._rim_edge_min_grad: float = float(
+            self.get_parameter('rim_edge_min_grad').value)
+        self._tf_defer_s: float = float(
+            self.get_parameter('rim_tf_defer_s').value)
+        self._tf_pending: list = []   # frames awaiting their stamped TF
+        self._upright_clouds: bool = bool(
+            self.get_parameter('upright_clouds').value)
         self.patch_radius: int = max(1, int(self.get_parameter('window_radius').value))
         self.patch_cx_px: int = int(self.get_parameter('window_center_x_px').value)
         self.patch_cy_px: int = int(self.get_parameter('window_center_y_px').value)
@@ -444,6 +511,16 @@ class PointCloudNode(Node):
         # late-joining subscriber sees the most recent snapshot.
         self.cups_on_table_pub = self.create_publisher(
             String, self.get_parameter('cups_on_table_topic').value, latched)
+        # Silhouette observations — published in BOTH roles (standalone tools
+        # may log them too); consumed by cup_fusion_node in fusion mode.
+        self.cup_obs_pub = None
+        self.rim_debug_pub = None
+        if self._rim_enabled:
+            self.cup_obs_pub = self.create_publisher(
+                CupObservationArray,
+                self.get_parameter('cup_obs_topic').value, 5)
+            self.rim_debug_pub = self.create_publisher(
+                Image, self.get_parameter('rim_debug_topic').value, 1)
         # Producer-role output: per-object world clouds for cup_fusion_node.
         self.world_clouds_pub = None
         if self.role == 'producer':
@@ -523,29 +600,45 @@ class PointCloudNode(Node):
     # ------------------------------------------------------------------
     def _on_synced(self, rgb_msg: Image, depth_msg: Image,
                    det_msg: SegmentedObjectArray) -> None:
-        """Per-frame: ingest detections into per-track buffers + emit live
-        debug images. Heavy work (filter, fit, marker/cloud publish) is
-        deferred to `_finalize_window` which fires every `window_period_s`.
-
-        TF lookup uses the IMAGE STAMP (with a short blocking timeout) so the
-        cloud is transformed via world←camera AT IMAGE-CAPTURE TIME — critical
-        for the wrist-mounted (handeye_aruco) case where the camera moves
-        with link_6.  Falls back to Time(0) (latest) when the stamped lookup
-        extrapolates, so a fixed exo camera still works the way it did.
+        """Per-frame entry: resolve world←camera AT IMAGE-CAPTURE TIME, then
+        process. When FK lags the image (wrist camera: /tf for this stamp has
+        not arrived yet) the frame is DEFERRED and retried on the next
+        callback instead of silently using the latest TF — that fallback
+        pairs an old pose with a new image and was a direct injector of
+        image↔trajectory desync into every world-frame measurement. Only a
+        frame older than `rim_tf_defer_s` falls back to latest, marked
+        tf_stamped_ok=False (rim observations from a moving camera skip it).
         """
+        retry = self._tf_pending
+        self._tf_pending = []
+        for item in retry:
+            self._try_process_frame(*item)
+        self._try_process_frame(rgb_msg, depth_msg, det_msg)
+
+    def _try_process_frame(self, rgb_msg, depth_msg, det_msg) -> None:
+        stamp = rclpy.time.Time.from_msg(rgb_msg.header.stamp)
+        tf_stamped_ok = True
         try:
             tf = self.tf_buffer.lookup_transform(
-                self.world_frame, self.camera_frame,
-                rclpy.time.Time.from_msg(rgb_msg.header.stamp),
+                self.world_frame, self.camera_frame, stamp,
                 # Non-blocking: in a single-threaded executor the /tf callback
-                # can't run while THIS callback blocks, so a non-zero timeout
-                # just burns up to 0.1s/frame (hand mode, FK lags the image)
-                # before falling back to latest anyway. 0 = fail fast → latest.
+                # can't run while THIS callback blocks. Fail fast → defer.
                 timeout=rclpy.duration.Duration(seconds=0.0))
         except tf2_ros.ExtrapolationException:
+            age_s = (self.get_clock().now() - stamp).nanoseconds * 1e-9
+            if age_s < self._tf_defer_s:
+                # FK not in the buffer yet — requeue for the next callback.
+                if len(self._tf_pending) < 4:
+                    self._tf_pending.append((rgb_msg, depth_msg, det_msg))
+                return
             try:
                 tf = self.tf_buffer.lookup_transform(
                     self.world_frame, self.camera_frame, rclpy.time.Time())
+                tf_stamped_ok = False
+                self.get_logger().info(
+                    f'TF fallback→latest (stamp lag {age_s*1e3:.0f}ms, '
+                    f'moving={self._joints_moving})',
+                    throttle_duration_sec=10.0)
             except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
                     tf2_ros.ExtrapolationException):
                 self.get_logger().warn(
@@ -559,7 +652,13 @@ class PointCloudNode(Node):
                 f'TF {self.world_frame}<-{self.camera_frame} not available yet',
                 throttle_duration_sec=2.0)
             return
+        self._process_frame(rgb_msg, depth_msg, det_msg, tf, tf_stamped_ok)
 
+    def _process_frame(self, rgb_msg, depth_msg, det_msg, tf,
+                       tf_stamped_ok: bool) -> None:
+        """Ingest detections into per-track buffers + emit live debug images.
+        Heavy work (filter, fit, marker/cloud publish) is deferred to
+        `_finalize_window` which fires every `window_period_s`."""
         # tf is target=world, source=camera ⇒ p_world = R_wc @ p_cam + t_wc.
         t_wc = np.array([tf.transform.translation.x,
                          tf.transform.translation.y,
@@ -632,6 +731,11 @@ class PointCloudNode(Node):
         # Per-frame: ingest each detection's world points into its track's
         # accumulating buffer. No fitting / cloud / marker publish here — the
         # window timer below batches that into one ~window_period_s update.
+        # (Exception: the throttled per-track silhouette fit below, which must
+        # pair a mask with the TF of ITS OWN frame — a moving hand camera
+        # cannot defer that pairing to the window.)
+        rim_obs: list = []
+        rim_dbg = {'canvas': None}      # lazily rgb.copy() on first attempt
         for obj, mb in per_object_masks:
             mb_box = self._erode_mask(mb)
             if mb_box.sum() < 32:
@@ -685,8 +789,13 @@ class PointCloudNode(Node):
                     'color_votes': {},         # {color_name: vote_count}
                 }
                 self._tracks[tid] = track
-            track['points_buf'].append(obj_world)
-            track['colors_buf'].append(obj_rgb_packed)
+            # Upright cups measured by rim need no cloud — skipping the
+            # buffer here removes their whole per-window cost (MAD, KDTree,
+            # serialize). obj_world above is still computed: rim needs the
+            # rough z (level) and xy init from it.
+            if self._upright_clouds or class_name not in self.cup_class_names:
+                track['points_buf'].append(obj_world)
+                track['colors_buf'].append(obj_rgb_packed)
             track['last_score'] = float(obj.score)
             # Per-frame color vote from the masked pixels.
             if bgr.shape[0] >= self._color_min_pixels:
@@ -698,6 +807,25 @@ class PointCloudNode(Node):
                         track['color_votes'],
                         key=track['color_votes'].get)
             track['last_display_name'] = obj.class_name
+
+            if (self.cup_obs_pub is not None
+                    and class_name in self.cup_class_names):
+                ob = self._rim_observe(
+                    obj, mb, oz, obj_world, R_wc, t_wc, track, class_name,
+                    tid, rgb, rim_dbg, tf_stamped_ok)
+                if ob is not None:
+                    rim_obs.append(ob)
+
+        if rim_obs and self.cup_obs_pub is not None:
+            self.cup_obs_pub.publish(CupObservationArray(
+                header=Header(stamp=rgb_msg.header.stamp,
+                              frame_id=self.world_frame),
+                observations=rim_obs))
+        if rim_dbg['canvas'] is not None and self.rim_debug_pub is not None:
+            dbg_msg = self.bridge.cv2_to_imgmsg(
+                rim_dbg['canvas'], encoding='bgr8')
+            dbg_msg.header = rgb_msg.header
+            self.rim_debug_pub.publish(dbg_msg)
 
         # Per-frame box debug overlay using the LAST window's fit (frozen
         # box / frustum between updates is expected — they refresh every
@@ -729,6 +857,154 @@ class PointCloudNode(Node):
         if elapsed >= self.window_period_s:
             self._finalize_window(rgb_msg.header.stamp)
             self._window_start_stamp = now
+
+    # ------------------------------------------------------------------
+    def _rim_observe(self, obj, mb, oz, obj_world, R_wc, t_wc, track,
+                     class_name, tid, rgb, rim_dbg, tf_stamped_ok=True):
+        """Throttled silhouette chamfer fit for one upright-cup detection.
+
+        Returns a CupObservation or None. The fit aligns the KNOWN truncated
+        cone (2 DOF: axis x, y at an assumed base elevation) to the raw mask
+        contour — depth contributes only the rough top-z (level evidence) and
+        the (x, y) initial guess, so depth bias does not propagate into the
+        measurement beyond the slide-along-ray term the consumer corrects.
+
+        Every ATTEMPTED fit (success or not) is drawn onto rim_dbg['canvas']
+        for the /digital_twin/rim_debug stream: observed contour green,
+        fitted silhouette cyan, depth init red, text with id/iou/rms or the
+        failure reason.
+        """
+        # A latest-TF fallback frame on a camera that is MOVING pairs the
+        # image with the wrong pose — exactly the image↔trajectory desync
+        # seen as a ~30 mm exo↔hand residual. Produce no measurement then.
+        # When the joints are STILL the latest TF equals the stamped TF
+        # physically, so the fallback pairing is safe — without this
+        # exemption a paused replay (stamped lookup unlucky every frame)
+        # starves the fusion of hand observations entirely.
+        if not tf_stamped_ok and self.camera_name != 'exo' \
+                and self._joints_moving:
+            self.get_logger().info(
+                'rim: skipping fallback-TF frame while moving',
+                throttle_duration_sec=5.0)
+            return None
+        now_s = self.get_clock().now().nanoseconds * 1e-9
+        if now_s - track.get('rim_last_t', 0.0) < self._rim_fit_period:
+            return None
+        track['rim_last_t'] = now_s
+
+        canvas = rim_dbg['canvas']
+        if canvas is None and self.rim_debug_pub is not None:
+            canvas = rim_dbg['canvas'] = rgb.copy()
+
+        z_top_rough = float(np.percentile(obj_world[:, 2], 97.0))
+        z_base0 = z_top_rough - self.cup_h
+        xy0 = (float(np.median(obj_world[:, 0])),
+               float(np.median(obj_world[:, 1])))
+        mask_u8 = mb.astype(np.uint8) * 255
+        try:
+            fit = fit_silhouette_xy(
+                mask_u8, K=self.K, dist=self.intr.dist, R_wc=R_wc, t_wc=t_wc,
+                r_top=self.cup_top_d * 0.5, r_bot=self.cup_bot_d * 0.5,
+                height=self.cup_h, z_base=z_base0, xy0=xy0,
+                fit_boundary_offset=self._rim_boundary_offset)
+        except Exception as e:  # never let the obs path break frame ingest
+            self.get_logger().warn(
+                f'silhouette fit failed: {e}', throttle_duration_sec=5.0)
+            fit = {'ok': False, 'fail': 'exception'}
+        ok = fit['ok'] and fit['iou'] >= self._rim_min_iou
+
+        # Edge-snap: replace the mask-derived boundary with the image
+        # gradient where a strong edge exists. Falls back silently to the
+        # chamfer result (edge_coverage = 0) when edges are too weak.
+        edge_cov = 0.0
+        if ok and self._rim_edge_snap:
+            gray = rim_dbg.get('gray')
+            if gray is None:
+                gray = rim_dbg['gray'] = cv2.cvtColor(
+                    rgb, cv2.COLOR_BGR2GRAY)
+            try:
+                snap = edge_snap_fit(
+                    gray, K=self.K, dist=self.intr.dist, R_wc=R_wc,
+                    t_wc=t_wc, r_top=self.cup_top_d * 0.5,
+                    r_bot=self.cup_bot_d * 0.5, height=self.cup_h,
+                    z_base=z_base0, xy0=(fit['x'], fit['y']),
+                    min_grad=self._rim_edge_min_grad)
+            except Exception:
+                snap = {'ok': False}
+            if snap.get('ok'):
+                fit = {**fit, 'x': snap['x'], 'y': snap['y'],
+                       'rms_px': snap['rms_px']}
+                edge_cov = float(snap['edge_cov'])
+
+        if canvas is not None:
+            cnts, _ = cv2.findContours(
+                mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            cv2.drawContours(canvas, cnts, -1, (0, 255, 0), 1)
+            tx, ty = int(obj.x_min), max(12, int(obj.y_min) - 4)
+            if ok:
+                sil = cone_silhouette_px(
+                    fit['x'], fit['y'], z_base0,
+                    r_top=self.cup_top_d * 0.5, r_bot=self.cup_bot_d * 0.5,
+                    height=self.cup_h, K=self.K, dist=self.intr.dist,
+                    R_wc=R_wc, t_wc=t_wc)
+                if sil is not None:
+                    cv2.polylines(canvas,
+                                  [np.round(sil).astype(np.int32)],
+                                  True, (255, 255, 0), 2)
+                p0c = R_wc.T @ (np.array([xy0[0], xy0[1], z_base0]) - t_wc)
+                if p0c[2] > 1e-3:
+                    u0 = int(round(self.intr.fx * p0c[0] / p0c[2]
+                                   + self.intr.cx))
+                    v0 = int(round(self.intr.fy * p0c[1] / p0c[2]
+                                   + self.intr.cy))
+                    cv2.circle(canvas, (u0, v0), 4, (0, 0, 255), -1)
+                label = (f"#{tid} iou{fit['iou']:.2f} "
+                         f"rms{fit['rms_px']:.1f} "
+                         f"b{fit.get('b_px', 0.0):+.1f} "
+                         f"cov{edge_cov:.1f} z{z_base0:+.2f}")
+                col = (255, 255, 0)
+            else:
+                reason = fit.get('fail') or f"low_iou {fit.get('iou', 0):.2f}"
+                label = f'#{tid} FIT-DROP {reason}'
+                col = (0, 0, 255)
+            cv2.putText(canvas, label, (tx, ty),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
+
+        if not ok:
+            return None
+
+        sigma = self._rim_sigma_px
+        if self._joints_moving:
+            sigma *= 3.0
+        if fit['truncated']:
+            sigma *= 2.0
+        origin, ray_d = ray_through_point(
+            np.array([fit['x'], fit['y'], z_base0]), t_wc)
+
+        ob = CupObservation()
+        ob.camera = self.camera_name
+        ob.instance_id = int(getattr(obj, 'instance_id', -1))
+        ob.class_name = class_name
+        ob.score = float(obj.score)
+        ob.color = str(track.get('color') or '')
+        ob.x0 = float(fit['x'])
+        ob.y0 = float(fit['y'])
+        ob.z_base0 = float(z_base0)
+        ob.ray_origin = MsgPoint(
+            x=float(origin[0]), y=float(origin[1]), z=float(origin[2]))
+        ob.ray_dir = Vector3(
+            x=float(ray_d[0]), y=float(ray_d[1]), z=float(ray_d[2]))
+        ob.focal_px = float(self.intr.fx)
+        ob.sigma_px = float(sigma)
+        ob.chamfer_rms_px = float(fit['rms_px'])
+        ob.mask_iou = float(fit['iou'])
+        ob.contour_points = int(fit['n_contour'])
+        ob.boundary_offset_px = float(fit.get('b_px', 0.0))
+        ob.edge_coverage = edge_cov
+        ob.median_depth_m = float(np.median(oz)) if oz.size else 0.0
+        ob.z_top_rough_m = z_top_rough
+        ob.moving = bool(self._joints_moving)
+        return ob
 
     # ------------------------------------------------------------------
     def _finalize_window(self, stamp) -> None:
