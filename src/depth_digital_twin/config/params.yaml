@@ -205,6 +205,9 @@ cup_fusion_node:
     #                              server's PYRAMID_LAYER_HEIGHT (robot.py)
     rim_obs_max_age_s: 3.0       # obs cache lifetime (hand publishes ~0.5Hz;
     #                              1.0s silently aged its view out of fusion)
+    rim_keepalive_s: 3.5         # rim-mode track eviction is WALL TIME (not
+    #                              event count) — events fire at cloud rate
+    #                              while obs refresh at 0.3-2s
     rim_cluster_xy_m: 0.05       # cross-camera same-cup XY gate
     rim_min_iou: 0.5             # drop low-quality silhouette fits
     rim_max_rms_px: 6.0

@@ -327,10 +327,15 @@ def _setup(context, *_, **__):
             'world_clouds_topic': '/digital_twin/cups_exo',
             'cup_obs_topic': '/digital_twin/cup_obs_exo',
             'rim_debug_topic': '/digital_twin/rim_debug_exo',
-            # rim is the upright measurement (cup_fusion fit_source=rim);
-            # skip building the noisy upright clouds entirely. Fallen-cup
-            # clouds (OBB path) are still produced.
-            'upright_clouds': False,
+            # split the remaining shared-default debug topics too — two
+            # cameras interleaving on one Image topic flickers violently
+            'box_debug_topic': '/digital_twin/box_debug_exo',
+            'depth_debug_topic': '/digital_twin/depth_debug_exo',
+            # rim is the upright measurement (cup_fusion fit_source=rim) —
+            # in rim mode the fusion never FITS upright clouds, but they
+            # still feed the /digital_twin/points DISPLAY (RViz/debug).
+            # Set false to also skip building them (CPU saving).
+            'upright_clouds': True,
         }])
     det_hand = Node(
         package='depth_digital_twin', executable='detection_node',
@@ -356,7 +361,9 @@ def _setup(context, *_, **__):
             'world_clouds_topic': '/digital_twin/cups_hand',
             'cup_obs_topic': '/digital_twin/cup_obs_hand',
             'rim_debug_topic': '/digital_twin/rim_debug_hand',
-            'upright_clouds': False,
+            'box_debug_topic': '/digital_twin/box_debug_hand',
+            'depth_debug_topic': '/digital_twin/depth_debug_hand',
+            'upright_clouds': True,
             'hand_motion_gating': True,
             'joint_states_topic': '/joint_states',
             'aruco_overlay': False,

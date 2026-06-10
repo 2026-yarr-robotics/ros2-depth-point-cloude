@@ -368,6 +368,16 @@ class CupFusionNode(Node):
         gp('rim_bias_alpha', 0.05)     # EMA gain per shared-cup event
         gp('rim_bias_max_m', 0.05)     # clamp |bias|
         gp('rim_bias_delta_max_m', 0.08)  # ignore absurd per-cup deltas
+        # Level-snap hysteresis: switch a cup's level only when the new snap
+        # beats the previous one by this margin (m) on |rough z - lattice|.
+        gp('rim_level_hyst_m', 0.008)
+        # Pyramid-lattice preference window: if the pyramid snap error is
+        # within this, take it over a (numerically closer) nest snap.
+        gp('rim_layer_pref_tol_m', 0.007)
+        # Wall-time track keepalive for rim mode (s). Slightly above the obs
+        # cache age so a track survives an occlusion exactly as long as its
+        # observations can.
+        gp('rim_keepalive_s', 3.5)
 
         def P(n):
             return self.get_parameter(n).value
@@ -563,6 +573,11 @@ class CupFusionNode(Node):
         self.rim_bias_delta_max = float(P('rim_bias_delta_max_m'))
         self._cam_bias: dict[str, np.ndarray] = {}  # cam → world-XY bias (m)
         self._cam_bias_n: dict[str, int] = {}       # cam → update count
+        self.rim_level_hyst = float(P('rim_level_hyst_m'))
+        self.rim_layer_pref_tol = float(P('rim_layer_pref_tol_m'))
+        self.rim_keepalive_s = float(P('rim_keepalive_s'))
+        self._rim_ests_tick = None      # per-tick shared estimate cache
+        self._rim_prev_lvl: list = []   # (key_xy, z_base, k) of last tick
         self._rim_csv = None                        # lazy-opened file handle
         self.rim_dbg_pub = None
         self.health_pub = None
@@ -662,6 +677,9 @@ class CupFusionNode(Node):
             'rim_bias_apply': ('rim_bias_apply', bool),
             'rim_bias_alpha': ('rim_bias_alpha', float),
             'rim_bias_max_m': ('rim_bias_max', float),
+            'rim_level_hyst_m': ('rim_level_hyst', float),
+            'rim_layer_pref_tol_m': ('rim_layer_pref_tol', float),
+            'rim_keepalive_s': ('rim_keepalive_s', float),
         }
         self.add_on_set_parameters_callback(self._on_set_params)
         self.get_logger().info(
@@ -1297,10 +1315,25 @@ class CupFusionNode(Node):
 
     # ================= tick dispatcher + live pipeline ==================
     # ── Rim/silhouette observation path (Phase 1: parallel A/B) ───────────
+    def _obs_ok(self, ob) -> bool:
+        return (ob.mask_iou >= self.rim_min_iou
+                and ob.chamfer_rms_px <= self.rim_max_rms
+                and not (self.rim_drop_moving and ob.moving))
+
     def _on_cup_obs(self, msg: CupObservationArray, cam: str) -> None:
         now_s = self.get_clock().now().nanoseconds * 1e-9
         for ob in msg.observations:
-            self._rim_latest[(cam, int(ob.instance_id))] = (ob, now_s)
+            key = (cam, int(ob.instance_id))
+            if not self._obs_ok(ob):
+                cur = self._rim_latest.get(key)
+                if (cur is not None and self._obs_ok(cur[0])
+                        and now_s - cur[1] <= self.rim_obs_max_age):
+                    # Keep the last GOOD observation: one below-gate/moving
+                    # obs overwriting it starved the track of fits for up to
+                    # the next obs period and the box blinked out (eviction)
+                    # then back in under a fresh gid/colour.
+                    continue
+            self._rim_latest[key] = (ob, now_s)
         if msg.observations:
             self._rim_fresh = True
 
@@ -1312,16 +1345,15 @@ class CupFusionNode(Node):
                   if now_s - t > self.rim_obs_max_age]:
             del self._rim_latest[k]
         return [ob for ob, _ in self._rim_latest.values()
-                if ob.mask_iou >= self.rim_min_iou
-                and ob.chamfer_rms_px <= self.rim_max_rms
-                and not (self.rim_drop_moving and ob.moving)]
+                if self._obs_ok(ob)]
 
     def _rim_tick(self, stamp) -> None:
         """Fuse the cached silhouette observations into per-cup estimates and
         publish debug markers + health JSON (+ optional CSV). Read-only with
         respect to the cloud pipeline."""
         now_s = self.get_clock().now().nanoseconds * 1e-9
-        ests = self._rim_estimates(self._rim_collect())
+        ests = (self._rim_ests_tick if self._rim_ests_tick is not None
+                else self._rim_estimates(self._rim_collect()))
         self._publish_rim_markers(ests, stamp)
         self._publish_fusion_health(ests, stamp)
         if self.rim_log_dir:
@@ -1332,8 +1364,17 @@ class CupFusionNode(Node):
         to the nesting lattice, slide each camera's (x, y) along its view ray
         to the snapped level, then fuse by inverse covariance. The per-camera
         residuals are the cross-view consistency signal (extrinsic health)."""
+        now_s = self.get_clock().now().nanoseconds * 1e-9
         if not obs:
+            # KEEP the level memory across momentarily-empty collections
+            # (age it out instead). Clearing it here erased the hysteresis
+            # exactly when gating (motion/occlusion) made the next snap
+            # noisiest — a level flip then slid the exo measurement ~55 mm
+            # along its ray and minted a duplicate track (blink).
+            self._rim_prev_lvl = [e for e in self._rim_prev_lvl
+                                  if now_s - e[3] < 5.0]
             return []
+        new_prev: list = []     # (key_xy, z_base, k, t) for hysteresis
         # 3D ellipsoidal clustering: XY and Z gated separately. XY-only
         # collapsed a pyramid — cups on adjacent layers sit at HALF the cup
         # spacing in XY (0.039 < 0.05 gate) and only differ in z.
@@ -1359,8 +1400,29 @@ class CupFusionNode(Node):
             kl, zl, el = snap_level(
                 z_top, table_z=self.table_z, cup_h=self.cup_h,
                 nest_off=self.rim_layer_h)
-            if abs(el) < abs(lvl_err):
+            # PREFER the pyramid lattice whenever it explains the rough z
+            # within sensor tolerance: the fine nest lattice (20 mm pitch)
+            # fits ANY z within ±10 mm, so a plain nearest-error contest is
+            # degenerate against it. A genuinely nested column misses the
+            # pyramid lattice by ≫ tolerance and still falls through.
+            if abs(el) <= self.rim_layer_pref_tol or abs(el) < abs(lvl_err):
                 k, z_base, lvl_err = kl, zl, el
+            # Level HYSTERESIS: keep last tick's level for this cup unless
+            # the new snap explains the rough z better by a clear margin.
+            # Depth noise near a lattice midpoint otherwise flips the level
+            # — and via the ray slide, a z flip is an XY jump too.
+            key_xy = np.array([
+                float(np.mean([o.x0 for o in by_cam.values()])),
+                float(np.mean([o.y0 for o in by_cam.values()]))])
+            for pxy, pzb, pk, _pt in self._rim_prev_lvl:
+                if float(np.hypot(*(key_xy - pxy))) > 0.03:
+                    continue
+                if pzb != z_base and (abs(z_top - (pzb + self.cup_h))
+                                      <= abs(lvl_err) + self.rim_level_hyst):
+                    k, z_base = pk, pzb
+                    lvl_err = z_top - (z_base + self.cup_h)
+                break
+            new_prev.append((key_xy, z_base, k, now_s))
             slids: dict[str, tuple] = {}    # cam → (raw xy, cov, obs)
             for o in by_cam.values():
                 d = np.array([o.ray_dir.x, o.ray_dir.y, o.ray_dir.z])
@@ -1421,6 +1483,15 @@ class CupFusionNode(Node):
                     'moving': bool(o.moving)}
                     for o, r in zip(used, resid)},
             })
+        # Merge: fresh entries win; carry over recent memory for cups not
+        # observed THIS call (brief occlusion must not lose their level).
+        for e in self._rim_prev_lvl:
+            if now_s - e[3] >= 5.0:
+                continue
+            if all(float(np.hypot(*(e[0] - npv[0]))) > 0.03
+                   for npv in new_prev):
+                new_prev.append(e)
+        self._rim_prev_lvl = new_prev
         return ests
 
     def _rim_final_fits(self) -> list[dict]:
@@ -1429,7 +1500,9 @@ class CupFusionNode(Node):
         markers, cups_on_table) run unchanged. Per-cup measurement noise comes
         from the fused covariance instead of the fixed kf_meas_* params."""
         fits = []
-        for e in self._rim_estimates(self._rim_collect()):
+        ests = (self._rim_ests_tick if self._rim_ests_tick is not None
+                else self._rim_estimates(self._rim_collect()))
+        for e in ests:
             center = np.array([e['x'], e['y'],
                                e['z_base'] + 0.5 * self.cup_h])
             frustum = _cup_frustum_geometry(
@@ -1459,6 +1532,11 @@ class CupFusionNode(Node):
 
     def _publish_rim_markers(self, ests: list[dict], stamp) -> None:
         arr = MarkerArray()
+        # Stable ordering → stable marker ids: list-index ids with dict-order
+        # input swapped geometry between ids whenever an obs aged in/out.
+        ests = sorted(ests, key=lambda e: (round(e['z_base'], 2),
+                                           round(e['x'], 2),
+                                           round(e['y'], 2)))
         for i, e in enumerate(ests):
             fr = _cup_frustum_geometry(
                 e['x'], e['y'], top_d=self.cup_top_d, bot_d=self.cup_bot_d,
@@ -1497,8 +1575,10 @@ class CupFusionNode(Node):
             t.text = (f"R{i} L{e['level']} ±{e['sigma_mm']:.0f}mm "
                       f"[{cams}]")
             arr.markers.append(t)
-        if arr.markers:
-            self.rim_dbg_pub.publish(arr)
+        # Publish even when empty: skipping while existing markers expire on
+        # the 0.4 s lifetime made the whole overlay blink off during gating
+        # gaps and pop back when observations returned.
+        self.rim_dbg_pub.publish(arr)
 
     def _publish_fusion_health(self, ests: list[dict], stamp) -> None:
         # 'cov' is a numpy array (KF consumption) — not JSON-serializable.
@@ -1560,10 +1640,15 @@ class CupFusionNode(Node):
             self._do_clear(stamp)
             self._pending_clear = False
 
-        # Rim/silhouette estimator — strictly parallel instrumentation; an
-        # exception here must never take down the cloud pipeline.
+        # Rim/silhouette estimator — computed ONCE per tick and shared by
+        # the debug publisher and the live measurement path (_rim_estimates
+        # is stateful: bias EMA + level hysteresis; calling it twice per
+        # tick double-stepped both and let the two displays diverge).
+        # An exception here must never take down the cloud pipeline.
+        self._rim_ests_tick = None
         if self.rim_enabled and self.rim_dbg_pub is not None:
             try:
+                self._rim_ests_tick = self._rim_estimates(self._rim_collect())
                 self._rim_tick(stamp)
             except Exception as e:
                 self.get_logger().warn(
@@ -1701,6 +1786,7 @@ class CupFusionNode(Node):
             final_fits = self._rim_final_fits() + final_fits
 
         # STAGE-3: 3D-ellipsoidal association + KF + hit count.
+        now_s = self.get_clock().now().nanoseconds * 1e-9
         alive: set[int] = set()
         for f in final_fits:
             gid = self._resolve_gid(f['center'])
@@ -1716,6 +1802,7 @@ class CupFusionNode(Node):
                 tr['hits'] += 1
             tr['cams'] = {m['cam'] for m in f['members']}
             tr['miss'] = 0
+            tr['last_match_t'] = now_s
             # ── Color: per-view HSV vote with decay (recency-weighted, ──
             # bounded ~= weight/(1-decay)). Each measurement event decays prior
             # votes then adds a FIXED per-view weight (not point-count), so an
@@ -1749,18 +1836,41 @@ class CupFusionNode(Node):
                        f['members'][0]['class_name'] if f['members'] else 'cup')
             score = max((m['score'] for m in f['members']), default=0.0)
             tr['cls'] = cls
+            # Render the frustum from the SMOOTHED KF state, not the raw
+            # per-event measurement — the raw frustum re-drawn at ~10 Hz was
+            # the "severely shaking cup" (the cube already used kf.x).
+            if f['kind'] == 'cup':
+                frustum = _cup_frustum_geometry(
+                    float(tr['kf'].x[0]), float(tr['kf'].x[1]),
+                    top_d=self.cup_top_d, bot_d=self.cup_bot_d,
+                    height=self.cup_h,
+                    floor_z=float(tr['kf'].x[2]) - 0.5 * self.cup_h,
+                    n_seg=self.cup_n_seg)
+            else:
+                frustum = f['frustum']
             tr['last_state'] = self._render_state(
                 gid, tr['kf'].x.copy(), f['R'], f['size'], f['kind'],
-                f['frustum'], f['residual'], tr['cams'],
+                frustum, f['residual'], tr['cams'],
                 tr['color'], cls, score)
             alive.add(gid)
 
-        # STAGE-4: coast/evict after keepalive measurement events with no match.
+        # STAGE-4: coast/evict tracks with no match.
+        # rim mode evicts on WALL TIME, not event count: measurement events
+        # fire at cloud-window rate (10-20 Hz) while rim observations refresh
+        # at 0.3-2 s, so an event-counted keepalive (9 events ≈ 0.5 s) evicted
+        # tracks during ordinary observation gaps and the cup blinked off,
+        # then re-minted a gid (new colour, min_hits re-earned) — the
+        # motion-correlated flicker.
         for gid in list(self._tracks.keys()):
-            if gid not in alive:
-                self._tracks[gid]['miss'] += 1
-                if self._tracks[gid]['miss'] > self.keepalive:
+            if gid in alive:
+                continue
+            tr = self._tracks[gid]
+            tr['miss'] += 1
+            if rim_mode:
+                if now_s - tr.get('last_match_t', now_s) > self.rim_keepalive_s:
                     self._tracks.pop(gid, None)
+            elif tr['miss'] > self.keepalive:
+                self._tracks.pop(gid, None)
 
         # STAGE-5: render final (stage-2) tracks — only if the dbg_fit2 toggle
         # is on (it is by default). /points = the FULL raw union (every point).

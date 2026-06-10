@@ -146,8 +146,15 @@ def _make_nodes(context, *args, **kwargs):
         in ('true', '1')
     pc_params = list(common_params)
     if fusion:
+        # Per-camera rim topics: the producer defaults are SHARED names --
+        # with hand_fusion_add.launch.py running too, both cameras would
+        # interleave frames on one rim_debug topic (violent flicker) and
+        # cup_fusion_node would never see the obs (it subscribes _exo/_hand).
         pc_params.append({'role': 'producer',
-                          'world_clouds_topic': '/digital_twin/cups_exo'})
+                          'world_clouds_topic': '/digital_twin/cups_exo',
+                          'camera_name': 'exo',
+                          'cup_obs_topic': '/digital_twin/cup_obs_exo',
+                          'rim_debug_topic': '/digital_twin/rim_debug_exo'})
     point_cloud = Node(
         package='depth_digital_twin', executable='point_cloud_node',
         name='point_cloud_node', output='screen', parameters=pc_params,

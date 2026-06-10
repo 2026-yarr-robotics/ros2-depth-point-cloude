@@ -593,8 +593,14 @@ class PointCloudNode(Node):
             t0, p0 = self._last_js
             dt = t - t0
             if dt > 1e-3 and pos.shape == p0.shape and pos.size:
-                self._joints_moving = bool(
-                    np.max(np.abs(pos - p0)) / dt > self._joint_vel_thresh)
+                v = float(np.max(np.abs(pos - p0)) / dt)
+                # Schmitt trigger: velocity noise hovering AT the threshold
+                # made the flag flap, which made the fusion's drop-moving
+                # gate discard hand observations intermittently.
+                if v > self._joint_vel_thresh:
+                    self._joints_moving = True
+                elif v < 0.5 * self._joint_vel_thresh:
+                    self._joints_moving = False
         self._last_js = (t, pos)
 
     # ------------------------------------------------------------------
@@ -628,8 +634,12 @@ class PointCloudNode(Node):
             age_s = (self.get_clock().now() - stamp).nanoseconds * 1e-9
             if age_s < self._tf_defer_s:
                 # FK not in the buffer yet — requeue for the next callback.
-                if len(self._tf_pending) < 4:
+                if len(self._tf_pending) < 8:
                     self._tf_pending.append((rgb_msg, depth_msg, det_msg))
+                else:
+                    self.get_logger().warning(
+                        'TF defer queue full — dropping a frame',
+                        throttle_duration_sec=5.0)
                 return
             try:
                 tf = self.tf_buffer.lookup_transform(
@@ -702,8 +712,9 @@ class PointCloudNode(Node):
         depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
         h, w = depth.shape[:2]
         if rgb.shape[:2] != (h, w):
-            self.get_logger().warn_once(
-                f'RGB ({rgb.shape[:2]}) != depth ({h, w}); requires aligned depth')
+            self.get_logger().warning(
+                f'RGB ({rgb.shape[:2]}) != depth ({h, w}); requires aligned '
+                f'depth', once=True)
             return
 
         z = depth.astype(np.float32) * self.depth_unit
@@ -735,8 +746,15 @@ class PointCloudNode(Node):
         # pair a mask with the TF of ITS OWN frame — a moving hand camera
         # cannot defer that pairing to the window.)
         rim_obs: list = []
-        rim_dbg = {'canvas': None}      # lazily rgb.copy() on first attempt
+        # Always-on canvas: the debug stream must be a LIVE video (panel 3D
+        # pane), not a sparse one that only updates when a throttled fit
+        # fires — that read as "rim detection randomly stops".
+        rim_dbg = {'canvas': None, 'gray': None, 'fresh': set()}
+        if self.rim_debug_pub is not None and self._rim_enabled:
+            rim_dbg['canvas'] = rgb.copy()
         for obj, mb in per_object_masks:
+            if rim_dbg['canvas'] is not None:
+                self._draw_det_overlay(rim_dbg['canvas'], obj, mb)
             mb_box = self._erode_mask(mb)
             if mb_box.sum() < 32:
                 mb_box = mb
@@ -810,6 +828,14 @@ class PointCloudNode(Node):
 
             if (self.cup_obs_pub is not None
                     and class_name in self.cup_class_names):
+                # Rough top-z history per FRAME (not per fit attempt): the
+                # 97th depth percentile of a single frame jitters cm-scale
+                # and used to flip the level snap downstream — a running
+                # median over ~0.5 s stabilises the level evidence.
+                hist = track.setdefault('ztop_hist', [])
+                hist.append(float(np.percentile(obj_world[:, 2], 97.0)))
+                if len(hist) > 7:
+                    hist.pop(0)
                 ob = self._rim_observe(
                     obj, mb, oz, obj_world, R_wc, t_wc, track, class_name,
                     tid, rgb, rim_dbg, tf_stamped_ok)
@@ -821,9 +847,31 @@ class PointCloudNode(Node):
                 header=Header(stamp=rgb_msg.header.stamp,
                               frame_id=self.world_frame),
                 observations=rim_obs))
-        if rim_dbg['canvas'] is not None and self.rim_debug_pub is not None:
-            dbg_msg = self.bridge.cv2_to_imgmsg(
-                rim_dbg['canvas'], encoding='bgr8')
+        if rim_dbg['canvas'] is not None:
+            canvas = rim_dbg['canvas']
+            # Draw every track's last overlay state IDENTICALLY whether the
+            # fit ran this frame or is cached from up to 1 s ago — constant
+            # brightness/labels, no strobing at the fit-throttle cadence.
+            now_s = self.get_clock().now().nanoseconds * 1e-9
+            for tr2 in self._tracks.values():
+                ov = tr2.get('rim_overlay')
+                if ov is None or now_s - ov['t'] > 1.0:
+                    continue
+                if ov['sil'] is not None:
+                    cv2.polylines(canvas,
+                                  [np.round(ov['sil']).astype(np.int32)],
+                                  True, (255, 255, 0), 2)
+                if ov['dot'] is not None:
+                    cv2.circle(canvas, ov['dot'], 4, (0, 0, 255), -1)
+                cv2.putText(canvas, ov['label'], ov['pos'],
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                            (255, 255, 0) if ov['ok'] else (0, 0, 255), 1)
+            cv2.putText(canvas,
+                        f'rim obs {len(rim_obs)} | dets '
+                        f'{len(per_object_masks)}',
+                        (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (0, 255, 255), 2)
+            dbg_msg = self.bridge.cv2_to_imgmsg(canvas, encoding='bgr8')
             dbg_msg.header = rgb_msg.header
             self.rim_debug_pub.publish(dbg_msg)
 
@@ -857,6 +905,23 @@ class PointCloudNode(Node):
         if elapsed >= self.window_period_s:
             self._finalize_window(rgb_msg.header.stamp)
             self._window_start_stamp = now
+
+    # ------------------------------------------------------------------
+    def _draw_det_overlay(self, canvas, obj, mb) -> None:
+        """YOLO segmentation overlay (mask tint + bbox + label) for EVERY
+        detection — same look as detection_debug, so the rim stream shows
+        the raw segmentation evidence alongside the fits."""
+        sel = canvas[mb]
+        canvas[mb] = (sel.astype(np.float32) * 0.65
+                      + np.array([0.0, 0.0, 255.0]) * 0.35).astype(np.uint8)
+        x1, y1 = int(obj.x_min), int(obj.y_min)
+        cv2.rectangle(canvas, (x1, y1),
+                      (int(obj.x_max), int(obj.y_max)), (0, 255, 0), 1)
+        iid = int(getattr(obj, 'instance_id', -1))
+        tag = f'#{iid}' if iid >= 0 else '#?'
+        cv2.putText(canvas, f'{tag} {obj.class_name} {obj.score:.2f}',
+                    (x1, max(12, y1 - 4)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
 
     # ------------------------------------------------------------------
     def _rim_observe(self, obj, mb, oz, obj_world, R_wc, t_wc, track,
@@ -893,10 +958,10 @@ class PointCloudNode(Node):
         track['rim_last_t'] = now_s
 
         canvas = rim_dbg['canvas']
-        if canvas is None and self.rim_debug_pub is not None:
-            canvas = rim_dbg['canvas'] = rgb.copy()
 
-        z_top_rough = float(np.percentile(obj_world[:, 2], 97.0))
+        hist = track.get('ztop_hist') or []
+        z_top_rough = (float(np.median(hist)) if hist
+                       else float(np.percentile(obj_world[:, 2], 97.0)))
         z_base0 = z_top_rough - self.cup_h
         xy0 = (float(np.median(obj_world[:, 0])),
                float(np.median(obj_world[:, 1])))
@@ -936,10 +1001,11 @@ class PointCloudNode(Node):
                        'rms_px': snap['rms_px']}
                 edge_cov = float(snap['edge_cov'])
 
+        # Store the overlay STATE only — drawing happens uniformly for all
+        # tracks in _process_frame's publish block. Drawing fresh fits in a
+        # bright style here and cached ones dim there made the display pulse
+        # at the fit-throttle rate (the reported flicker).
         if canvas is not None:
-            cnts, _ = cv2.findContours(
-                mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-            cv2.drawContours(canvas, cnts, -1, (0, 255, 0), 1)
             tx, ty = int(obj.x_min), max(12, int(obj.y_min) - 4)
             if ok:
                 sil = cone_silhouette_px(
@@ -947,28 +1013,26 @@ class PointCloudNode(Node):
                     r_top=self.cup_top_d * 0.5, r_bot=self.cup_bot_d * 0.5,
                     height=self.cup_h, K=self.K, dist=self.intr.dist,
                     R_wc=R_wc, t_wc=t_wc)
-                if sil is not None:
-                    cv2.polylines(canvas,
-                                  [np.round(sil).astype(np.int32)],
-                                  True, (255, 255, 0), 2)
+                dot = None
                 p0c = R_wc.T @ (np.array([xy0[0], xy0[1], z_base0]) - t_wc)
                 if p0c[2] > 1e-3:
-                    u0 = int(round(self.intr.fx * p0c[0] / p0c[2]
-                                   + self.intr.cx))
-                    v0 = int(round(self.intr.fy * p0c[1] / p0c[2]
-                                   + self.intr.cy))
-                    cv2.circle(canvas, (u0, v0), 4, (0, 0, 255), -1)
-                label = (f"#{tid} iou{fit['iou']:.2f} "
-                         f"rms{fit['rms_px']:.1f} "
-                         f"b{fit.get('b_px', 0.0):+.1f} "
-                         f"cov{edge_cov:.1f} z{z_base0:+.2f}")
-                col = (255, 255, 0)
+                    dot = (int(round(self.intr.fx * p0c[0] / p0c[2]
+                                     + self.intr.cx)),
+                           int(round(self.intr.fy * p0c[1] / p0c[2]
+                                     + self.intr.cy)))
+                track['rim_overlay'] = {
+                    'ok': True, 'sil': sil, 'dot': dot,
+                    'label': (f"#{tid} iou{fit['iou']:.2f} "
+                              f"rms{fit['rms_px']:.1f} "
+                              f"b{fit.get('b_px', 0.0):+.1f} "
+                              f"cov{edge_cov:.1f} z{z_base0:+.2f}"),
+                    'pos': (tx, ty + 14), 't': now_s}
             else:
                 reason = fit.get('fail') or f"low_iou {fit.get('iou', 0):.2f}"
-                label = f'#{tid} FIT-DROP {reason}'
-                col = (0, 0, 255)
-            cv2.putText(canvas, label, (tx, ty),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
+                track['rim_overlay'] = {
+                    'ok': False, 'sil': None, 'dot': None,
+                    'label': f'#{tid} FIT-DROP {reason}',
+                    'pos': (tx, ty + 14), 't': now_s}
 
         if not ok:
             return None
