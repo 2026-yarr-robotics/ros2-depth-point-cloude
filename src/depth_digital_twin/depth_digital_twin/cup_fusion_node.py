@@ -560,18 +560,22 @@ class CupFusionNode(Node):
 
     def _accumulated_objs(self, cam, now):
         """Union one camera's detection-objs over the last `accum_window` of
-        frames (temporal frame accumulation, A). window<=0 → latest cloud only.
-        _premerge then clusters the SAME cup across frames → _merge unions their
-        points → a denser cloud whose fit averages out per-frame depth noise."""
+        frames (temporal frame accumulation, A). _premerge then clusters the SAME
+        cup across frames → _merge unions their points → a denser cloud whose fit
+        averages out per-frame depth noise. FALLBACK: if no frame falls inside
+        the window (a slow producer whose cloud INTERVAL > accum_window — which
+        made the slower camera vanish every event and flicker /points), use the
+        latest cloud (the caller already gated it by max_age)."""
         hist = self._cloud_hist[cam]
-        if self.accum_window <= 0.0 or not hist:
-            msg, _ = self._latest[cam]
-            return self._build_cam_objs(cam, msg) if msg is not None else []
-        objs = []
-        for recv_t, msg in hist:
-            if (now - recv_t).nanoseconds * 1e-9 <= self.accum_window:
-                objs.extend(self._build_cam_objs(cam, msg))
-        return objs
+        if self.accum_window > 0.0 and hist:
+            objs = []
+            for recv_t, msg in hist:
+                if (now - recv_t).nanoseconds * 1e-9 <= self.accum_window:
+                    objs.extend(self._build_cam_objs(cam, msg))
+            if objs:
+                return objs
+        msg, _ = self._latest[cam]      # fallback: latest cloud (within max_age)
+        return self._build_cam_objs(cam, msg) if msg is not None else []
 
     def _merge(self, members: list[dict]) -> np.ndarray:
         """View-weighted, density-equalised merge of a cluster's points.

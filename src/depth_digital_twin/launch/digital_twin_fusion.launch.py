@@ -205,6 +205,13 @@ def _setup(context, *_, **__):
     # Cup model lives under point_cloud_node: — pass the geometry to
     # cup_fusion_node so the fused fit/frustum use the SAME Speed Stack cup.
     pn = (_y.get('point_cloud_node') or {}).get('ros__parameters') or {}
+    # The params.yaml `point_cloud_node:` section does NOT match the RENAMED
+    # producer nodes (point_cloud_node_exo/_hand), so its window_period_s=0.1
+    # (and approx_sync_slop / depth filters) were silently ignored → producers
+    # ran at the 0.5s code default (~1.5 Hz), which flickered /points. Pass `pn`
+    # explicitly, positioned BEFORE the tuning snapshot so per-camera panel
+    # tuning (point_cloud_node_exo/_hand sections) still wins.
+    prod_base = [params, pn, *base_params[1:]]
     cup_geom = {k: pn[k] for k in (
         'cup_top_diameter_m', 'cup_bottom_diameter_m', 'cup_height_m',
         'cup_fit_residual_max', 'cup_polygon_segments', 'cup_class_names',
@@ -306,7 +313,7 @@ def _setup(context, *_, **__):
     pc_exo = Node(
         package='depth_digital_twin', executable='point_cloud_node',
         name='point_cloud_node_exo', output='screen',
-        parameters=common_exo + [{
+        parameters=prod_base + [{'intrinsics_path': intr_exo}, {
             'rgb_topic': '/camera_exo/color/image_raw',
             'depth_topic': '/camera_exo/aligned_depth_to_color/image_raw',
             'detections_topic': '/digital_twin/detections_exo',
@@ -329,7 +336,7 @@ def _setup(context, *_, **__):
     pc_hand = Node(
         package='depth_digital_twin', executable='point_cloud_node',
         name='point_cloud_node_hand', output='screen',
-        parameters=common_hand + [{
+        parameters=prod_base + [{'intrinsics_path': intr_hand}, {
             'rgb_topic': '/camera_hand/color/image_raw',
             'depth_topic': '/camera_hand/aligned_depth_to_color/image_raw',
             'detections_topic': '/digital_twin/detections_hand',
