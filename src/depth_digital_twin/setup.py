@@ -30,6 +30,7 @@ setup(
             'world_origin_node = depth_digital_twin.world_origin_node:main',
             'world_origin_control = depth_digital_twin.world_origin_control:main',
             'detection_node = depth_digital_twin.detection_node:main',
+            'cup_dedup_node = depth_digital_twin.cup_dedup_node:main',
             'point_cloud_node = depth_digital_twin.point_cloud_node:main',
             'cup_fusion_node = depth_digital_twin.cup_fusion_node:main',
             'digital_twin_panel = depth_digital_twin.digital_twin_panel:main',

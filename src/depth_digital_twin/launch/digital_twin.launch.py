@@ -94,25 +94,71 @@ def _make_nodes(context, *args, **kwargs):
         package='depth_digital_twin', executable='world_origin_node',
         name='world_origin_node', output='screen', parameters=common_params,
         remappings=cam_remaps)
+    # Insert cup_dedup_node between detection and point_cloud: detection_node
+    # publishes the RAW array on /digital_twin/detections_raw, the dedup node
+    # collapses same-cup duplicate boxes (default NMS iou=0.7 + ByteTrack lets
+    # one far cup survive as two ids) and republishes on /digital_twin/detections
+    # — the topic point_cloud_node already subscribes to (no PC change needed).
+    detection_remaps = cam_remaps + [
+        ('/digital_twin/detections', '/digital_twin/detections_raw')]
     detection = Node(
         package='depth_digital_twin', executable='detection_node',
         name='detection_node', output='screen', parameters=detection_params,
-        remappings=cam_remaps)
+        remappings=detection_remaps)
+    cup_dedup = Node(
+        package='depth_digital_twin', executable='cup_dedup_node',
+        name='cup_dedup_node', output='screen', parameters=[params,
+            {'detections_in': '/digital_twin/detections_raw',
+             'detections_out': '/digital_twin/detections'}])
+    # Fusion (exo-only): point_cloud runs as a producer feeding cup_fusion_node,
+    # which owns /digital_twin/boxes + /vision/cups_on_table. Default false keeps
+    # the standalone single-camera behaviour (rollback baseline) unchanged.
+    fusion = LaunchConfiguration('fusion').perform(context).strip().lower() \
+        in ('true', '1')
+    pc_params = list(common_params)
+    if fusion:
+        pc_params.append({'role': 'producer',
+                          'world_clouds_topic': '/digital_twin/cups_exo'})
     point_cloud = Node(
         package='depth_digital_twin', executable='point_cloud_node',
-        name='point_cloud_node', output='screen', parameters=common_params,
+        name='point_cloud_node', output='screen', parameters=pc_params,
         remappings=cam_remaps)
+    cup_fusion = Node(
+        package='depth_digital_twin', executable='cup_fusion_node',
+        name='cup_fusion_node', output='screen', parameters=[params],
+        condition=IfCondition(LaunchConfiguration('fusion')))
     rviz = Node(
         package='rviz2', executable='rviz2', name='rviz2',
         arguments=['-d', rviz_cfg],
         condition=IfCondition(LaunchConfiguration('rviz')),
         output='screen')
-    control_panel = Node(
-        package='depth_digital_twin', executable='world_origin_control',
-        name='world_origin_control', output='screen',
-        condition=IfCondition(LaunchConfiguration('control_panel')))
+    if fusion:
+        # Integrated dual-cam panel (exo+hand RGB/Depth/3D + ArUco redetect),
+        # remapped to this setup's live topics/service. Replaces the old
+        # per-node world_origin_control popup.
+        control_panel = Node(
+            package='depth_digital_twin', executable='digital_twin_panel',
+            name='digital_twin_panel', output='screen',
+            parameters=[{
+                'exo_color_topic': '/exo/exo/color/image_raw',
+                'exo_depth_topic': '/exo/exo/aligned_depth_to_color/image_raw',
+                'exo_debug_topic': '/digital_twin/detection_debug',
+                'hand_color_topic': '/hand/hand/color/image_raw',
+                'hand_depth_topic':
+                    '/hand/hand/aligned_depth_to_color/image_raw',
+                'hand_debug_topic': '/digital_twin/detection_debug_hand',
+                'exo_redetect_srv': '/world_origin_node/redetect',
+                'hand_redetect_srv': '/world_origin_node/redetect',
+            }],
+            condition=IfCondition(LaunchConfiguration('control_panel')))
+    else:
+        control_panel = Node(
+            package='depth_digital_twin', executable='world_origin_control',
+            name='world_origin_control', output='screen',
+            condition=IfCondition(LaunchConfiguration('control_panel')))
 
-    return [world_origin, detection, point_cloud, rviz, control_panel]
+    return [world_origin, detection, cup_dedup, point_cloud, cup_fusion, rviz,
+            control_panel]
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -145,5 +191,10 @@ def generate_launch_description() -> LaunchDescription:
             description='RealSense camera namespace. '
                         '"camera" = rs_align_depth_launch.py default (/camera/camera/...). '
                         '"exo" = cameras_only.launch.py view:=exo (/exo/exo/...).'),
+        DeclareLaunchArgument(
+            'fusion', default_value='false',
+            description='exo-only fusion: point_cloud as producer + '
+                        'cup_fusion_node owns /digital_twin/boxes + '
+                        '/vision/cups_on_table (default false = standalone)'),
         OpaqueFunction(function=_make_nodes),
     ])
