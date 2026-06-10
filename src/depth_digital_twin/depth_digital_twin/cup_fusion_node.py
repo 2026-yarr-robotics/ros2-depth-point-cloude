@@ -37,7 +37,10 @@ from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker, MarkerArray
 from scipy.spatial import cKDTree
 
-from depth_digital_twin_msgs.msg import WorldObjectCloudArray
+from depth_digital_twin_msgs.msg import (CupObservationArray,
+                                         WorldObjectCloudArray)
+from depth_digital_twin.cup_geometry import (fuse_xy, slide_xy_to_z,
+                                             snap_level, xy_cov_from_px)
 
 # Single source of truth for the estimation maths — reuse the pure helpers from
 # point_cloud_node rather than duplicating them. (A later refactor may move
@@ -307,6 +310,48 @@ class CupFusionNode(Node):
         gp('scan_fit_voxel_m', 0.004)        # consolidation voxel (bound growth)
         gp('scan_max_points_per_cup', 6000)
 
+        # ── Measurement source for the LIVE pipeline ─────────────────────────
+        # rim   (default): upright cups are measured from the producers'
+        #         silhouette observations (mask contour + calibration; depth
+        #         only classifies the level). The noisy point-cloud cone-fit
+        #         path is bypassed for upright cups; clouds remain in use for
+        #         fallen cups (OBB needs 3D points) and for /points display.
+        # cloud : legacy full point-cloud path (rollback switch).
+        gp('fit_source', 'rim')
+        # Drop hand observations captured while the arm moves (image↔FK sync
+        # error lands directly in the measurement; the KF coasts instead).
+        gp('rim_drop_moving', True)
+
+        # ── Rim/silhouette observation path (Phase 1: PARALLEL instrumentation)
+        # Consumes the producers' CupObservationArray (mask-silhouette chamfer
+        # fits — see cup_geometry.py), snaps z to the nesting lattice, fuses
+        # cameras by inverse covariance, and publishes a SEPARATE debug box
+        # set + health JSON + optional CSV for A/B comparison against the
+        # cloud path. Never touches /digital_twin/boxes or the KF tracks.
+        gp('rim_enabled', True)
+        gp('exo_obs_topic', '/digital_twin/cup_obs_exo')
+        gp('hand_obs_topic', '/digital_twin/cup_obs_hand')
+        gp('rim_boxes_dbg_topic', '/digital_twin/boxes_rim_dbg')
+        gp('fusion_health_topic', '/digital_twin/fusion_health')
+        gp('table_z_m', 0.0)           # table surface in world (= robot base) z
+        # Height ONE nested cup adds to a column (measure: stack 2, subtract).
+        gp('nesting_offset_m', 0.020)
+        # Pyramid slot lattice (MUST mirror the FastAPI server's
+        # PYRAMID_LAYER_HEIGHT). A stacked cup's base sits on k*layer, not
+        # k*nest — snapping picks whichever lattice fits the rough z better.
+        # A wrong z slides the estimate along the view ray: at the exo
+        # elevation (~20°) a 7 mm z error becomes ~19 mm in XY.
+        gp('rim_layer_height_m', 0.093)
+        gp('rim_obs_max_age_s', 3.0)   # forget observations older than this
+        #                                (hand publishes slower than exo —
+        #                                 1.0s aged its obs out between ticks)
+        gp('rim_cluster_xy_m', 0.05)   # cross-camera same-cup XY gate
+        gp('rim_cluster_z_m', 0.04)    # z gate (must be < layer spacing 0.093
+        #                                so pyramid layers stay separate)
+        gp('rim_min_iou', 0.5)         # consumer-side quality gates
+        gp('rim_max_rms_px', 6.0)
+        gp('rim_log_dir', '')          # non-empty → append A/B CSV rows there
+
         def P(n):
             return self.get_parameter(n).value
 
@@ -479,6 +524,40 @@ class CupFusionNode(Node):
             MarkerArray, str(P('dbg_premerge_topic')), latched)
         self.dbg_fit1_pub = self.create_publisher(
             MarkerArray, str(P('dbg_fit1_topic')), latched)
+        # ── Rim observation path: state + subs/pubs ─────────────────────────
+        self.fit_source = str(P('fit_source')).strip().lower()
+        self.rim_drop_moving = bool(P('rim_drop_moving'))
+        self._rim_fresh = False        # new obs since last live tick
+        self.rim_enabled = bool(P('rim_enabled'))
+        self.table_z = float(P('table_z_m'))
+        self.nest_off = float(P('nesting_offset_m'))
+        self.rim_layer_h = float(P('rim_layer_height_m'))
+        self.rim_obs_max_age = float(P('rim_obs_max_age_s'))
+        self.rim_cluster_xy = float(P('rim_cluster_xy_m'))
+        self.rim_cluster_z = float(P('rim_cluster_z_m'))
+        self.rim_min_iou = float(P('rim_min_iou'))
+        self.rim_max_rms = float(P('rim_max_rms_px'))
+        self.rim_log_dir = str(P('rim_log_dir'))
+        self._rim_latest: dict[tuple, tuple] = {}   # (cam, iid) → (obs, t_s)
+        self._rim_csv = None                        # lazy-opened file handle
+        self.rim_dbg_pub = None
+        self.health_pub = None
+        if self.rim_enabled:
+            self.create_subscription(
+                CupObservationArray, str(P('exo_obs_topic')),
+                lambda m: self._on_cup_obs(m, 'exo'), 10)
+            self.create_subscription(
+                CupObservationArray, str(P('hand_obs_topic')),
+                lambda m: self._on_cup_obs(m, 'hand'), 10)
+            self.rim_dbg_pub = self.create_publisher(
+                MarkerArray, str(P('rim_boxes_dbg_topic')), latched)
+            self.health_pub = self.create_publisher(
+                String, str(P('fusion_health_topic')), 10)
+            self.get_logger().info(
+                f"rim path ON: obs={P('exo_obs_topic')},{P('hand_obs_topic')} "
+                f"→ {P('rim_boxes_dbg_topic')} + {P('fusion_health_topic')}"
+                + (f' + CSV {self.rim_log_dir}' if self.rim_log_dir else ''))
+
         # Debug markers age out via lifetime instead of a per-event DELETEALL,
         # so a 1-2 event detection dropout doesn't blink the overlay in RViz.
         # 4 measurement events of slack; refreshed well before expiry.
@@ -543,6 +622,19 @@ class CupFusionNode(Node):
             'scan_max_cup_footprint_m': ('scan_max_cup_footprint', float),
             'scan_fit_voxel_m': ('scan_fit_voxel', float),
             'scan_max_points_per_cup': ('scan_max_points', int),
+            # rim path live-tunables
+            'rim_enabled': ('rim_enabled', bool),
+            'table_z_m': ('table_z', float),
+            'nesting_offset_m': ('nest_off', float),
+            'rim_layer_height_m': ('rim_layer_h', float),
+            'rim_obs_max_age_s': ('rim_obs_max_age', float),
+            'rim_cluster_xy_m': ('rim_cluster_xy', float),
+            'rim_cluster_z_m': ('rim_cluster_z', float),
+            'rim_min_iou': ('rim_min_iou', float),
+            'rim_max_rms_px': ('rim_max_rms', float),
+            'rim_log_dir': ('rim_log_dir', str),
+            'fit_source': ('fit_source', str),
+            'rim_drop_moving': ('rim_drop_moving', bool),
         }
         self.add_on_set_parameters_callback(self._on_set_params)
         self.get_logger().info(
@@ -1177,6 +1269,228 @@ class CupFusionNode(Node):
         self.get_logger().info('scan-lock CLEARED — back to live detection')
 
     # ================= tick dispatcher + live pipeline ==================
+    # ── Rim/silhouette observation path (Phase 1: parallel A/B) ───────────
+    def _on_cup_obs(self, msg: CupObservationArray, cam: str) -> None:
+        now_s = self.get_clock().now().nanoseconds * 1e-9
+        for ob in msg.observations:
+            self._rim_latest[(cam, int(ob.instance_id))] = (ob, now_s)
+        if msg.observations:
+            self._rim_fresh = True
+
+    def _rim_collect(self) -> list:
+        """Quality-gated, age-pruned snapshot of the cached observations —
+        shared by the live rim estimator and the debug tick."""
+        now_s = self.get_clock().now().nanoseconds * 1e-9
+        for k in [k for k, (_, t) in self._rim_latest.items()
+                  if now_s - t > self.rim_obs_max_age]:
+            del self._rim_latest[k]
+        return [ob for ob, _ in self._rim_latest.values()
+                if ob.mask_iou >= self.rim_min_iou
+                and ob.chamfer_rms_px <= self.rim_max_rms
+                and not (self.rim_drop_moving and ob.moving)]
+
+    def _rim_tick(self, stamp) -> None:
+        """Fuse the cached silhouette observations into per-cup estimates and
+        publish debug markers + health JSON (+ optional CSV). Read-only with
+        respect to the cloud pipeline."""
+        now_s = self.get_clock().now().nanoseconds * 1e-9
+        ests = self._rim_estimates(self._rim_collect())
+        self._publish_rim_markers(ests, stamp)
+        self._publish_fusion_health(ests, stamp)
+        if self.rim_log_dir:
+            self._rim_log(ests, now_s)
+
+    def _rim_estimates(self, obs: list) -> list[dict]:
+        """Cluster observations across cameras (XY), snap each cluster's base
+        to the nesting lattice, slide each camera's (x, y) along its view ray
+        to the snapped level, then fuse by inverse covariance. The per-camera
+        residuals are the cross-view consistency signal (extrinsic health)."""
+        if not obs:
+            return []
+        # 3D ellipsoidal clustering: XY and Z gated separately. XY-only
+        # collapsed a pyramid — cups on adjacent layers sit at HALF the cup
+        # spacing in XY (0.039 < 0.05 gate) and only differ in z.
+        xy_g = max(self.rim_cluster_xy, 1e-6)
+        z_g = max(self.rim_cluster_z, 1e-6)
+        scaled = [np.array([o.x0 / xy_g, o.y0 / xy_g,
+                            o.z_top_rough_m / z_g]) for o in obs]
+        ests = []
+        for grp in _cluster_indices(scaled, 1.0):
+            members = [obs[i] for i in grp]
+            by_cam: dict[str, object] = {}
+            for o in members:           # best (highest-IoU) obs per camera
+                cur = by_cam.get(o.camera)
+                if cur is None or o.mask_iou > cur.mask_iou:
+                    by_cam[o.camera] = o
+            z_top = float(np.median(
+                [o.z_top_rough_m for o in by_cam.values()]))
+            # Snap to whichever lattice (nested column vs pyramid slot)
+            # explains the rough z better.
+            k, z_base, lvl_err = snap_level(
+                z_top, table_z=self.table_z, cup_h=self.cup_h,
+                nest_off=self.nest_off)
+            kl, zl, el = snap_level(
+                z_top, table_z=self.table_z, cup_h=self.cup_h,
+                nest_off=self.rim_layer_h)
+            if abs(el) < abs(lvl_err):
+                k, z_base, lvl_err = kl, zl, el
+            meas, used = [], []
+            for o in by_cam.values():
+                d = np.array([o.ray_dir.x, o.ray_dir.y, o.ray_dir.z])
+                slid = slide_xy_to_z(o.x0, o.y0, o.z_base0, d, z_base)
+                if slid is None:
+                    continue
+                org = np.array([o.ray_origin.x, o.ray_origin.y,
+                                o.ray_origin.z])
+                rng = float(np.linalg.norm(
+                    np.array([slid[0], slid[1], z_base]) - org))
+                cov = xy_cov_from_px(
+                    o.sigma_px, rng, float(o.focal_px) or 600.0, d)
+                meas.append((np.asarray(slid), cov))
+                used.append(o)
+            fused = fuse_xy(meas)
+            if fused is None:
+                continue
+            xy_f, cov_f, resid = fused
+            ests.append({
+                'x': float(xy_f[0]), 'y': float(xy_f[1]),
+                'z_base': float(z_base), 'level': int(k),
+                'level_err_mm': round(1e3 * float(lvl_err), 1),
+                'sigma_mm': round(
+                    1e3 * float(np.sqrt(np.max(np.linalg.eigvalsh(cov_f)))), 1),
+                'cov': cov_f,
+                'cams': {o.camera: {
+                    'resid_mm': round(1e3 * float(np.linalg.norm(r)), 1),
+                    'iou': round(float(o.mask_iou), 3),
+                    'rms_px': round(float(o.chamfer_rms_px), 2),
+                    'score': float(o.score),
+                    'color': str(o.color),
+                    'moving': bool(o.moving)}
+                    for o, r in zip(used, resid)},
+            })
+        return ests
+
+    def _rim_final_fits(self) -> list[dict]:
+        """LIVE measurement set from the silhouette observations, shaped like
+        the cloud path's `final_fits` so STAGE-3/4/5 (association, KF, color,
+        markers, cups_on_table) run unchanged. Per-cup measurement noise comes
+        from the fused covariance instead of the fixed kf_meas_* params."""
+        fits = []
+        for e in self._rim_estimates(self._rim_collect()):
+            center = np.array([e['x'], e['y'],
+                               e['z_base'] + 0.5 * self.cup_h])
+            frustum = _cup_frustum_geometry(
+                e['x'], e['y'], top_d=self.cup_top_d, bot_d=self.cup_bot_d,
+                height=self.cup_h, floor_z=e['z_base'], n_seg=self.cup_n_seg)
+            members = [{
+                'cam': cam,
+                'class_name': 'upright-cup',
+                'score': c['score'],
+                'rgb': np.zeros(0, np.float32),   # color via color_name
+                'color_name': c['color'] or None,
+            } for cam, c in e['cams'].items()]
+            cov = np.asarray(e['cov'])
+            r_diag = np.array([
+                max(cov[0, 0], 1e-6), max(cov[1, 1], 1e-6),
+                # snapped z: trust it well below the level spacing
+                (0.25 * max(self.nest_off, 1e-3)) ** 2])
+            fits.append({
+                'center': center, 'R': np.eye(3),
+                'size': np.array([self.cup_bot_d, self.cup_bot_d,
+                                  self.cup_h]),
+                'kind': 'cup', 'frustum': frustum,
+                'residual': 1e-3 * e['sigma_mm'],
+                'members': members, 'r_diag': r_diag,
+            })
+        return fits
+
+    def _publish_rim_markers(self, ests: list[dict], stamp) -> None:
+        arr = MarkerArray()
+        for i, e in enumerate(ests):
+            fr = _cup_frustum_geometry(
+                e['x'], e['y'], top_d=self.cup_top_d, bot_d=self.cup_bot_d,
+                height=self.cup_h, floor_z=e['z_base'], n_seg=self.cup_n_seg)
+            m = Marker()
+            m.header = Header(stamp=stamp, frame_id=self.world_frame)
+            m.ns = 'rim_dbg'
+            m.id = i
+            m.type = Marker.LINE_LIST
+            m.action = Marker.ADD
+            m.scale = Vector3(x=0.002, y=0.0, z=0.0)
+            m.color = ColorRGBA(r=0.0, g=0.95, b=0.95, a=0.9)
+            m.lifetime = self._dbg_lifetime
+            pts = []
+            for loop in (fr['top_loop'], fr['bot_loop']):
+                for a, b in zip(loop[:-1], loop[1:]):
+                    pts.extend((a, b))
+            for a, b in fr['generatrix']:
+                pts.extend((a, b))
+            m.points = [MsgPoint(x=float(p[0]), y=float(p[1]), z=float(p[2]))
+                        for p in pts]
+            arr.markers.append(m)
+
+            t = Marker()
+            t.header = m.header
+            t.ns = 'rim_dbg_txt'
+            t.id = i
+            t.type = Marker.TEXT_VIEW_FACING
+            t.action = Marker.ADD
+            t.pose.position = MsgPoint(
+                x=e['x'], y=e['y'], z=e['z_base'] + self.cup_h + 0.04)
+            t.scale = Vector3(x=0.0, y=0.0, z=0.02)
+            t.color = ColorRGBA(r=0.0, g=0.95, b=0.95, a=0.9)
+            t.lifetime = self._dbg_lifetime
+            cams = '+'.join(sorted(e['cams']))
+            t.text = (f"R{i} L{e['level']} ±{e['sigma_mm']:.0f}mm "
+                      f"[{cams}]")
+            arr.markers.append(t)
+        if arr.markers:
+            self.rim_dbg_pub.publish(arr)
+
+    def _publish_fusion_health(self, ests: list[dict], stamp) -> None:
+        # 'cov' is a numpy array (KF consumption) — not JSON-serializable.
+        cups = [{k: v for k, v in e.items() if k != 'cov'} for e in ests]
+        self.health_pub.publish(String(data=json.dumps({
+            't': float(stamp.sec) + float(stamp.nanosec) * 1e-9,
+            'n_obs_cached': len(self._rim_latest),
+            'cups': cups,
+        })))
+
+    def _rim_log(self, ests: list[dict], now_s: float) -> None:
+        """A/B CSV: one `rim` row per rim estimate and one `cloud` row per
+        live KF track, same timestamp — offline analysis aligns them by t."""
+        if getattr(self, '_rim_csv_dir', None) != self.rim_log_dir:
+            # rim_log_dir changed live (ros2 param set) → reopen in new dir.
+            if self._rim_csv is not None:
+                self._rim_csv.close()
+                self._rim_csv = None
+            self._rim_csv_dir = self.rim_log_dir
+        if self._rim_csv is None:
+            import os
+            from pathlib import Path
+            d = Path(self.rim_log_dir).expanduser()
+            d.mkdir(parents=True, exist_ok=True)
+            path = d / f'rim_ab_{os.getpid()}.csv'
+            self._rim_csv = path.open('a', buffering=1)
+            if path.stat().st_size == 0:
+                self._rim_csv.write(
+                    't,src,idx,x,y,z,ncams,resid_max_mm,sigma_mm,level\n')
+            self.get_logger().info(f'rim A/B CSV → {path}')
+        for i, e in enumerate(ests):
+            rmax = max((c['resid_mm'] for c in e['cams'].values()),
+                       default=0.0)
+            self._rim_csv.write(
+                f"{now_s:.3f},rim,{i},{e['x']:.4f},{e['y']:.4f},"
+                f"{e['z_base']:.4f},{len(e['cams'])},{rmax:.1f},"
+                f"{e['sigma_mm']:.1f},{e['level']}\n")
+        for gid, tr in self._tracks.items():
+            kf = tr.get('kf')
+            if kf is None:
+                continue
+            self._rim_csv.write(
+                f"{now_s:.3f},cloud,{gid},{kf.x[0]:.4f},{kf.x[1]:.4f},"
+                f"{kf.x[2]:.4f},0,0.0,{1e3 * kf.position_std():.1f},-1\n")
+
     def _tick(self) -> None:
         """Dispatcher: live KF pipeline (OFF, or ACTIVE before the first lock)
         vs scan-lock (advance FSM, bypass live KF once a lock exists). All scan
@@ -1187,6 +1501,15 @@ class CupFusionNode(Node):
         if self._pending_clear:                 # priority 1: deferred clear
             self._do_clear(stamp)
             self._pending_clear = False
+
+        # Rim/silhouette estimator — strictly parallel instrumentation; an
+        # exception here must never take down the cloud pipeline.
+        if self.rim_enabled and self.rim_dbg_pub is not None:
+            try:
+                self._rim_tick(stamp)
+            except Exception as e:
+                self.get_logger().warn(
+                    f'rim estimator error: {e}', throttle_duration_sec=5.0)
 
         # "In a session" = a lock exists, points are accumulated, or a visit is
         # in flight. While in a session, unchecking only PAUSES (keeps accum +
@@ -1255,8 +1578,16 @@ class CupFusionNode(Node):
             Header(stamp=stamp, frame_id=self.world_frame), xyz, rgb))
 
     def _tick_live(self) -> None:
+        rim_mode = self.fit_source == 'rim'
         objs = self._gather()
-        if objs is None:
+        if rim_mode:
+            # Measurement event = fresh silhouette obs OR fresh clouds
+            # (clouds still serve fallen cups + the /points display).
+            if objs is None and not self._rim_fresh:
+                return
+            self._rim_fresh = False
+            objs = objs or []
+        elif objs is None:
             # Not a fresh measurement event → don't touch the markers; the last
             # published set persists in RViz. (No flicker between measurements.)
             return
@@ -1268,10 +1599,16 @@ class CupFusionNode(Node):
             tr['settled'] = tr['kf'].position_std() <= self.kf_settled_std
 
         # STAGE-1: merge duplicate detections of the same cup → fit each group.
-        premerge_groups = self._premerge(objs)
+        # rim mode: upright cups are measured from silhouette observations
+        # (no cone fit on noisy depth); the cloud path below only handles
+        # what rim cannot — fallen cups, whose OBB needs 3D points.
+        cloud_objs = ([o for o in objs
+                       if o['class_name'] not in self.cup_class_names]
+                      if rim_mode else objs)
+        premerge_groups = self._premerge(cloud_objs)
         fits = []
         for grp in premerge_groups:
-            members = [objs[i] for i in grp]
+            members = [cloud_objs[i] for i in grp]
             meas = self._fit(self._merge(members), members)
             if meas is not None:
                 c, R, size, kind, frustum, residual = meas
@@ -1302,6 +1639,9 @@ class CupFusionNode(Node):
                                'frustum': frustum, 'residual': residual,
                                'members': members})
 
+        if rim_mode:
+            final_fits = self._rim_final_fits() + final_fits
+
         # STAGE-3: 3D-ellipsoidal association + KF + hit count.
         alive: set[int] = set()
         for f in final_fits:
@@ -1313,7 +1653,8 @@ class CupFusionNode(Node):
                       'settled': False, 'cams': set()}
                 self._tracks[gid] = tr
             else:
-                tr['kf'].update(f['center'], self.r_diag, self.kf_gate)
+                tr['kf'].update(f['center'],
+                                f.get('r_diag', self.r_diag), self.kf_gate)
                 tr['hits'] += 1
             tr['cams'] = {m['cam'] for m in f['members']}
             tr['miss'] = 0
@@ -1326,8 +1667,16 @@ class CupFusionNode(Node):
             for k in votes:
                 votes[k] *= self._color_vote_decay
             by_cam: dict = {}
+            named: dict = {}      # rim members carry the color by NAME
             for m in f['members']:
-                by_cam.setdefault(m['cam'], []).append(m['rgb'])
+                if m.get('color_name'):
+                    named.setdefault(m['cam'], m['color_name'])
+                else:
+                    by_cam.setdefault(m['cam'], []).append(m['rgb'])
+            for cam, col in named.items():
+                if col in self._cup_colors:
+                    votes[col] = votes.get(col, 0.0) \
+                        + self._color_w.get(cam, 1.0)
             for cam, rgbs in by_cam.items():
                 packed = np.concatenate(rgbs) if rgbs else None
                 if packed is None or len(packed) < self._color_min_points:
