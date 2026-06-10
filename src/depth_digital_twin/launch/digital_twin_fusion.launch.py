@@ -91,6 +91,9 @@ _NS_REMAP_NAMES = (
     '/digital_twin/detections_exo', '/digital_twin/detection_debug_exo',
     '/digital_twin/detections_hand', '/digital_twin/detection_debug_hand',
     '/digital_twin/cups_exo', '/digital_twin/cups_hand',
+    '/digital_twin/cup_obs_exo', '/digital_twin/cup_obs_hand',
+    '/digital_twin/rim_debug_exo', '/digital_twin/rim_debug_hand',
+    '/digital_twin/boxes_rim_dbg', '/digital_twin/fusion_health',
     '/digital_twin/points', '/digital_twin/boxes',
     '/world_origin_node_exo/redetect', '/world_origin_node_hand/redetect',
     '/cup_fusion_node/clear_scan', '/cup_fusion_node/set_parameters',
@@ -322,6 +325,12 @@ def _setup(context, *_, **__):
             'role': 'producer',
             'camera_name': 'exo',
             'world_clouds_topic': '/digital_twin/cups_exo',
+            'cup_obs_topic': '/digital_twin/cup_obs_exo',
+            'rim_debug_topic': '/digital_twin/rim_debug_exo',
+            # rim is the upright measurement (cup_fusion fit_source=rim);
+            # skip building the noisy upright clouds entirely. Fallen-cup
+            # clouds (OBB path) are still produced.
+            'upright_clouds': False,
         }])
     det_hand = Node(
         package='depth_digital_twin', executable='detection_node',
@@ -345,6 +354,9 @@ def _setup(context, *_, **__):
             'role': 'producer',
             'camera_name': 'hand',
             'world_clouds_topic': '/digital_twin/cups_hand',
+            'cup_obs_topic': '/digital_twin/cup_obs_hand',
+            'rim_debug_topic': '/digital_twin/rim_debug_hand',
+            'upright_clouds': False,
             'hand_motion_gating': True,
             'joint_states_topic': '/joint_states',
             'aruco_overlay': False,
@@ -357,6 +369,8 @@ def _setup(context, *_, **__):
         parameters=[*base_params, dict({
             'exo_clouds_topic': '/digital_twin/cups_exo',
             'hand_clouds_topic': '/digital_twin/cups_hand',
+            'exo_obs_topic': '/digital_twin/cup_obs_exo',
+            'hand_obs_topic': '/digital_twin/cup_obs_hand',
             'boxes_topic': '/digital_twin/boxes',
             'points_topic': '/digital_twin/points',
             'world_frame': 'world',
@@ -374,10 +388,14 @@ def _setup(context, *_, **__):
             # /hand/hand split-launch topology).
             'exo_color_topic': '/camera_exo/color/image_raw',
             'exo_depth_topic': '/camera_exo/aligned_depth_to_color/image_raw',
-            'exo_debug_topic': '/digital_twin/detection_debug_exo',
+            # 3D pane = the rim-fit overlay (observed contour green, fitted
+            # silhouette cyan, depth init red, per-cup iou/rms/b/cov text) —
+            # the actual live measurement. Raw YOLO boxes remain on
+            # /digital_twin/detection_debug_* if needed.
+            'exo_debug_topic': '/digital_twin/rim_debug_exo',
             'hand_color_topic': '/camera_hand/color/image_raw',
             'hand_depth_topic': '/camera_hand/aligned_depth_to_color/image_raw',
-            'hand_debug_topic': '/digital_twin/detection_debug_hand',
+            'hand_debug_topic': '/digital_twin/rim_debug_hand',
             'exo_redetect_srv': '/world_origin_node_exo/redetect',
             'hand_redetect_srv': '/world_origin_node_hand/redetect',
         }])

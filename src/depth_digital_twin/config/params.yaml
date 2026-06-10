@@ -114,6 +114,20 @@ point_cloud_node:
     #   "fallen-cup"   → OBB fallback (intentionally absent)
     cup_class_names: ["upright-cup"]
 
+    # ----- Rim/silhouette observations (depth-light measurement path) -----
+    # Per-cup 2D silhouette chamfer fit (cup_geometry.fit_silhouette_xy):
+    # mask contour + calibration constrain the axis (x,y) far better than the
+    # depth cloud. Published on CupObservationArray ALONGSIDE the cloud path
+    # (Phase 1 A/B; /digital_twin/boxes is unchanged).
+    rim_obs_enabled: true
+    rim_fit_period_s: 0.3        # min seconds between fits per track (~6ms/fit)
+    rim_sigma_px: 2.0            # assumed contour 1σ (×3 moving, ×2 truncated)
+    rim_min_iou: 0.2             # producer-side sanity gate (consumer: 0.5)
+    rim_boundary_offset: true    # 3rd fit param b: uniform YOLO boundary bias
+    #                              (px) absorbed instead of leaking into (x,y)
+    rim_edge_snap: true          # re-anchor boundary to image-gradient peaks
+    rim_edge_min_grad: 8.0       # min Sobel magnitude to accept an edge
+
     # ----- Accumulating-window pipeline -----
     window_period_s: 0.1
 
@@ -169,6 +183,32 @@ point_cloud_node:
 
 cup_fusion_node:
   ros__parameters:
+    # ── LIVE measurement source ──────────────────────────────────────────
+    # rim (default): upright cups from silhouette observations (mask contour
+    # + calibration; depth only picks the level). cloud = legacy point-cloud
+    # cone fit (rollback). Fallen cups always use the cloud OBB.
+    fit_source: rim
+    rim_drop_moving: true        # discard hand obs captured mid-motion
+    #                              (image-FK desync lands in the measurement)
+
+    # ── Rim/silhouette observation path (Phase 1: parallel A/B) ──────────
+    # Consumes the producers' silhouette fits, snaps z to the nesting
+    # lattice, fuses cameras by inverse covariance and publishes
+    # /digital_twin/boxes_rim_dbg (cyan frustums) + /digital_twin/fusion_health
+    # (JSON incl. per-camera residuals = extrinsic health). The cloud path and
+    # /digital_twin/boxes are untouched.
+    rim_enabled: true
+    table_z_m: 0.0               # table surface in world (= robot base) z
+    nesting_offset_m: 0.020      # height ONE nested cup adds to a column —
+    #                              MEASURE: stack 2 cups, total − cup_height_m
+    rim_layer_height_m: 0.093    # pyramid slot lattice — MUST mirror the
+    #                              server's PYRAMID_LAYER_HEIGHT (robot.py)
+    rim_obs_max_age_s: 3.0       # obs cache lifetime (hand publishes ~0.5Hz;
+    #                              1.0s silently aged its view out of fusion)
+    rim_cluster_xy_m: 0.05       # cross-camera same-cup XY gate
+    rim_min_iou: 0.5             # drop low-quality silhouette fits
+    rim_max_rms_px: 6.0
+    rim_log_dir: ""              # set to e.g. /tmp/rim_ab to record A/B CSV
     # Doosan M0609 publishes joint states under the /dsr01 namespace
     # (global /joint_states has no publisher). scan-lock arrival
     # detection reads this; joint names already match joint_1..6.
