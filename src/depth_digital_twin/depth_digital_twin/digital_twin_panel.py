@@ -394,6 +394,23 @@ class PanelUI:
         _Tooltip(clr_btn, 'cup_fusion_node/clear_scan (Trigger)\n'
                           '누적·lock 폐기 → 라이브 검출 복귀.')
 
+        # Lock scope: unchecked (default) = hand frozen + exo LIVE re-fuse;
+        # checked = freeze both cameras into one static lock.
+        self._lock_exo_var = tk.BooleanVar(value=False)
+        exo_cb = tk.Checkbutton(
+            scan, text='Lock exo too', variable=self._lock_exo_var,
+            bg='#1e1e1e', fg='#9cdcfe', selectcolor='#333333',
+            activebackground='#1e1e1e', activeforeground='#ffffff',
+            command=lambda: self.node.request_param(
+                self.node.fusion_node, 'scan_lock_exo',
+                self._lock_exo_var.get(), 'bool'))
+        exo_cb.pack(side='left', padx=4)
+        _Tooltip(exo_cb,
+                 'scan_lock_exo\n'
+                 '해제(기본): hand만 고정, exo는 라이브로 매 tick 재융합\n'
+                 '  → exo가 새로 본 컵 추가, 집어간 컵은 hand lock에 유지.\n'
+                 '체크: exo도 고정(둘 다 정적 lock).')
+
         grid = tk.Frame(parent, bg='#1e1e1e')
         grid.grid(row=1, column=0, sticky='nsew')
         for c in range(3):
