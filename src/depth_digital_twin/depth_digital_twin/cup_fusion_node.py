@@ -352,6 +352,23 @@ class CupFusionNode(Node):
         gp('rim_max_rms_px', 6.0)
         gp('rim_log_dir', '')          # non-empty → append A/B CSV rows there
 
+        # ── Cross-camera extrinsic self-calibration (Phase 3) ───────────────
+        # When BOTH cameras see the same cup, the per-camera (x, y) delta is
+        # the extrinsic disagreement (observed: static ~30 mm — exo's distant
+        # ArUco solvePnP vs the hand FK+hand-eye chain). An EMA of that delta
+        # estimates the non-reference camera's world-frame bias; with apply
+        # on, its observations are corrected before fusion, so cups only that
+        # camera sees inherit the reference frame's accuracy. EMA steps are
+        # <= alpha*delta per event (~1.5 mm) — gradual, so tracks follow
+        # without KF gate rejections. A rotation error is position-dependent,
+        # but across this 0.3 m workspace the variation is ~4 mm — a single
+        # translation bias captures the bulk of it.
+        gp('rim_bias_apply', False)    # estimation always runs; this gates use
+        gp('rim_bias_ref_cam', 'hand')
+        gp('rim_bias_alpha', 0.05)     # EMA gain per shared-cup event
+        gp('rim_bias_max_m', 0.05)     # clamp |bias|
+        gp('rim_bias_delta_max_m', 0.08)  # ignore absurd per-cup deltas
+
         def P(n):
             return self.get_parameter(n).value
 
@@ -539,6 +556,13 @@ class CupFusionNode(Node):
         self.rim_max_rms = float(P('rim_max_rms_px'))
         self.rim_log_dir = str(P('rim_log_dir'))
         self._rim_latest: dict[tuple, tuple] = {}   # (cam, iid) → (obs, t_s)
+        self.rim_bias_apply = bool(P('rim_bias_apply'))
+        self.rim_bias_ref = str(P('rim_bias_ref_cam'))
+        self.rim_bias_alpha = float(P('rim_bias_alpha'))
+        self.rim_bias_max = float(P('rim_bias_max_m'))
+        self.rim_bias_delta_max = float(P('rim_bias_delta_max_m'))
+        self._cam_bias: dict[str, np.ndarray] = {}  # cam → world-XY bias (m)
+        self._cam_bias_n: dict[str, int] = {}       # cam → update count
         self._rim_csv = None                        # lazy-opened file handle
         self.rim_dbg_pub = None
         self.health_pub = None
@@ -635,6 +659,9 @@ class CupFusionNode(Node):
             'rim_log_dir': ('rim_log_dir', str),
             'fit_source': ('fit_source', str),
             'rim_drop_moving': ('rim_drop_moving', bool),
+            'rim_bias_apply': ('rim_bias_apply', bool),
+            'rim_bias_alpha': ('rim_bias_alpha', float),
+            'rim_bias_max_m': ('rim_bias_max', float),
         }
         self.add_on_set_parameters_callback(self._on_set_params)
         self.get_logger().info(
@@ -1334,7 +1361,7 @@ class CupFusionNode(Node):
                 nest_off=self.rim_layer_h)
             if abs(el) < abs(lvl_err):
                 k, z_base, lvl_err = kl, zl, el
-            meas, used = [], []
+            slids: dict[str, tuple] = {}    # cam → (raw xy, cov, obs)
             for o in by_cam.values():
                 d = np.array([o.ray_dir.x, o.ray_dir.y, o.ray_dir.z])
                 slid = slide_xy_to_z(o.x0, o.y0, o.z_base0, d, z_base)
@@ -1346,7 +1373,33 @@ class CupFusionNode(Node):
                     np.array([slid[0], slid[1], z_base]) - org))
                 cov = xy_cov_from_px(
                     o.sigma_px, rng, float(o.focal_px) or 600.0, d)
-                meas.append((np.asarray(slid), cov))
+                slids[o.camera] = (np.asarray(slid, dtype=np.float64),
+                                   cov, o)
+            # Extrinsic bias estimation from RAW (uncorrected) deltas — a
+            # shared cup is a calibration target. Update before applying so
+            # the EMA tracks the true disagreement, not the residual of its
+            # own correction.
+            if self.rim_bias_ref in slids:
+                ref_xy = slids[self.rim_bias_ref][0]
+                for cam, (xy, _, o) in slids.items():
+                    if cam == self.rim_bias_ref or o.moving:
+                        continue
+                    delta = xy - ref_xy
+                    if float(np.linalg.norm(delta)) > self.rim_bias_delta_max:
+                        continue
+                    b = self._cam_bias.get(cam, np.zeros(2))
+                    b = (1.0 - self.rim_bias_alpha) * b \
+                        + self.rim_bias_alpha * delta
+                    nb = float(np.linalg.norm(b))
+                    if nb > self.rim_bias_max:
+                        b *= self.rim_bias_max / nb
+                    self._cam_bias[cam] = b
+                    self._cam_bias_n[cam] = self._cam_bias_n.get(cam, 0) + 1
+            meas, used = [], []
+            for cam, (xy, cov, o) in slids.items():
+                if self.rim_bias_apply and cam != self.rim_bias_ref:
+                    xy = xy - self._cam_bias.get(cam, np.zeros(2))
+                meas.append((xy, cov))
                 used.append(o)
             fused = fuse_xy(meas)
             if fused is None:
@@ -1453,6 +1506,11 @@ class CupFusionNode(Node):
         self.health_pub.publish(String(data=json.dumps({
             't': float(stamp.sec) + float(stamp.nanosec) * 1e-9,
             'n_obs_cached': len(self._rim_latest),
+            'extrinsic_bias_mm': {
+                cam: {'xy': [round(1e3 * float(v), 1) for v in b],
+                      'n': self._cam_bias_n.get(cam, 0),
+                      'applied': bool(self.rim_bias_apply)}
+                for cam, b in self._cam_bias.items()},
             'cups': cups,
         })))
 

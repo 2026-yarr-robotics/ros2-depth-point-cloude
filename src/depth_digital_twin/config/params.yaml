@@ -209,6 +209,16 @@ cup_fusion_node:
     rim_min_iou: 0.5             # drop low-quality silhouette fits
     rim_max_rms_px: 6.0
     rim_log_dir: ""              # set to e.g. /tmp/rim_ab to record A/B CSV
+
+    # ── Cross-camera extrinsic self-calibration ──────────────────────────
+    # Shared cups calibrate the exo<->hand world disagreement (static ~30mm
+    # = exo ArUco bias). apply=true corrects non-reference (exo) observations
+    # by the EMA bias, so exo-only cups inherit hand-frame accuracy. Watch
+    # the estimate in /digital_twin/fusion_health extrinsic_bias_mm.
+    rim_bias_apply: true
+    rim_bias_ref_cam: hand
+    rim_bias_alpha: 0.05
+    rim_bias_max_m: 0.05
     # Doosan M0609 publishes joint states under the /dsr01 namespace
     # (global /joint_states has no publisher). scan-lock arrival
     # detection reads this; joint names already match joint_1..6.
