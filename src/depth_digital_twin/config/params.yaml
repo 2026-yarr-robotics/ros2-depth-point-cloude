@@ -58,19 +58,19 @@ detection_node:
     # `model` = default / live-camera weight (digital_twin.launch.py and
     # digital_twin_with_robot.launch.py when no view-specific override is
     # passed).  Both exo and hand ship the same 2-class taxonomy now.
-    model: /home/ssu/cup-stack-integration/vision/ros2-depth-point-cloude/vision/yolo/0522_exo_best.pt
+    model: /home/eunwoo/Projects/yarr_projects/src/ros2-depth-point-cloude/vision/yolo/0522_exo_best.pt
     # Per-view weights for digital_twin_sequence.launch.py (view:=exo|hand).
-    model_exo: /home/ssu/cup-stack-integration/vision/ros2-depth-point-cloude/vision/yolo/0522_exo_best.pt
-    model_hand: /home/ssu/cup-stack-integration/vision/ros2-depth-point-cloude/vision/yolo/hand_eye_view_yolo26m_seg_1280_epoch250_roboflow_0518_medium_a100_best.pt
+    model_exo: /home/eunwoo/Projects/yarr_projects/src/ros2-depth-point-cloude/vision/yolo/0609_exo_best.pt
+    model_hand: /home/eunwoo/Projects/yarr_projects/src/ros2-depth-point-cloude/vision/yolo/speedstack3class_yolo26s_seg_1280_epoch250_3class_lightaug_geom1_redp25_sm_a100_best.pt
     # Both models emit the same two classes:
     #   "fallen-cup"  (id=1)
     #   "upright-cup" (id=2)
     target_classes: ["fallen-cup", "upright-cup"]
-    confidence: 0.45   # 0.35→0.45: cut YOLO false positives feeding cups_on_table noise
+    confidence: 0.35
     image_topic: /camera/camera/color/image_raw
     detections_topic: /digital_twin/detections
     debug_topic: /digital_twin/detection_debug
-    device: "cuda"   # GPU 명시 고정 (""=auto 였음; CPU 추론으로 새지 않게)
+    device: ""
     imgsz: 1280
 
 point_cloud_node:
@@ -96,10 +96,7 @@ point_cloud_node:
     #                              tripped the old 15mm gate and dropped far cups
     box_outlier_mad_k: 3.0
     approx_sync_slop: 0.05
-    track_world_merge_dist_m: 0.05  # 0.02→0.05: absorb ByteTrack re-IDs of the
-                                    # same cup (jittering centroid) instead of
-                                    # spawning duplicate tracks → cups_on_table
-                                    # over-count. Still < cup spacing (0.078).
+    track_world_merge_dist_m: 0.02  # world-frame re-association radius (m)
 
     # ----- Cup model (Speed Stack truncated cone, standing only) -----
     cup_top_diameter_m: 0.054
@@ -168,41 +165,44 @@ point_cloud_node:
     # (2) Laser Power & Preset to reduce specular reflection noise
     visual_preset: High Accuracy      # or Hand-Held, Short-Range
     laser_power: 60                   # 0–100; lower = less reflection (default 80)
+    # For plastic cups, lower laser_power (40–60) can reduce rim noise
 
 cup_fusion_node:
   ros__parameters:
-    # ────────────────────────────────────────────────────────────────────────
-    # === SCAN & LOCK (multi-view accumulate-at-waypoints) ===
-    # ────────────────────────────────────────────────────────────────────────
-    # Enabled via the Tk "Scan & Lock" checkbox (or skill_manager). While the
-    # arm dwells at scan waypoints, the node accumulates that view's world
-    # clouds per cup, fits once, and publishes a STABLE latched lock on
-    # /digital_twin/boxes + /points. Unchecking PAUSES (lock kept); the
-    # ~/clear_scan service (skill_manager) wipes and returns to live detection.
-    scan_lock_active: false
-    scan_joint_states_topic: /joint_states
-    # Joint names in SEMANTIC J1..J6 order — code maps BY NAME, so the M0609
-    # wire order (1,2,4,5,3,6) is irrelevant. Underscored to match the driver.
-    scan_joint_names: ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"]
-    # Scan waypoints (J1..J6 degrees). Arrival = every joint within tol AND
-    # settled; the start/return pose is NOT a waypoint so it is skipped.
-    scan_wp1_deg: [57.4585, 10.3361, 75.0595, -31.1839, 127.2512, 44.6653]
-    scan_wp2_deg: [-42.1911, 12.8098, 66.9024, 25.0818, 107.6920, -18.8562]
-    scan_arrival_tol_rad: 0.02       # per-joint arrival gate (~1.15°)
-    scan_settle_vel_rad_s: 0.05      # max joint speed to count as "settled"
-    scan_wait_s: 1.0                 # settle wait after arrival before capture
-    scan_capture_s: 1.0              # accumulation window per waypoint visit
-    scan_js_timeout_s: 0.5           # joints older than this → arm state UNKNOWN
-    # Looser merge/fit gates for the COMPUTE pass (a multi-view union of one cup
-    # is more spread than a single view; inter-cup distance stays the splitter).
-    scan_merge_dist_m: 0.06
-    scan_premerge_dxy_m: 0.045
-    scan_premerge_dz_m: 0.05
-    scan_premerge_iou: 0.20
-    scan_premerge_radius_m: 0.07
-    scan_postmerge_dxy_m: 0.04
-    scan_postmerge_dz_m: 0.04
-    scan_max_cup_footprint_m: 0.14
-    scan_fit_voxel_m: 0.004          # consolidation voxel (bounds growth)
-    scan_max_points_per_cup: 6000
-    # For plastic cups, lower laser_power (40–60) can reduce rim noise
+    # ── Scan & Lock (multi-view accumulate-at-waypoints) ──────────────────
+    # Edit here and relaunch (no rebuild — params.yaml is symlink-installed).
+    # Waypoints: a FLAT list of 6 joint angles (deg) per waypoint, concatenated.
+    # The arm visits each in order; arrival is auto-detected by joint match.
+    # Default below = a SINGLE waypoint (pos1). Append 6 more values to add a
+    # 2nd waypoint, etc.  ← set this to the robot's new scan pose.
+    scan_waypoints_deg: [103.4671, -4.3731, 100.2539, -29.3674, 115.5776, -139.6331]
+    scan_capture_s: 1.0          # HAND depth accumulation time per waypoint (s)
+    scan_wait_s: 1.0             # settle wait after arrival before capturing (s)
+    scan_arrival_tol_rad: 0.02   # per-joint arrival gate (~1.15°)
+    # false (default) = HAND frozen + exo LIVE: each tick re-fuses the frozen
+    # hand scan with the latest exo cloud, so cups exo newly sees appear and a
+    # picked cup stays from the hand lock. true = BOTH cameras frozen into one
+    # static lock. Toggle live from the Tk "Lock exo too" checkbox.
+    scan_lock_exo: false
+
+    # ── Live noise suppression ────────────────────────────────────────────
+    # (A) Temporal frame accumulation: union each camera's clouds over this
+    # window before fitting → averages out raw per-frame depth noise (far exo
+    # ±40-80mm, zero-mean → cancels). 0 = latest cloud only. Keep short so a
+    # moving cup doesn't smear (static cups on a table benefit most).
+    fusion_accum_window_s: 0.3
+    # (B) Spatial-density filter: drop isolated noise islands / flying-pixels
+    # (a point with < min_neighbors others within radius) from the fit input.
+    use_fusion_density_filter: true
+    fusion_density_radius_m: 0.03
+    fusion_density_min_neighbors: 4
+
+    # ── Premerge: cup-cylinder containment (replaces 3D AABB-IoU) ──────────
+    # Two UPRIGHT detections = same cup iff their XY box-centers are within
+    # cup_axis_xy_m AND the union z-span <= cup_height*(1+cup_span_margin).
+    # Merges a hand top-rim disc with an exo side slab (they share the axis);
+    # splits vertically-stacked cups (union z-span > one cup). Fallen cups fall
+    # back to the legacy IoU gate (premerge_iou/dxy/dz above). Margin must sit
+    # between one cup (0.095) and cup+min-layer-spacing (~0.134): 0.119 ✓.
+    cup_axis_xy_m: 0.05       # ~cup radius (0.039) + slack
+    cup_span_margin: 0.25

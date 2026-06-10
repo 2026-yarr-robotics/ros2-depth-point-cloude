@@ -23,6 +23,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 
 import numpy as np
+from builtin_interfaces.msg import Duration as DurationMsg
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
@@ -43,7 +44,7 @@ from depth_digital_twin_msgs.msg import WorldObjectCloudArray
 # side-effect-free because main() is guarded by __main__.)
 from depth_digital_twin.point_cloud_node import (
     PositionKF, _fit_cup_axis_xy, _compute_box_world, _make_pointcloud2,
-    _cup_frustum_geometry, _palette, _rot_to_quat)
+    _cup_frustum_geometry, _palette, _rot_to_quat, _filter_spatial_density)
 
 
 def _pc2_xyzrgb(cloud: PointCloud2):
@@ -167,15 +168,37 @@ class CupFusionNode(Node):
         gp('merge_dist_m', 0.035)      # STAGE-0 coarse centroid cluster (strict)
         gp('fusion_voxel_m', 0.004)    # voxel size to equalise per-view density
         gp('max_merge_points', 4000)   # cap merged points per cup (deterministic)
+        # (A) Temporal frame ACCUMULATION: union each camera's clouds over the
+        # last `fusion_accum_window_s` before fitting, so the fit averages out
+        # the raw per-frame depth noise (esp. far exo ±40-80mm, zero-mean → it
+        # cancels). 0 = use only the latest cloud (old behaviour). Keep short so
+        # a moving cup doesn't smear; static cups on a table benefit most.
+        gp('fusion_accum_window_s', 0.3)
+        # (B) Spatial-density filter: drop isolated noise islands (a point with
+        # < min_neighbors others within radius) from the FIT input — catches the
+        # exo flying-pixels the producer MAD can't (in-distribution but lonely).
+        gp('use_fusion_density_filter', True)
+        gp('fusion_density_radius_m', 0.03)
+        gp('fusion_density_min_neighbors', 4)
         # Reject a box bigger than this footprint — it's an over-merge of
         # several cups (or noise), not one cup. Stops giant boxes.
         gp('max_cup_footprint_m', 0.11)
 
-        # STAGE-1 pre-fit point-cloud merge (AABB-IoU, STRICT AND of 3 gates).
+        # STAGE-1 pre-fit point-cloud merge. PRIMARY = cup-cylinder containment
+        # (cup_axis_xy + cup_span_margin below). The IoU/dxy/dz triple is now the
+        # FALLBACK for fallen (non-vertical) cups only.
         gp('premerge_iou', 0.62)
         gp('premerge_dxy_m', 0.018)
         gp('premerge_dz_m', 0.022)     # blocks telescoped/vertically-stacked cups
         gp('premerge_radius_m', 0.05)  # candidate-pair prefilter (centroid KDTree)
+        # Cup-cylinder premerge (vertical cups): merge iff XY box-centers within
+        # cup_axis_xy_m AND union z-span <= cup_h*(1+cup_span_margin). The margin
+        # MUST sit between one cup (0.095) and cup+min-layer-spacing (~0.134):
+        # 0.095 < 0.095*1.25=0.119 < 0.134 ✓ (merges partial views, splits stacks).
+        gp('cup_axis_xy_m', 0.05)      # ~cup radius (0.039) + slack
+        gp('cup_span_margin', 0.25)
+        gp('scan_cup_axis_xy_m', 0.06)     # looser twins for the scan COMPUTE pass
+        gp('scan_cup_span_margin', 0.40)
         # STAGE-2b post-fit re-merge (two fits pointing at the same cup).
         gp('postmerge_dxy_m', 0.015)
         gp('postmerge_dz_m', 0.015)
@@ -259,8 +282,16 @@ class CupFusionNode(Node):
         self.merge_dist = float(P('merge_dist_m'))
         self.voxel_m = float(P('fusion_voxel_m'))
         self.max_merge_points = int(P('max_merge_points'))
+        self.accum_window = float(P('fusion_accum_window_s'))
+        self.use_density = bool(P('use_fusion_density_filter'))
+        self.density_radius = float(P('fusion_density_radius_m'))
+        self.density_min_nb = int(P('fusion_density_min_neighbors'))
         self.max_cup_footprint = float(P('max_cup_footprint_m'))
         self.premerge_iou = float(P('premerge_iou'))
+        self.cup_axis_xy = float(P('cup_axis_xy_m'))
+        self.cup_span_margin = float(P('cup_span_margin'))
+        self.scan_cup_axis_xy = float(P('scan_cup_axis_xy_m'))
+        self.scan_cup_span_margin = float(P('scan_cup_span_margin'))
         self.premerge_dxy = float(P('premerge_dxy_m'))
         self.premerge_dz = float(P('premerge_dz_m'))
         self.premerge_radius = float(P('premerge_radius_m'))
@@ -366,6 +397,8 @@ class CupFusionNode(Node):
             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
 
         self._latest: dict[str, tuple] = {'exo': (None, None), 'hand': (None, None)}
+        # Rolling per-camera cloud history for temporal frame accumulation (A).
+        self._cloud_hist: dict[str, list] = {'exo': [], 'hand': []}
         # Last-processed cloud stamp per camera — a KF update only fires when a
         # camera's stamp advances, so a stale cloud is not counted repeatedly
         # (which would make the filter over-confident and the box flicker).
@@ -373,6 +406,8 @@ class CupFusionNode(Node):
         self._tracks: dict[int, dict] = {}
         self._next_gid = 1
         self._last_ids: set[int] = set()
+        self._last_points_xyz = None     # last non-empty /points union (coast)
+        self._last_points_rgb = None
 
         self.create_subscription(
             WorldObjectCloudArray, str(P('exo_clouds_topic')),
@@ -399,12 +434,23 @@ class CupFusionNode(Node):
             MarkerArray, str(P('dbg_premerge_topic')), latched)
         self.dbg_fit1_pub = self.create_publisher(
             MarkerArray, str(P('dbg_fit1_topic')), latched)
+        # Debug markers age out via lifetime instead of a per-event DELETEALL,
+        # so a 1-2 event detection dropout doesn't blink the overlay in RViz.
+        # 4 measurement events of slack; refreshed well before expiry.
+        _life = max(0.3, 4.0 * float(P('fusion_period_s')))
+        self._dbg_lifetime = DurationMsg(
+            sec=int(_life), nanosec=int((_life % 1.0) * 1e9))
+        self._dbg_enabled_prev = {}     # pub → last enabled state (for wipe)
 
         self.create_timer(float(P('fusion_period_s')), self._tick)
         # Live-tunable thresholds — `ros2 param set /cup_fusion_node <p> <v>`
         # takes effect immediately (no relaunch needed while tuning).
         self._tunable = {
             'max_age_s': ('max_age', float),
+            'fusion_accum_window_s': ('accum_window', float),
+            'use_fusion_density_filter': ('use_density', bool),
+            'fusion_density_radius_m': ('density_radius', float),
+            'fusion_density_min_neighbors': ('density_min_nb', int),
             'merge_dist_m': ('merge_dist', float),
             'max_cup_footprint_m': ('max_cup_footprint', float),
             'premerge_iou': ('premerge_iou', float),
@@ -429,6 +475,10 @@ class CupFusionNode(Node):
             'w_exo_base': ('w_exo_base', float),
             'w_hand_base': ('w_hand_base', float),
             'cup_fit_residual_max': ('cup_resid_max', float),
+            'cup_axis_xy_m': ('cup_axis_xy', float),
+            'cup_span_margin': ('cup_span_margin', float),
+            'scan_cup_axis_xy_m': ('scan_cup_axis_xy', float),
+            'scan_cup_span_margin': ('scan_cup_span_margin', float),
             # scan & lock live-tunables (scan_lock_active drives the mode)
             'scan_lock_active': ('scan_lock_active', bool),
             'scan_lock_exo': ('scan_lock_exo', bool),
@@ -473,43 +523,54 @@ class CupFusionNode(Node):
 
     # ------------------------------------------------------------------
     def _on_clouds(self, msg: WorldObjectCloudArray, cam: str) -> None:
-        self._latest[cam] = (msg, self.get_clock().now())
+        now = self.get_clock().now()
+        self._latest[cam] = (msg, now)
+        # Append to the rolling history and prune frames older than the
+        # accumulation window (a little slack so a brief rate dip keeps frames).
+        hist = self._cloud_hist[cam]
+        hist.append((now, msg))
+        keep_s = max(self.accum_window, self.max_age)
+        while hist and (now - hist[0][0]).nanoseconds * 1e-9 > keep_s:
+            hist.pop(0)
 
     def _gather(self):
-        """Collect objects for THIS measurement event. Returns [] (→ coast,
-        no KF update) unless at least one camera produced a NEW cloud since the
-        last event; when fresh, uses the latest cloud from BOTH cameras (within
-        max_age) so a cup seen by both is fused in one fit."""
+        """Collect objects for THIS measurement event. Returns None (→ coast, no
+        KF update) unless at least one camera produced a NEW cloud since the last
+        event; when fresh, ACCUMULATES each active camera's clouds over the last
+        fusion_accum_window_s (temporal denoise) so a cup's fit averages out the
+        raw per-frame depth noise."""
         now = self.get_clock().now()
-        snaps = {}
+        active = []
         fresh = False
         for cam in ('exo', 'hand'):
             msg, t = self._latest[cam]
             if msg is None or (now - t).nanoseconds * 1e-9 > self.max_age:
                 continue
             stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-            snaps[cam] = (msg, stamp)
+            active.append((cam, stamp))
             if stamp > self._proc_stamp[cam]:
                 fresh = True
         if not fresh:
             return None      # not a fresh event → caller skips, markers persist
         objs = []
-        for cam, (msg, stamp) in snaps.items():
+        for cam, stamp in active:
             self._proc_stamp[cam] = stamp
-            for o in msg.objects:
-                if cam == 'hand' and o.moving and self.hand_gating:
-                    continue
-                xyz, rgb = _pc2_xyzrgb(o.points)
-                if xyz.shape[0] < 32:
-                    continue
-                w_base = self.w_hand_base if cam == 'hand' else self.w_exo_base
-                objs.append({
-                    'cam': cam, 'xyz': xyz, 'rgb': rgb,
-                    'centroid': np.array([o.centroid.x, o.centroid.y,
-                                          o.centroid.z], dtype=np.float64),
-                    'score': float(o.score), 'class_name': o.class_name,
-                    'moving': bool(o.moving), 'w': w_base,
-                })
+            objs.extend(self._accumulated_objs(cam, now))
+        return objs
+
+    def _accumulated_objs(self, cam, now):
+        """Union one camera's detection-objs over the last `accum_window` of
+        frames (temporal frame accumulation, A). window<=0 → latest cloud only.
+        _premerge then clusters the SAME cup across frames → _merge unions their
+        points → a denser cloud whose fit averages out per-frame depth noise."""
+        hist = self._cloud_hist[cam]
+        if self.accum_window <= 0.0 or not hist:
+            msg, _ = self._latest[cam]
+            return self._build_cam_objs(cam, msg) if msg is not None else []
+        objs = []
+        for recv_t, msg in hist:
+            if (now - recv_t).nanoseconds * 1e-9 <= self.accum_window:
+                objs.extend(self._build_cam_objs(cam, msg))
         return objs
 
     def _merge(self, members: list[dict]) -> np.ndarray:
@@ -528,6 +589,13 @@ class CupFusionNode(Node):
             vsz = self.voxel_m / np.sqrt(max(m['w'] / mean_w, 1e-6))
             chunks.append(_voxel_downsample(m['xyz'], vsz))
         out = np.vstack(chunks) if chunks else np.zeros((0, 3))
+        # (B) Spatial-density filter: drop isolated noise islands (esp. exo
+        # flying-pixels) before the fit. Skip if it would gut the cluster.
+        if self.use_density and out.shape[0] > self.density_min_nb:
+            keep = _filter_spatial_density(
+                out, self.density_radius, self.density_min_nb)
+            if int(keep.sum()) >= 16:
+                out = out[keep]
         if out.shape[0] > self.max_merge_points:
             k = int(np.ceil(out.shape[0] / self.max_merge_points))
             out = out[::k]                            # deterministic stride
@@ -581,10 +649,28 @@ class CupFusionNode(Node):
     # ------------------------------------------------------------------
     def _premerge(self, objs):
         """STAGE-0/1: coarse centroid cluster, then within each cluster merge
-        ONLY detections that are the SAME physical cup (AABB-IoU & dXY & dZ, all
-        strict). Returns groups of obj indices = one group per physical cup."""
-        clusters = _cluster_indices([o['centroid'] for o in objs], self.merge_dist)
+        ONLY detections that are the SAME physical cup. Returns groups of obj
+        indices = one group per physical cup.
+
+        Primary metric = CUP-CYLINDER containment (a standing cup is a vertical
+        cylinder): two upright detections merge iff their robust XY box-centers
+        (axis estimate) are within one cup radius AND the UNION of their robust
+        z-extents fits inside one cup height·(1+margin). This merges a hand
+        top-rim disc with an exo side slab (they share the axis; union-z ≈ one
+        cup) where 3D AABB-IoU failed (thin disc vs tall slab barely overlap),
+        while a vertically-STACKED pair (union-z > one cup) stays separate.
+        Pairs where EITHER detection is not an upright-cup (YOLO class, e.g.
+        fallen-cup) fall back to the legacy AABB-IoU gate."""
+        # Cluster by XY (the vertical column), NOT 3D centroid: a cup's hand
+        # top-disc and exo side-slab share XY but differ in centroid-Z, so 3D
+        # clustering would split them before the pair-test ever runs. Stacked
+        # cups share XY too → they land in one cluster and the cup-cylinder
+        # pair-test below separates them by z-span.
+        clusters = _cluster_indices(
+            [np.array([o['xyc'][0], o['xyc'][1], 0.0]) for o in objs],
+            self.merge_dist)
         groups = []
+        z_ceil = self.cup_h * (1.0 + self.cup_span_margin)
         for cl in clusters:
             if len(cl) == 1:
                 groups.append(cl)
@@ -592,12 +678,25 @@ class CupFusionNode(Node):
             edges = []
             for a in range(len(cl)):
                 for b in range(a + 1, len(cl)):
-                    i, j = cl[a], cl[b]
-                    dc = objs[i]['centroid'] - objs[j]['centroid']
-                    if (abs(dc[2]) <= self.premerge_dz
-                            and float(np.hypot(dc[0], dc[1])) <= self.premerge_dxy
-                            and _aabb_iou(objs[i]['aabb'], objs[j]['aabb'])
-                            >= self.premerge_iou):
+                    oi, oj = objs[cl[a]], objs[cl[b]]
+                    # Upright (by YOLO class) → vertical-cylinder metric; any
+                    # non-upright (fallen-cup) in the pair → legacy IoU gate.
+                    up = (oi['class_name'] in self.cup_class_names
+                          and oj['class_name'] in self.cup_class_names)
+                    if up:
+                        dxy = float(np.hypot(oi['xyc'][0] - oj['xyc'][0],
+                                             oi['xyc'][1] - oj['xyc'][1]))
+                        z_span = (max(oi['zhi'], oj['zhi'])
+                                  - min(oi['zlo'], oj['zlo']))
+                        same = dxy <= self.cup_axis_xy and z_span <= z_ceil
+                    else:               # fallen cup → legacy AABB-IoU gate
+                        dc = oi['centroid'] - oj['centroid']
+                        same = (abs(dc[2]) <= self.premerge_dz
+                                and float(np.hypot(dc[0], dc[1]))
+                                <= self.premerge_dxy
+                                and _aabb_iou(oi['aabb'], oj['aabb'])
+                                >= self.premerge_iou)
+                    if same:
                         edges.append((a, b))
             for grp in _union_find_groups(len(cl), edges):
                 groups.append([cl[k] for k in grp])
@@ -752,9 +851,22 @@ class CupFusionNode(Node):
                         f'waypoint(s) captured, lock published; diagnostic '
                         f'logging stops (clear or re-activate to scan again)')
 
+    def _cup_geom_fields(self, xyz):
+        """Premerge geometry from ONE detection's points (single robust AABB):
+        the box, the robust XY box-center (a standing-cup AXIS estimate), and the
+        z-extent. Whether the cup-cylinder metric applies (vs the legacy IoU
+        gate) is decided in _premerge from the YOLO class — upright-cup vs
+        fallen-cup — NOT re-derived from geometry."""
+        lo, hi = _aabb_robust(xyz)
+        return {
+            'aabb': (lo, hi),
+            'xyc': np.array([0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1])]),
+            'zlo': float(lo[2]), 'zhi': float(hi[2]),
+        }
+
     def _build_cam_objs(self, cam, msg):
         """Detection-objs (world-frame already) for one camera's cloud message
-        — same shape _gather builds, incl. the 'aabb' _premerge needs."""
+        — same shape _gather builds, incl. the premerge geom fields."""
         out = []
         for o in msg.objects:
             if cam == 'hand' and o.moving and self.hand_gating:
@@ -766,7 +878,7 @@ class CupFusionNode(Node):
                 'cam': cam, 'xyz': xyz, 'rgb': rgb,
                 'centroid': np.array([o.centroid.x, o.centroid.y,
                                       o.centroid.z], dtype=np.float64),
-                'aabb': _aabb_robust(xyz),
+                **self._cup_geom_fields(xyz),
                 'score': float(o.score), 'class_name': o.class_name,
                 'moving': bool(o.moving),
                 'w': self.w_hand_base if cam == 'hand' else self.w_exo_base,
@@ -774,13 +886,14 @@ class CupFusionNode(Node):
         return out
 
     def _latest_cam_objs(self, cam):
-        """Objs from the LATEST cached cloud of `cam` (within max_age) — used to
-        overlay LIVE exo on the frozen hand lock each tick."""
+        """Accumulated objs of `cam` over fusion_accum_window_s (within max_age)
+        — overlays LIVE, temporally-denoised exo on the frozen hand lock each
+        tick, so the exo re-fuse doesn't jitter from single-frame noise."""
         msg, t = self._latest[cam]
-        if (msg is None
-                or (self.get_clock().now() - t).nanoseconds * 1e-9 > self.max_age):
+        now = self.get_clock().now()
+        if msg is None or (now - t).nanoseconds * 1e-9 > self.max_age:
             return []
-        return self._build_cam_objs(cam, msg)
+        return self._accumulated_objs(cam, now)
 
     def _capture_into_accum(self) -> None:
         """Append fresh per-camera detection-objs into the accumulation buffer
@@ -805,7 +918,8 @@ class CupFusionNode(Node):
         for the COMPUTE pass (a multi-view union of one cup is more spread than a
         single view). Single-threaded → safe to mutate instance attrs."""
         attrs = ('merge_dist', 'premerge_dxy', 'premerge_dz', 'premerge_iou',
-                 'postmerge_dxy', 'postmerge_dz', 'max_cup_footprint')
+                 'postmerge_dxy', 'postmerge_dz', 'max_cup_footprint',
+                 'cup_axis_xy', 'cup_span_margin')
         saved = {a: getattr(self, a) for a in attrs}
         self.merge_dist = self.scan_merge_dist
         self.premerge_dxy = self.scan_premerge_dxy
@@ -814,6 +928,8 @@ class CupFusionNode(Node):
         self.postmerge_dxy = self.scan_postmerge_dxy
         self.postmerge_dz = self.scan_postmerge_dz
         self.max_cup_footprint = self.scan_max_cup_footprint
+        self.cup_axis_xy = self.scan_cup_axis_xy
+        self.cup_span_margin = self.scan_cup_span_margin
         try:
             yield
         finally:
@@ -907,7 +1023,8 @@ class CupFusionNode(Node):
                    else f['members'][0]['class_name'])
             out.append({
                 'cam': 'scan', 'xyz': xyz, 'rgb': rgb,
-                'centroid': xyz.mean(axis=0), 'aabb': _aabb_robust(xyz),
+                'centroid': xyz.mean(axis=0),
+                **self._cup_geom_fields(xyz),
                 'score': max(m['score'] for m in f['members']),
                 'class_name': cls, 'moving': False, 'w': self.w_hand_base,
             })
@@ -1002,6 +1119,8 @@ class CupFusionNode(Node):
         self._tracks = {}
         self._next_gid = 1
         self._last_ids = set()
+        self._last_points_xyz = None
+        self._last_points_rgb = None
         self._proc_stamp = {'exo': -1.0, 'hand': -1.0}
         self.get_logger().info('scan-lock CLEARED — back to live detection')
 
@@ -1089,8 +1208,7 @@ class CupFusionNode(Node):
             # Not a fresh measurement event → don't touch the markers; the last
             # published set persists in RViz. (No flicker between measurements.)
             return
-        for o in objs:
-            o['aabb'] = _aabb_robust(o['xyz'])
+        # objs already carry aabb + cup-geom fields (_build_cam_objs).
 
         # Predict once per measurement event (Q is tuned for this cadence).
         for tr in self._tracks.values():
@@ -1163,11 +1281,19 @@ class CupFusionNode(Node):
         # is on (it is by default). /points = the FULL raw union (every point).
         stamp = self.get_clock().now().to_msg()
         self._publish_markers(stamp, enabled=self.dbg_fit2)
+        # COAST /points like the boxes: a producer emits a fresh-but-EMPTY cloud
+        # on any YOLO-dropout frame; blanking /points there made it flicker while
+        # the (min_hits/keepalive-coasted) boxes stayed. So republish the last
+        # non-empty union while tracks are still alive, and only clear once they
+        # are fully evicted (_last_ids empty — same lifetime as the boxes).
         if objs:
             xyz = np.vstack([o['xyz'] for o in objs]).astype(np.float32)
             rgb = np.concatenate([o['rgb'] for o in objs])
+            self._last_points_xyz, self._last_points_rgb = xyz, rgb
+        elif self._last_ids and self._last_points_xyz is not None:
+            xyz, rgb = self._last_points_xyz, self._last_points_rgb   # coast
         else:
-            xyz = np.zeros((0, 3), np.float32)
+            xyz = np.zeros((0, 3), np.float32)                       # all gone
             rgb = np.zeros((0,), np.float32)
         self.points_pub.publish(_make_pointcloud2(
             Header(stamp=stamp, frame_id=self.world_frame), xyz, rgb))
@@ -1222,66 +1348,80 @@ class CupFusionNode(Node):
     # ------------------------------------------------------------------
     def _emit_dbg(self, pub, enabled, boxes, stamp) -> None:
         """Publish a debug MarkerArray: CUBE + label + optional cup frustum per
-        box. Always DELETEALL first, so toggling the checkbox off clears it."""
+        box. Markers carry a short lifetime instead of a per-event DELETEALL:
+        the full clear-and-redraw of raw, unfiltered per-event boxes made the
+        1-3 debug overlays blink in RViz whenever a detection dropped for one
+        event. Now a dropped box just lingers ~lifetime and ages out; same-id
+        re-adds refresh in place. DELETEALL fires once on the enabled→disabled
+        edge so toggling the checkbox off still clears the overlay."""
         ma = MarkerArray()
-        clr = Marker()
-        clr.header.frame_id = self.world_frame
-        clr.header.stamp = stamp
-        clr.action = Marker.DELETEALL
-        ma.markers.append(clr)
-        if enabled:
-            for i, bx in enumerate(boxes):
-                c, R, size, col = bx['center'], bx['R'], bx['size'], bx['color']
-                qx, qy, qz, qw = _rot_to_quat(R)
-                cube = Marker()
-                cube.header.frame_id = self.world_frame
-                cube.header.stamp = stamp
-                cube.ns = 'dbg_box'
-                cube.id = i
-                cube.type = Marker.CUBE
-                cube.action = Marker.ADD
-                cube.pose.position = MsgPoint(x=float(c[0]), y=float(c[1]),
-                                              z=float(c[2]))
-                cube.pose.orientation = Quaternion(x=qx, y=qy, z=qz, w=qw)
-                cube.scale = Vector3(x=max(float(size[0]), 1e-3),
-                                     y=max(float(size[1]), 1e-3),
-                                     z=max(float(size[2]), 1e-3))
-                cube.color = ColorRGBA(r=col[0], g=col[1], b=col[2], a=0.25)
-                ma.markers.append(cube)
-                if bx.get('label'):
-                    txt = Marker()
-                    txt.header.frame_id = self.world_frame
-                    txt.header.stamp = stamp
-                    txt.ns = 'dbg_label'
-                    txt.id = i
-                    txt.type = Marker.TEXT_VIEW_FACING
-                    txt.action = Marker.ADD
-                    txt.pose.position = MsgPoint(
-                        x=float(c[0]), y=float(c[1]),
-                        z=float(c[2] + size[2] * 0.5 + 0.02))
-                    txt.scale.z = 0.022
-                    txt.color = ColorRGBA(r=col[0], g=col[1], b=col[2], a=1.0)
-                    txt.text = str(bx['label'])
-                    ma.markers.append(txt)
-                fr = bx.get('frustum')
-                if fr is not None:
-                    for ns, loop in (('dbg_top', fr['top_loop']),
-                                     ('dbg_bot', fr['bot_loop'])):
-                        ln = Marker()
-                        ln.header.frame_id = self.world_frame
-                        ln.header.stamp = stamp
-                        ln.ns = ns
-                        ln.id = i
-                        ln.type = Marker.LINE_STRIP
-                        ln.action = Marker.ADD
-                        ln.scale.x = 0.003
-                        ln.color = ColorRGBA(r=col[0], g=col[1], b=col[2], a=0.9)
-                        ln.pose.orientation.w = 1.0
-                        for p in loop:
-                            ln.points.append(MsgPoint(x=float(p[0]), y=float(p[1]),
-                                                      z=float(p[2])))
-                        ma.markers.append(ln)
-        pub.publish(ma)
+        if not enabled:
+            if self._dbg_enabled_prev.get(pub, True):
+                clr = Marker()
+                clr.header.frame_id = self.world_frame
+                clr.header.stamp = stamp
+                clr.action = Marker.DELETEALL
+                ma.markers.append(clr)
+                pub.publish(ma)
+            self._dbg_enabled_prev[pub] = False
+            return
+        self._dbg_enabled_prev[pub] = True
+        for i, bx in enumerate(boxes):
+            c, R, size, col = bx['center'], bx['R'], bx['size'], bx['color']
+            qx, qy, qz, qw = _rot_to_quat(R)
+            cube = Marker()
+            cube.header.frame_id = self.world_frame
+            cube.header.stamp = stamp
+            cube.ns = 'dbg_box'
+            cube.id = i
+            cube.type = Marker.CUBE
+            cube.action = Marker.ADD
+            cube.lifetime = self._dbg_lifetime
+            cube.pose.position = MsgPoint(x=float(c[0]), y=float(c[1]),
+                                          z=float(c[2]))
+            cube.pose.orientation = Quaternion(x=qx, y=qy, z=qz, w=qw)
+            cube.scale = Vector3(x=max(float(size[0]), 1e-3),
+                                 y=max(float(size[1]), 1e-3),
+                                 z=max(float(size[2]), 1e-3))
+            cube.color = ColorRGBA(r=col[0], g=col[1], b=col[2], a=0.25)
+            ma.markers.append(cube)
+            if bx.get('label'):
+                txt = Marker()
+                txt.header.frame_id = self.world_frame
+                txt.header.stamp = stamp
+                txt.ns = 'dbg_label'
+                txt.id = i
+                txt.type = Marker.TEXT_VIEW_FACING
+                txt.action = Marker.ADD
+                txt.lifetime = self._dbg_lifetime
+                txt.pose.position = MsgPoint(
+                    x=float(c[0]), y=float(c[1]),
+                    z=float(c[2] + size[2] * 0.5 + 0.02))
+                txt.scale.z = 0.022
+                txt.color = ColorRGBA(r=col[0], g=col[1], b=col[2], a=1.0)
+                txt.text = str(bx['label'])
+                ma.markers.append(txt)
+            fr = bx.get('frustum')
+            if fr is not None:
+                for ns, loop in (('dbg_top', fr['top_loop']),
+                                 ('dbg_bot', fr['bot_loop'])):
+                    ln = Marker()
+                    ln.header.frame_id = self.world_frame
+                    ln.header.stamp = stamp
+                    ln.ns = ns
+                    ln.id = i
+                    ln.type = Marker.LINE_STRIP
+                    ln.action = Marker.ADD
+                    ln.lifetime = self._dbg_lifetime
+                    ln.scale.x = 0.003
+                    ln.color = ColorRGBA(r=col[0], g=col[1], b=col[2], a=0.9)
+                    ln.pose.orientation.w = 1.0
+                    for p in loop:
+                        ln.points.append(MsgPoint(x=float(p[0]), y=float(p[1]),
+                                                  z=float(p[2])))
+                    ma.markers.append(ln)
+        if ma.markers:
+            pub.publish(ma)
 
     def _publish_markers(self, stamp, enabled=True) -> None:
         markers = MarkerArray()
