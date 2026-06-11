@@ -284,6 +284,20 @@ class PointCloudNode(Node):
         self.declare_parameter('cup_track_keepalive_frames', 10)
         self.declare_parameter('cup_fit_residual_max', 0.02)
         self.declare_parameter('cup_class_names', ['cup'])
+        # Fixed-box mode: skip the noisy point-cloud cone/OBB fit and place
+        # a canonical cup-sized box at the robust centroid of the deprojected
+        # mask points (median XY, low-percentile Z = base). Far more stable.
+        self.declare_parameter('fixed_cup_box', True)
+        self.declare_parameter('fixed_cup_min_points', 10)
+        self.declare_parameter('fixed_cup_base_pct', 10.0)
+        # KF residual floor for fixed mode (a fixed box can be stable but
+        # biased; never treat it as a perfect measurement). Effective
+        # residual = max(floor, XY spread).
+        self.declare_parameter('fixed_cup_kf_residual_m', 0.008)
+        # z-band (m) around the median cup z for base estimation. Narrow it
+        # in stacked regions (layer spacing ~0.093m) to avoid pulling base
+        # to the layer below; a track/slot z prior would be safer there.
+        self.declare_parameter('fixed_cup_z_band_m', 0.12)
 
         # Accumulating-window pipeline. Per-frame depth is too noisy at one
         # shot; we ingest into per-track buffers and only fit + publish at
@@ -386,6 +400,16 @@ class PointCloudNode(Node):
         self.cup_resid_max: float = float(self.get_parameter('cup_fit_residual_max').value)
         self.cup_class_names: set[str] = {
             s.lower() for s in self.get_parameter('cup_class_names').value}
+        self.fixed_cup_box: bool = bool(
+            self.get_parameter('fixed_cup_box').value)
+        self.fixed_cup_min_pts: int = max(
+            1, int(self.get_parameter('fixed_cup_min_points').value))
+        self.fixed_cup_base_pct: float = float(
+            self.get_parameter('fixed_cup_base_pct').value)
+        self.fixed_cup_kf_residual_m: float = float(
+            self.get_parameter('fixed_cup_kf_residual_m').value)
+        self.fixed_cup_z_band: float = float(
+            self.get_parameter('fixed_cup_z_band_m').value)
         self.patch_radius: int = max(1, int(self.get_parameter('window_radius').value))
         self.patch_cx_px: int = int(self.get_parameter('window_center_x_px').value)
         self.patch_cy_px: int = int(self.get_parameter('window_center_y_px').value)
@@ -960,6 +984,43 @@ class PointCloudNode(Node):
         track['center_xy'] = track['kf'].x[:2].astype(np.float64).copy()
 
     # ------------------------------------------------------------------
+    def _fixed_cup_state(self, tid: int, track: dict, all_pts: np.ndarray):
+        """Canonical cup-sized box at the robust cup centre (circle-fit XY +
+        z-band base) of the deprojected mask points -- no cone/OBB fit. The
+        centre is KF-filtered with a spread-based residual proxy so a biased
+        / spread-out mask is trusted less. frustum=None -> box only."""
+        if all_pts.shape[0] < self.fixed_cup_min_pts:
+            return None
+        cup_r = 0.5 * max(self.cup_top_d, self.cup_bot_d)
+        res = _fixed_cup_centroid(
+            all_pts, cup_radius=cup_r, base_pct=self.fixed_cup_base_pct,
+            z_band=self.fixed_cup_z_band)
+        if res is None:
+            return None
+        cx, cy, z_base_meas, xy_spread = res
+        resid = max(self.fixed_cup_kf_residual_m, xy_spread)
+        z_meas = np.array(
+            [cx, cy, z_base_meas + 0.5 * self.cup_h], dtype=np.float64)
+        filt = self._kf_update_centre(tid, track, z_meas, resid)
+        cx_s, cy_s = float(filt[0]), float(filt[1])
+        z_base_s = float(filt[2]) - 0.5 * self.cup_h
+        center = np.array([cx_s, cy_s, float(filt[2])], dtype=np.float64)
+        R_box = np.eye(3)
+        d_max = max(self.cup_top_d, self.cup_bot_d)
+        size = np.array([d_max, d_max, self.cup_h], dtype=np.float64)
+        top_world = np.array(
+            [cx_s, cy_s, z_base_s + self.cup_h], dtype=np.float64)
+        frustum = None  # box only (네모) — skip cup cone wireframe
+        color_tok = track.get('color') or 'unknown'
+        line1 = (f"#{tid}_c={color_tok}_{track['last_display_name']}_"
+                 f"{track['last_score']:.2f}")
+        line2 = f"fixed_({cx_s:.2f},{cy_s:.2f},{top_world[2]:.2f})"
+        label = line1.replace(' ', '_') + '\n' + line2.replace(' ', '_')
+        return {
+            'center': center, 'R': R_box, 'size': size,
+            'top_world': top_world, 'frustum': frustum, 'label': label,
+        }
+
     def _fit_and_render_state(self, tid: int, track: dict,
                               all_pts: np.ndarray):
         """Fit the cup pose (with OBB fallback), Kalman-filter the centre, and
@@ -976,6 +1037,10 @@ class PointCloudNode(Node):
         """
         class_name = track['class_name']
         cup_kind = (class_name in self.cup_class_names)
+
+        # Fixed canonical cup box (skip noisy cone/OBB fit) when enabled.
+        if self.fixed_cup_box and cup_kind:
+            return self._fixed_cup_state(tid, track, all_pts)
 
         # ── Measurement: cup-cone fit (preferred) ─────────────────────────
         if cup_kind:
@@ -1474,6 +1539,70 @@ def _filter_spatial_density(xyz: np.ndarray, radius: float, min_neighbors: int) 
 #     visible side alone is enough — radius variation along z constrains the
 #     centre even from a one-sided arc.
 #     """
+def _angular_coverage(ang: np.ndarray) -> float:
+    """Angular span (rad) the points cover about a centre: 2*pi minus the
+    largest angular gap. Low coverage => one-sided arc => unreliable fit."""
+    if ang.size < 2:
+        return 0.0
+    a = np.sort(ang)
+    max_gap = max(float(np.max(np.diff(a))),
+                  float((a[0] + 2.0 * np.pi) - a[-1]))
+    return 2.0 * np.pi - max_gap
+
+
+def _fixed_cup_centroid(pts, *, cup_radius, base_pct, z_band=0.12,
+                        ref_points=60):
+    """Robust cup centre for fixed-box mode. Returns (cx, cy, z_base,
+    resid_proxy) or None if too few points.
+
+    cx,cy: Kasa algebraic circle fit on the XY of the (visible-surface)
+    mask points, accepted ONLY when the fitted radius is near cup_radius,
+    the centre is near the median, the radial MAD is small AND the angular
+    coverage is wide (>=120 deg) -- else a one-sided arc gives a plausible
+    radius with a wrong centre, so we fall back to the median.
+    z_base: low percentile inside a +/- z_band/2 band around the median z.
+    resid_proxy: known-radius radial MAD (median |dist - cup_radius|),
+    scaled by sqrt(ref_points / N) so sparse masks are trusted less -- a
+    real measurement-noise proxy for the KF (NOT ~cup_radius).
+    """
+    n = pts.shape[0]
+    if n < 3:
+        return None
+    x = pts[:, 0]
+    y = pts[:, 1]
+    z = pts[:, 2]
+    mx = float(np.median(x))
+    my = float(np.median(y))
+    cx, cy = mx, my
+    try:
+        A = np.column_stack([2.0 * x, 2.0 * y, np.ones(n)])
+        sol, _r, _rk, _sv = np.linalg.lstsq(A, x * x + y * y, rcond=None)
+        fx, fy = float(sol[0]), float(sol[1])
+        r2 = float(sol[2]) + fx * fx + fy * fy
+        if r2 > 0.0:
+            r = float(np.sqrt(r2))
+            radial_mad_f = float(np.median(
+                np.abs(np.hypot(x - fx, y - fy) - r)))
+            coverage = _angular_coverage(np.arctan2(y - fy, x - fx))
+            if (0.6 * cup_radius <= r <= 1.6 * cup_radius
+                    and float(np.hypot(fx - mx, fy - my)) <= cup_radius
+                    and radial_mad_f <= 0.30 * cup_radius
+                    and coverage >= 2.094):   # >= 120 deg
+                cx, cy = fx, fy
+    except Exception:
+        pass
+    radial_resid = float(np.median(
+        np.abs(np.hypot(x - cx, y - cy) - cup_radius)))
+    resid_proxy = radial_resid * float(np.sqrt(ref_points / max(1, n)))
+    mz = float(np.median(z))
+    half = 0.5 * z_band
+    band = z[(z > mz - half) & (z < mz + half)]
+    if band.size == 0:
+        band = z
+    z_base = float(np.percentile(band, base_pct))
+    return cx, cy, z_base, resid_proxy
+
+
 def _fit_cup_axis_xy(points: np.ndarray, *, top_d: float, bot_d: float,
                      height: float):
     """Robust Non-linear LS fit of the cup axis (cx, cy) and base elevation z_base

@@ -1,14 +1,14 @@
 cup_fusion_node:
   ros__parameters:
-    merge_dist_m: 0.035
+    merge_dist_m: 0.06
     max_cup_footprint_m: 0.11
     premerge_iou: 0.62
     premerge_dxy_m: 0.018
     premerge_dz_m: 0.022
-    postmerge_dxy_m: 0.015
-    postmerge_dz_m: 0.015
-    assoc_gate_xy_m: 0.04
-    assoc_gate_z_m: 0.03
+    postmerge_dxy_m: 0.055
+    postmerge_dz_m: 0.04
+    assoc_gate_xy_m: 0.06
+    assoc_gate_z_m: 0.04
     max_age_s: 1.5
     min_hits: 3
     keepalive_ticks: 8

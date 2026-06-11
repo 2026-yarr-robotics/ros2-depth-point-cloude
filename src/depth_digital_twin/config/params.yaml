@@ -70,7 +70,7 @@ detection_node:
     image_topic: /camera/camera/color/image_raw
     detections_topic: /digital_twin/detections
     debug_topic: /digital_twin/detection_debug
-    device: ""
+    device: "cuda:0"
     imgsz: 1280
 
 point_cloud_node:
@@ -83,7 +83,7 @@ point_cloud_node:
     # Namespaced so the integration aggregator_node sits in front of GSP.
     cups_on_table_topic: /vision/cups_on_table
     box_debug_topic: /digital_twin/box_debug
-    downsample: 2
+    downsample: 4
     z_min: 0.1
     z_max: 6.0     # raised from 4.0 — current exo mount sees cups @ ~4.2 m
     box_line_width: 0.0015
@@ -199,7 +199,7 @@ cup_fusion_node:
     # window before fitting → averages out raw per-frame depth noise (far exo
     # ±40-80mm, zero-mean → cancels). 0 = latest cloud only. Keep short so a
     # moving cup doesn't smear (static cups on a table benefit most).
-    fusion_accum_window_s: 0.3
+    fusion_accum_window_s: 0.15
     # (B) Spatial-density filter: drop isolated noise islands / flying-pixels
     # (a point with < min_neighbors others within radius) from the fit input.
     use_fusion_density_filter: true
@@ -213,5 +213,5 @@ cup_fusion_node:
     # splits vertically-stacked cups (union z-span > one cup). Fallen cups fall
     # back to the legacy IoU gate (premerge_iou/dxy/dz above). Margin must sit
     # between one cup (0.095) and cup+min-layer-spacing (~0.134): 0.119 ✓.
-    cup_axis_xy_m: 0.05       # ~cup radius (0.039) + slack
+    cup_axis_xy_m: 0.06       # ~cup radius (0.039) + slack
     cup_span_margin: 0.25

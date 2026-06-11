@@ -46,7 +46,7 @@ from depth_digital_twin_msgs.msg import WorldObjectCloudArray
 from depth_digital_twin.point_cloud_node import (
     PositionKF, _fit_cup_axis_xy, _compute_box_world, _make_pointcloud2,
     _cup_frustum_geometry, _palette, _rot_to_quat, _classify_color_bgr,
-    _filter_spatial_density)
+    _filter_spatial_density, _fixed_cup_centroid)
 
 
 def _pc2_xyzrgb(cloud: PointCloud2):
@@ -237,6 +237,17 @@ class CupFusionNode(Node):
         gp('cup_fit_residual_max', 0.02)
         gp('cup_polygon_segments', 24)
         gp('cup_class_names', ['upright-cup'])
+        # Fixed-box mode (canonical cup box at robust centroid, no cone/OBB
+        # fit). This is the node that publishes /digital_twin/boxes in
+        # fusion mode. box only (frustum=None).
+        gp('fixed_cup_box', True)
+        gp('fixed_cup_min_points', 10)
+        gp('fixed_cup_base_pct', 10.0)
+        gp('fixed_cup_kf_residual_m', 0.008)
+        gp('fixed_cup_z_band_m', 0.12)
+        # residual->measurement-noise inflation for the track KF (mirror of
+        # point_cloud_node): r_diag *= 1 + infl*(residual/cup_resid_max).
+        gp('kf_residual_inflation', 1.0)
         # Color contract: fused cups must carry the SAME color identity the
         # standalone pipeline emitted (verifier/plan_executor parse `c=<color>`).
         gp('cup_colors', ['red', 'orange', 'yellow', 'green', 'blue',
@@ -340,6 +351,12 @@ class CupFusionNode(Node):
         self.cup_resid_max = float(P('cup_fit_residual_max'))
         self.cup_n_seg = int(P('cup_polygon_segments'))
         self.cup_class_names = set(P('cup_class_names'))
+        self.fixed_cup_box = bool(P('fixed_cup_box'))
+        self.fixed_cup_min_pts = max(1, int(P('fixed_cup_min_points')))
+        self.fixed_cup_base_pct = float(P('fixed_cup_base_pct'))
+        self.fixed_cup_kf_residual_m = float(P('fixed_cup_kf_residual_m'))
+        self.fixed_cup_z_band = float(P('fixed_cup_z_band_m'))
+        self.kf_resid_infl = float(P('kf_residual_inflation'))
         self._cup_colors = list(P('cup_colors'))
         self._color_w = {'exo': float(P('color_exo_weight')),
                          'hand': float(P('color_hand_weight'))}
@@ -657,6 +674,23 @@ class CupFusionNode(Node):
         """Return (center3, R3x3, size3, pose_kind, frustum|None, residual) or
         None. Mirrors point_cloud_node._fit_and_render_state's measurement."""
         cup_kind = any(m['class_name'] in self.cup_class_names for m in members)
+        if cup_kind and self.fixed_cup_box:
+            # Fixed-box path is TERMINAL for cups (no cone/OBB fallback) so
+            # standalone and fusion behave identically.
+            if pts.shape[0] < self.fixed_cup_min_pts:
+                return None
+            cup_r = 0.5 * max(self.cup_top_d, self.cup_bot_d)
+            res = _fixed_cup_centroid(
+                pts, cup_radius=cup_r, base_pct=self.fixed_cup_base_pct,
+                z_band=self.fixed_cup_z_band)
+            if res is None:
+                return None
+            cx, cy, z_base, resid_proxy = res
+            center = np.array([cx, cy, z_base + 0.5 * self.cup_h])
+            d_max = max(self.cup_top_d, self.cup_bot_d)
+            size = np.array([d_max, d_max, self.cup_h])
+            resid = max(self.fixed_cup_kf_residual_m, resid_proxy)
+            return center, np.eye(3), size, 'standing', None, resid
         if cup_kind:
             fit = _fit_cup_axis_xy(pts, top_d=self.cup_top_d,
                                    bot_d=self.cup_bot_d, height=self.cup_h)
@@ -1313,7 +1347,12 @@ class CupFusionNode(Node):
                       'settled': False, 'cams': set()}
                 self._tracks[gid] = tr
             else:
-                tr['kf'].update(f['center'], self.r_diag, self.kf_gate)
+                infl = 1.0
+                if self.kf_resid_infl > 0.0 and self.cup_resid_max > 0.0:
+                    infl = 1.0 + self.kf_resid_infl * (
+                        float(f['residual']) / self.cup_resid_max)
+                tr['kf'].update(
+                    f['center'], self.r_diag * infl, self.kf_gate)
                 tr['hits'] += 1
             tr['cams'] = {m['cam'] for m in f['members']}
             tr['miss'] = 0
