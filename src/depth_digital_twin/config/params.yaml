@@ -240,16 +240,11 @@ cup_fusion_node:
     scan_capture_s: 1.0          # HAND depth accumulation time per waypoint (s)
     scan_wait_s: 1.0             # settle wait after arrival before capturing (s)
     scan_arrival_tol_rad: 0.02   # per-joint arrival gate (~1.15°)
-    # false (default) = HAND frozen + exo LIVE: each tick re-fuses the frozen
-    # hand scan with the latest exo cloud, so cups exo newly sees appear and a
-    # picked cup stays from the hand lock. true = BOTH cameras frozen into one
-    # static lock. Toggle live from the Tk "Lock exo too" checkbox.
-    scan_lock_exo: false
-
-    # Live hand-view toggle (Tk "Use hand (live)" checkbox). true (default) =
-    # hand cloud contributes to the LIVE fit; false = exo only. Scan/lock always
-    # use the hand view regardless.
-    live_use_hand: true
+    # Live hand-view toggle (Tk "Use hand (live)" checkbox). false (default)
+    # = live fit is EXO ONLY; hand observations show in the panel (H-cloud/
+    # H-box) but never enter the fit or RViz. Scan-frozen hand observations
+    # ([S]) always participate regardless.
+    live_use_hand: false
 
     # ── Live noise suppression ────────────────────────────────────────────
     # (A) Temporal frame accumulation: union each camera's clouds over this

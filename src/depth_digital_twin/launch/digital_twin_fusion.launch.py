@@ -46,9 +46,22 @@ Args:
   sequence    : recorded sequence dir — REQUIRED for replay, ignored for live.
   intr_exo    : LIVE exo intrinsics YAML (default: package config/intrinsics.yaml)
   intr_hand   : LIVE hand intrinsics YAML (default: package config/intrinsics.yaml)
+  exo_cam_ns  : exo camera topic namespace (default /camera_exo — the replay
+                sequence_player layout). LIVE feeds that publish elsewhere
+                (cameras_only.launch.py / Isaac sim → /exo/exo) pass their ns
+                here; every exo subscriber AND the replay player follow it.
+  hand_cam_ns : hand camera topic namespace (default /camera_hand; live
+                RealSense/Isaac → /hand/hand).
+  world_marker_timeout_s : override world_origin_node's ArUco timeout (s).
+                Empty (default) keeps the params.yaml value. Slow-to-start
+                camera sources (Isaac Sim) need a large value or the exo
+                origin falls back to the floor plane fit.
   dsr_joint_topic : LIVE source joints bridged to /joint_states (default
                     /dsr01/joint_states)
   with_pose_bridge: LIVE — run robot_pose_bridge_node (default true)
+  with_rsp    : run the m0609 robot_state_publisher (default true). Set false
+                when a dsr bringup already broadcasts the identical chain on
+                the global /tf (duplicate-stamp TF spam otherwise).
   loop        : replay loop (default false)        autostart : play now (default true)
   params      : pipeline params.yaml (default: package config)
   rviz        : launch RViz2 overlay (default true)
@@ -80,13 +93,9 @@ _HANDEYE_DEFAULT = ('/home/eunwoosong/Projects/ros2-recode-sequence/'
 # hardcoded here and in params.yaml — ignore the namespace, so they need
 # explicit remaps. SetRemap also remaps the service NAMES the panel/skill_manager
 # build from params, so the namespaced servers are reached.)
+# Camera topics are added per-launch from the exo_cam_ns/hand_cam_ns args —
+# see _ns_remap_names().
 _NS_REMAP_NAMES = (
-    '/camera_exo/color/image_raw',
-    '/camera_exo/aligned_depth_to_color/image_raw',
-    '/camera_exo/color/camera_info',
-    '/camera_hand/color/image_raw',
-    '/camera_hand/aligned_depth_to_color/image_raw',
-    '/camera_hand/color/camera_info',
     '/joint_states', '/tf', '/tf_static',
     '/digital_twin/detections_exo', '/digital_twin/detection_debug_exo',
     '/digital_twin/detections_hand', '/digital_twin/detection_debug_hand',
@@ -96,18 +105,35 @@ _NS_REMAP_NAMES = (
     '/digital_twin/box_debug_exo', '/digital_twin/box_debug_hand',
     '/digital_twin/depth_debug_exo', '/digital_twin/depth_debug_hand',
     '/digital_twin/boxes_rim_dbg', '/digital_twin/fusion_health',
+    '/digital_twin/points_exo', '/digital_twin/points_hand',
+    '/digital_twin/dbg_boxes_exo', '/digital_twin/dbg_boxes_hand',
+    '/cup_fusion_node/capture_scan_now',
+    '/handeye_markers', '/handeye_camera_pose_in_base',
     '/vision/cups_on_table', '/stack_track_ids',
     '/cup_fusion_node/reset_bias',
-    '/digital_twin/points', '/digital_twin/boxes',
+    '/digital_twin/boxes',
     '/world_origin_node_exo/redetect', '/world_origin_node_hand/redetect',
     '/cup_fusion_node/clear_scan', '/cup_fusion_node/set_parameters',
+    # The panel's producer tuning sliders call these absolute param services.
+    '/point_cloud_node_exo/set_parameters',
+    '/point_cloud_node_hand/set_parameters',
 )
 
 
-def _namespace_group(ns: str, actions: list):
+def _ns_remap_names(exo_ns: str, hand_ns: str) -> tuple:
+    """Full absolute-name collision list: the static names above plus the
+    camera topics under the launch-selected exo/hand namespaces."""
+    cams = tuple(
+        f'{ns}/{leaf}' for ns in (exo_ns, hand_ns)
+        for leaf in ('color/image_raw', 'aligned_depth_to_color/image_raw',
+                     'color/camera_info'))
+    return cams + _NS_REMAP_NAMES
+
+
+def _namespace_group(ns: str, actions: list, remap_names: tuple):
     """Wrap every replay action under `/<ns>`: push the namespace (node names +
     relative names) and remap the absolute colliding names above into it."""
-    remaps = [SetRemap(src=n, dst=f'/{ns}{n}') for n in _NS_REMAP_NAMES]
+    remaps = [SetRemap(src=n, dst=f'/{ns}{n}') for n in remap_names]
     return GroupAction([PushRosNamespace(ns), *remaps, *actions])
 
 
@@ -153,6 +179,21 @@ def _setup(context, *_, **__):
     ns = LaunchConfiguration('ns').perform(context).strip().strip('/')
     seq = LaunchConfiguration('sequence').perform(context)
     seq_valid = bool(seq and os.path.isdir(seq))
+
+    # Camera topic namespaces: every exo/hand subscriber below (and the replay
+    # publisher) builds its topics from these, so one arg rewires the whole
+    # pipeline to whatever the camera source publishes (replay /camera_exo,
+    # live RealSense or Isaac sim /exo/exo + /hand/hand).
+    exo_ns = '/' + LaunchConfiguration(
+        'exo_cam_ns').perform(context).strip().strip('/')
+    hand_ns = '/' + LaunchConfiguration(
+        'hand_cam_ns').perform(context).strip().strip('/')
+    exo_color = f'{exo_ns}/color/image_raw'
+    exo_depth = f'{exo_ns}/aligned_depth_to_color/image_raw'
+    exo_info = f'{exo_ns}/color/camera_info'
+    hand_color = f'{hand_ns}/color/image_raw'
+    hand_depth = f'{hand_ns}/aligned_depth_to_color/image_raw'
+    hand_info = f'{hand_ns}/color/camera_info'
     # LIVE = no namespace AND no sequence → defer the trajectory to the real
     # robot (dsr_bringup2). A namespace, or a sequence, means REPLAY.
     live = (not ns) and (not seq_valid)
@@ -209,6 +250,13 @@ def _setup(context, *_, **__):
     # ArUco / hand-eye params live under `world_origin_node:`, which would NOT
     # apply to the renamed _exo/_hand nodes — re-pass them as an inline dict.
     wo = (_y.get('world_origin_node') or {}).get('ros__parameters') or {}
+    # Optional ArUco-timeout override (slow-starting camera sources, e.g.
+    # Isaac Sim, need far more than the params.yaml 15 s before the exo
+    # origin falls back to the floor plane fit).
+    wm_timeout = LaunchConfiguration(
+        'world_marker_timeout_s').perform(context).strip()
+    if wm_timeout:
+        wo = dict(wo, world_marker_timeout_s=float(wm_timeout))
     # Cup model lives under point_cloud_node: — pass the geometry to
     # cup_fusion_node so the fused fit/frustum use the SAME Speed Stack cup.
     pn = (_y.get('point_cloud_node') or {}).get('ros__parameters') or {}
@@ -225,6 +273,13 @@ def _setup(context, *_, **__):
         'box_standing_ratio', 'box_min_elongation') if k in pn}
     model_exo = dn.get('model_exo') or dn.get('model') or ''
     model_hand = dn.get('model_hand') or dn.get('model') or ''
+    # Like `wo`/`pn` above: the params.yaml `detection_node:` section does
+    # NOT match the RENAMED detection_node_exo/_hand, so its class filter /
+    # confidence / device silently fell back to code defaults (the 3-class
+    # hand model then leaked its extra class into the producers). Re-pass
+    # the runtime keys inline; model/imgsz/topics stay per-node below.
+    det_common = {k: dn[k] for k in
+                  ('target_classes', 'confidence', 'device') if k in dn}
     imgsz = int(LaunchConfiguration('imgsz').perform(context))
 
     EXO_F = 'exo_color_optical_frame'
@@ -247,14 +302,12 @@ def _setup(context, *_, **__):
             name='sequence_player_node', output='screen',
             parameters=[{
                 'sequence_dir': seq,
-                'exo_color_topic': '/camera_exo/color/image_raw',
-                'exo_depth_topic':
-                    '/camera_exo/aligned_depth_to_color/image_raw',
-                'exo_info_topic': '/camera_exo/color/camera_info',
-                'hand_color_topic': '/camera_hand/color/image_raw',
-                'hand_depth_topic':
-                    '/camera_hand/aligned_depth_to_color/image_raw',
-                'hand_info_topic': '/camera_hand/color/camera_info',
+                'exo_color_topic': exo_color,
+                'exo_depth_topic': exo_depth,
+                'exo_info_topic': exo_info,
+                'hand_color_topic': hand_color,
+                'hand_depth_topic': hand_depth,
+                'hand_info_topic': hand_info,
                 'exo_frame': EXO_F, 'hand_frame': HAND_F,
                 'joint_states_topic': '/joint_states',
                 'autostart':
@@ -276,9 +329,16 @@ def _setup(context, *_, **__):
         ' rt_host:=127.0.0.1 update_rate:=100',
         ' model:=', LaunchConfiguration('model'),
     ])
+    # with_rsp:=false skips it: when a dsr bringup is ALREADY broadcasting
+    # the identical world→base_link→…→link_6 chain on the global /tf (same
+    # m0609 xacro), a second publisher emits duplicate-stamp transforms
+    # (TF_REPEATED_DATA spam in every listener) and the pose-bridge's
+    # zero-joint idle fallback would flap the chain to the home pose on a
+    # joint-stream stall. Keep true for replay/standalone (no bringup).
     rsp = Node(
         package='robot_state_publisher', executable='robot_state_publisher',
         name='robot_state_publisher', output='screen',
+        condition=IfCondition(LaunchConfiguration('with_rsp')),
         parameters=[{'robot_description': ParameterValue(
             robot_description, value_type=str)}])
 
@@ -289,8 +349,8 @@ def _setup(context, *_, **__):
         name='world_origin_node_exo', output='screen',
         parameters=common_exo + [wo, {
             'world_origin_mode': 'aruco',
-            'color_topic': '/camera_exo/color/image_raw',
-            'depth_topic': '/camera_exo/aligned_depth_to_color/image_raw',
+            'color_topic': exo_color,
+            'depth_topic': exo_depth,
             'camera_frame': EXO_F,
             'world_frame': 'world',
         }])
@@ -300,7 +360,7 @@ def _setup(context, *_, **__):
         name='world_origin_node_hand', output='screen',
         parameters=common_hand + [wo, {
             'world_origin_mode': 'handeye_aruco',
-            'color_topic': '/camera_hand/color/image_raw',
+            'color_topic': hand_color,
             'camera_frame': HAND_F,
             'world_frame': 'world',
             'base_frame': 'base_link',
@@ -310,8 +370,8 @@ def _setup(context, *_, **__):
     det_exo = Node(
         package='depth_digital_twin', executable='detection_node',
         name='detection_node_exo', output='screen',
-        parameters=common_exo + [{
-            'image_topic': '/camera_exo/color/image_raw',
+        parameters=common_exo + [det_common, {
+            'image_topic': exo_color,
             'detections_topic': '/digital_twin/detections_exo',
             'debug_topic': '/digital_twin/detection_debug_exo',
             'model': model_exo,
@@ -321,8 +381,8 @@ def _setup(context, *_, **__):
         package='depth_digital_twin', executable='point_cloud_node',
         name='point_cloud_node_exo', output='screen',
         parameters=prod_base + [{'intrinsics_path': intr_exo}, {
-            'rgb_topic': '/camera_exo/color/image_raw',
-            'depth_topic': '/camera_exo/aligned_depth_to_color/image_raw',
+            'rgb_topic': exo_color,
+            'depth_topic': exo_depth,
             'detections_topic': '/digital_twin/detections_exo',
             'camera_frame': EXO_F,
             'world_frame': 'world',
@@ -344,8 +404,8 @@ def _setup(context, *_, **__):
     det_hand = Node(
         package='depth_digital_twin', executable='detection_node',
         name='detection_node_hand', output='screen',
-        parameters=common_hand + [{
-            'image_topic': '/camera_hand/color/image_raw',
+        parameters=common_hand + [det_common, {
+            'image_topic': hand_color,
             'detections_topic': '/digital_twin/detections_hand',
             'debug_topic': '/digital_twin/detection_debug_hand',
             'model': model_hand,
@@ -355,8 +415,8 @@ def _setup(context, *_, **__):
         package='depth_digital_twin', executable='point_cloud_node',
         name='point_cloud_node_hand', output='screen',
         parameters=prod_base + [{'intrinsics_path': intr_hand}, {
-            'rgb_topic': '/camera_hand/color/image_raw',
-            'depth_topic': '/camera_hand/aligned_depth_to_color/image_raw',
+            'rgb_topic': hand_color,
+            'depth_topic': hand_depth,
             'detections_topic': '/digital_twin/detections_hand',
             'camera_frame': HAND_F,
             'world_frame': 'world',
@@ -383,7 +443,6 @@ def _setup(context, *_, **__):
             'exo_obs_topic': '/digital_twin/cup_obs_exo',
             'hand_obs_topic': '/digital_twin/cup_obs_hand',
             'boxes_topic': '/digital_twin/boxes',
-            'points_topic': '/digital_twin/points',
             'world_frame': 'world',
             # scan-lock reads /joint_states (remapped under /<ns> in replay).
             'scan_joint_states_topic': '/joint_states',
@@ -393,19 +452,19 @@ def _setup(context, *_, **__):
         package='depth_digital_twin', executable='digital_twin_panel',
         name='digital_twin_panel', output='screen',
         parameters=[{
-            # This launch uses /camera_exo|hand/* feeds and the _exo/_hand
-            # world-origin nodes. Set image topics EXPLICITLY (do not rely on
-            # the panel's code defaults, which target start.sh's /exo/exo,
-            # /hand/hand split-launch topology).
-            'exo_color_topic': '/camera_exo/color/image_raw',
-            'exo_depth_topic': '/camera_exo/aligned_depth_to_color/image_raw',
+            # This launch uses the exo_cam_ns/hand_cam_ns feeds and the
+            # _exo/_hand world-origin nodes. Set image topics EXPLICITLY (do
+            # not rely on the panel's code defaults, which target start.sh's
+            # /exo/exo, /hand/hand split-launch topology).
+            'exo_color_topic': exo_color,
+            'exo_depth_topic': exo_depth,
             # 3D pane = the rim-fit overlay (observed contour green, fitted
             # silhouette cyan, depth init red, per-cup iou/rms/b/cov text) —
             # the actual live measurement. Raw YOLO boxes remain on
             # /digital_twin/detection_debug_* if needed.
             'exo_debug_topic': '/digital_twin/rim_debug_exo',
-            'hand_color_topic': '/camera_hand/color/image_raw',
-            'hand_depth_topic': '/camera_hand/aligned_depth_to_color/image_raw',
+            'hand_color_topic': hand_color,
+            'hand_depth_topic': hand_depth,
             'hand_debug_topic': '/digital_twin/rim_debug_hand',
             'exo_redetect_srv': '/world_origin_node_exo/redetect',
             'hand_redetect_srv': '/world_origin_node_hand/redetect',
@@ -422,7 +481,9 @@ def _setup(context, *_, **__):
         fusion, panel, rviz]
 
     # ns set ⇒ isolate the whole replay stack under /<ns> (coexist with live).
-    return [_namespace_group(ns, entities)] if ns else entities
+    if ns:
+        return [_namespace_group(ns, entities, _ns_remap_names(exo_ns, hand_ns))]
+    return entities
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -446,9 +507,29 @@ def generate_launch_description() -> LaunchDescription:
             default_value=os.path.join(pkg, 'config', 'intrinsics.yaml'),
             description='LIVE hand intrinsics YAML.'),
         DeclareLaunchArgument(
+            'exo_cam_ns', default_value='/camera_exo',
+            description='Exo camera topic namespace (<ns>/color/image_raw, '
+                        '<ns>/aligned_depth_to_color/image_raw). Default = '
+                        'replay sequence_player layout; live cameras_only/'
+                        'Isaac publish /exo/exo.'),
+        DeclareLaunchArgument(
+            'hand_cam_ns', default_value='/camera_hand',
+            description='Hand camera topic namespace (live RealSense/Isaac '
+                        'publish /hand/hand).'),
+        DeclareLaunchArgument(
+            'world_marker_timeout_s', default_value='',
+            description='Override world_origin ArUco timeout in seconds '
+                        '(empty = params.yaml). Use a large value for '
+                        'slow-starting camera sources (Isaac Sim).'),
+        DeclareLaunchArgument(
             'dsr_joint_topic', default_value='/dsr01/joint_states',
             description='LIVE source joints bridged → /joint_states.'),
         DeclareLaunchArgument('with_pose_bridge', default_value='true'),
+        DeclareLaunchArgument(
+            'with_rsp', default_value='true',
+            description='Run the m0609 robot_state_publisher. Set false when '
+                        'a dsr bringup already broadcasts the same chain on '
+                        'the global /tf (avoids duplicate-stamp TF spam).'),
         DeclareLaunchArgument('handeye_npy', default_value=_HANDEYE_DEFAULT),
         DeclareLaunchArgument('model', default_value='m0609'),
         DeclareLaunchArgument('color', default_value='white'),

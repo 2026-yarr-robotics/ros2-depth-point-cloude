@@ -881,6 +881,11 @@ class PointCloudNode(Node):
                 observations=rim_obs))
         if rim_dbg['canvas'] is not None:
             canvas = rim_dbg['canvas']
+            if self._aruco_overlay:
+                # ArUco marker + world(base) axes from the calibrated TF —
+                # restored from the legacy box_debug stream so the panel 3D
+                # pane shows WHERE the world origin sits in the image.
+                self._draw_aruco_axes(canvas)
             # Draw every track's last overlay state IDENTICALLY whether the
             # fit ran this frame or is cached from up to 1 s ago — constant
             # brightness/labels, no strobing at the fit-throttle cadence.

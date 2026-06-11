@@ -517,9 +517,28 @@ ros2 topic echo /digital_twin/fusion_health   # 컵별 카메라 잔차(mm), 레
   카메라의 `world_origin_node_{exo,hand}/redetect` 서비스를 호출한다.
 - 본문: **2행 × 3열 이미지 그리드** — (exo/hand) × (RGB, Depth, 3D). **3D 열은
   rim fit 오버레이**(`/digital_twin/rim_debug_*`): 관측 윤곽(녹), fit 실루엣(시안),
-  depth 초기값(빨강), 컵별 `iou/rms/b/cov` 텍스트(실패 시 사유). 원시 YOLO 박스는
-  `/digital_twin/detection_debug_*`에 그대로 남아 있다.
-- 기존 `world_origin_control` 팝업은 이 패널로 대체된다.
+  depth 초기값(빨강), 컵별 `iou/rms/b/cov` 텍스트(실패 시 사유), ArUco/base 축
+  투영. 원시 YOLO 박스는 `/digital_twin/detection_debug_*`에 그대로 남아 있다.
+- **Debug plot 행**: `1 H-cloud(주황, 기본 on) / 2 H-box / 3 E-cloud(파랑, 기본
+  on) / 4 E-box / 5 F(final, 기본 on) | Use hand(live, 기본 off)`.
+  H/E 채널은 카메라별 단색 러프 표시(`/digital_twin/points_{exo,hand}`,
+  `/digital_twin/dbg_boxes_{exo,hand}`, 박스에는 `Hand1`/`Exo2` 텍스트)이고,
+  정밀 추정은 **F = `/digital_twin/boxes`** 하나뿐이다. 융합 `/digital_twin/points`
+  토픽은 제거되었다.
+- **Use hand(live)**: 해제(기본) 시 라이브 fit은 exo 단독 — hand 검출은 패널에는
+  보이지만 RViz/측정에는 들어가지 않는다. 스캔으로 동결된 hand 관측([S])은 이
+  설정과 무관하게 항상 사용된다.
+- **라벨 v2**: `[F] [S] #N <color> cup(x, y, z)` — `[F]`=exo+hand 융합,
+  `[S]`=scan 지지(둘 다면 `[F] [S]`), 좌표는 KF 중심. 구 `[L]`(settled) 태그는
+  폐지. 다운스트림 파서(skill-manager/plan_executor/pick_node/
+  boxes_to_detections)는 구·신 포맷을 모두 수용한다.
+- **Scan**: skill-manager가 `scan_lock_active`를 켜면 관절이 `scan_waypoints_deg`
+  범위로 들어올 때 1 s 대기 후 1 s간 hand 관측을 동결한다(점군 lock 아님 — exo는
+  항상 라이브 재피팅). exo가 못 보는 컵은 `[S]`로 영구 추적되고, exo와 한 번이라도
+  융합된 `[S]` 컵은 exo가 놓치면 함께 사라진다. 패널 **Clear Scan**(=`~/clear_scan`)
+  으로 동결 해제; replay/sim 검증용 `~/capture_scan_now` 서비스도 있다.
+- 기존 `world_origin_control` 팝업은 이 패널로 대체된다. (구 Scan&Lock /
+  Lock exo too / Clear Lock 컨트롤은 제거되었다.)
 
 > ⚠ 라이브 `dsr_bringup2`가 켜져 있으면 `world→base_link→…→link_6` TF가 충돌한다.
 > 종료 후 실행하거나 `ROS_DOMAIN_ID`/`ns:=`로 분리한다.
