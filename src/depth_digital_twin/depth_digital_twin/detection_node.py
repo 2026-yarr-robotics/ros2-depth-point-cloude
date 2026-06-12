@@ -73,6 +73,18 @@ class DetectionNode(Node):
         self.declare_parameter('device', '')  # '', 'cpu', '0'
         self.declare_parameter('imgsz', 640)  # YOLO inference resolution (px)
 
+        # OpenCV/torch spawn one worker per core (32 here) by default; for
+        # the small per-frame CPU ops in this node the spawn/spin overhead
+        # exceeds the parallel gain and inflated each detection process to
+        # ~6 cores. Two threads suffice — the heavy part (forward pass) is
+        # on the GPU.
+        cv2.setNumThreads(2)
+        try:
+            import torch
+            torch.set_num_threads(2)
+        except ImportError:
+            pass
+
         # Lazy import so the package can be inspected without ultralytics installed.
         try:
             from ultralytics import YOLO  # type: ignore
@@ -139,18 +151,24 @@ class DetectionNode(Node):
 
         out = SegmentedObjectArray()
         out.header = msg.header  # share stamp + frame_id with the source image
-        debug = bgr.copy()
+        # Debug overlay only when someone is actually watching: the copy +
+        # per-object zeros_like/addWeighted full-frame blends were ~half of
+        # this node's per-frame CPU and ran unconditionally (same pattern as
+        # cup_fusion's subscriber-gated debug channels).
+        want_debug = self.debug_pub.get_subscription_count() > 0
+        debug = bgr.copy() if want_debug else None
 
         # If the model returned nothing, still publish the empty array AND a
         # live debug image (annotated with status) so the user always has a
         # video feed.
         if r.masks is None or r.boxes is None:
-            cv2.putText(debug, 'no detections', (10, 28),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
             self.pub.publish(out)
-            dbg = self.bridge.cv2_to_imgmsg(debug, encoding='bgr8')
-            dbg.header = msg.header
-            self.debug_pub.publish(dbg)
+            if want_debug:
+                cv2.putText(debug, 'no detections', (10, 28),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+                dbg = self.bridge.cv2_to_imgmsg(debug, encoding='bgr8')
+                dbg.header = msg.header
+                self.debug_pub.publish(dbg)
             return
 
         # masks.data: tensor (N, Hm, Wm) in [0,1] in the model's resolution.
@@ -181,9 +199,12 @@ class DetectionNode(Node):
             x1, y1, x2, y2 = (int(round(v)) for v in xyxy.tolist())
             inst_id = int(ids[i]) if ids is not None else -1
 
-            # Resize mask to source frame and binarise.
-            mask_src = cv2.resize(masks[i], (w, h), interpolation=cv2.INTER_NEAREST)
-            mask_u8 = (mask_src > 0.5).astype(np.uint8) * 255
+            # Binarise at MODEL resolution first (~640x384 float32), THEN
+            # upsample the uint8 mask: one NEAREST resize replaces the
+            # float32 full-res resize + compare + cast (~3x less CPU/mask).
+            mask_u8 = cv2.resize(
+                (masks[i] > 0.5).astype(np.uint8) * 255, (w, h),
+                interpolation=cv2.INTER_NEAREST)
 
             obj = SegmentedObject()
             obj.class_name = name
@@ -198,22 +219,25 @@ class DetectionNode(Node):
             obj.mask.header = msg.header
             out.objects.append(obj)
 
-            cv2.rectangle(debug, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            id_tag = f'#{inst_id}' if inst_id >= 0 else '#?'
-            cv2.putText(debug, f'{id_tag} {name} {score:.2f}', (x1, max(0, y1 - 6)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            tint = np.zeros_like(debug)
-            tint[mask_u8 > 0] = (0, 0, 255)
-            debug = cv2.addWeighted(debug, 1.0, tint, 0.4, 0.0)
+            if want_debug:
+                cv2.rectangle(debug, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                id_tag = f'#{inst_id}' if inst_id >= 0 else '#?'
+                cv2.putText(debug, f'{id_tag} {name} {score:.2f}',
+                            (x1, max(0, y1 - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                tint = np.zeros_like(debug)
+                tint[mask_u8 > 0] = (0, 0, 255)
+                debug = cv2.addWeighted(debug, 1.0, tint, 0.4, 0.0)
 
-        # Annotate frame summary so an empty result is still distinguishable
-        # from "model not running".
-        cv2.putText(debug, f'objects={len(out.objects)}', (10, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         self.pub.publish(out)
-        dbg = self.bridge.cv2_to_imgmsg(debug, encoding='bgr8')
-        dbg.header = msg.header
-        self.debug_pub.publish(dbg)
+        if want_debug:
+            # Annotate frame summary so an empty result is still
+            # distinguishable from "model not running".
+            cv2.putText(debug, f'objects={len(out.objects)}', (10, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            dbg = self.bridge.cv2_to_imgmsg(debug, encoding='bgr8')
+            dbg.header = msg.header
+            self.debug_pub.publish(dbg)
 
 
 def main(args: Iterable[str] | None = None) -> None:
