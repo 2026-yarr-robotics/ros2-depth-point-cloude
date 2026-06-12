@@ -60,10 +60,10 @@ detection_node:
     # `model` = default / live-camera weight (digital_twin.launch.py and
     # digital_twin_with_robot.launch.py when no view-specific override is
     # passed).  Both exo and hand ship the same 2-class taxonomy now.
-    model: /home/ssu/cup-stack-integration/vision/ros2-depth-point-cloude/vision/yolo/0610-2.pt
+    model: /home/ssu/cup-stack-integration/ros2-depth-point-cloude/vision/yolo/0610-2.pt
     # Per-view weights for digital_twin_sequence.launch.py (view:=exo|hand).
-    model_exo: /home/ssu/cup-stack-integration/vision/ros2-depth-point-cloude/vision/yolo/0610-2.pt
-    model_hand: /home/ssu/cup-stack-integration/vision/ros2-depth-point-cloude/vision/yolo/speedstack3class_yolo26s_seg_1280_epoch250_3class_lightaug_geom1_redp25_sm_a100_best.pt
+    model_exo: /home/ssu/cup-stack-integration/ros2-depth-point-cloude/vision/yolo/0610-2.pt
+    model_hand: /home/ssu/cup-stack-integration/ros2-depth-point-cloude/vision/yolo/speedstack3class_yolo26s_seg_1280_epoch250_3class_lightaug_geom1_redp25_sm_a100_best.pt
     # Both models emit the same two classes:
     #   "fallen-cup"  (id=1)
     #   "upright-cup" (id=2)
