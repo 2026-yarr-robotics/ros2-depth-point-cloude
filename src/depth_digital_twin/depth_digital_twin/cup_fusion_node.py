@@ -231,6 +231,15 @@ class CupFusionNode(Node):
         # STAGE-3 association: 3D ELLIPSOIDAL gate (xy and z scaled separately so
         # a pyramid keeps distinct tracks per layer — XY-only collapsed them).
         gp('assoc_gate_xy_m', 0.035)
+        # Identity-first association: ByteTrack iids are stable per camera
+        # (measured constant over 60 s), so a (cam,iid) already bound to a
+        # live track names the SAME physical cup even when its measured
+        # centre jumps the XY gate — a level-snap flip slides the exo
+        # estimate ~55 mm along the view ray and used to mint a fresh gid
+        # every flip (the far cup alternated two gids, 7 boxes for 6 cups).
+        # This is the loose sanity radius for accepting an iid-bound match
+        # (guards ByteTrack id reuse on a different cup after occlusion).
+        gp('assoc_iid_max_jump_m', 0.15)
         gp('assoc_gate_z_m', 0.018)
         gp('min_hits', 3)              # consecutive matches before a track renders
         gp('points_voxel_m', 0.004)    # deterministic /points downsample
@@ -467,6 +476,7 @@ class CupFusionNode(Node):
         self.postmerge_dxy = float(P('postmerge_dxy_m'))
         self.postmerge_dz = float(P('postmerge_dz_m'))
         self.assoc_gate_xy = float(P('assoc_gate_xy_m'))
+        self.assoc_iid_max_jump = float(P('assoc_iid_max_jump_m'))
         self.assoc_gate_z = float(P('assoc_gate_z_m'))
         self.min_hits = int(P('min_hits'))
         self.points_voxel = float(P('points_voxel_m'))
@@ -588,6 +598,9 @@ class CupFusionNode(Node):
         # (which would make the filter over-confident and the box flicker).
         self._proc_stamp: dict[str, float] = {'exo': -1.0, 'hand': -1.0}
         self._tracks: dict[int, dict] = {}
+        # (cam, iid) → gid identity bindings (see assoc_iid_max_jump_m).
+        # Lazily validated against _tracks at lookup; pruned when oversized.
+        self._idkey_gid: dict[tuple, int] = {}
         self._stacked_ids: set = set()
         self._next_gid = 1
         self._last_ids: set[int] = set()
@@ -736,6 +749,7 @@ class CupFusionNode(Node):
             'postmerge_dxy_m': ('postmerge_dxy', float),
             'postmerge_dz_m': ('postmerge_dz', float),
             'assoc_gate_xy_m': ('assoc_gate_xy', float),
+            'assoc_iid_max_jump_m': ('assoc_iid_max_jump', float),
             'assoc_gate_z_m': ('assoc_gate_z', float),
             'min_hits': ('min_hits', int),
             'keepalive_ticks': ('keepalive', int),
@@ -981,11 +995,32 @@ class CupFusionNode(Node):
             #                 one cup; dropping it avoids a giant box.
         return center, R, size, kind, None, 0.0
 
-    def _resolve_gid(self, center: np.ndarray) -> int:
-        """Associate a fitted centre to an existing track by a 3D ELLIPSOIDAL
-        gate (XY and Z scaled independently). XY-only distance collapsed a
-        pyramid's vertical column into one track; an ellipsoid keeps layers
-        apart (Z gate < layer spacing) while merging cross-view jitter (XY)."""
+    def _resolve_gid(self, center: np.ndarray, idkeys=()) -> int:
+        """Associate a fitted centre to an existing track.
+
+        Pass 1 — IDENTITY: a (cam,iid) of this fit already bound to a live
+        track names the same physical cup (ByteTrack iids are per-camera
+        stable), even when the centre jumped the XY gate — e.g. the
+        level-snap flip that slides the exo estimate ~55 mm along its view
+        ray. Without this, every flip minted a fresh gid (duplicate boxes +
+        id churn). A loose radius still rejects ByteTrack id reuse on a
+        different cup after a long occlusion.
+
+        Pass 2 — GEOMETRY: 3D ELLIPSOIDAL gate (XY and Z scaled
+        independently). XY-only distance collapsed a pyramid's vertical
+        column into one track; an ellipsoid keeps layers apart (Z gate <
+        layer spacing) while merging cross-view jitter (XY)."""
+        bound = {g for k in idkeys
+                 if (g := self._idkey_gid.get(k)) is not None
+                 and g in self._tracks}
+        if bound:
+            best, best_d = None, float('inf')
+            for g in bound:
+                d = float(np.hypot(*(center - self._tracks[g]['kf'].x)[:2]))
+                if d < best_d:
+                    best_d, best = d, g
+            if best_d <= self.assoc_iid_max_jump:
+                return best
         best, best_cost = None, 1.0
         for gid, tr in self._tracks.items():
             d = center - tr['kf'].x
@@ -1268,7 +1303,7 @@ class CupFusionNode(Node):
             if xyz.shape[0] < 32:
                 continue
             out.append({
-                'cam': cam, 'xyz': xyz, 'rgb': rgb,
+                'cam': cam, 'iid': int(o.instance_id), 'xyz': xyz, 'rgb': rgb,
                 'centroid': np.array([o.centroid.x, o.centroid.y,
                                       o.centroid.z], dtype=np.float64),
                 **self._cup_geom_fields(xyz),
@@ -1714,6 +1749,7 @@ class CupFusionNode(Node):
                 'fused': ('exo' in meas_obs and 'hand' in meas_obs),
                 'scan_keys': scan_keys,
                 'cams': {o.camera: {
+                    'iid': int(o.instance_id),
                     'resid_mm': round(1e3 * float(np.linalg.norm(r)), 1),
                     'iou': round(float(o.mask_iou), 3),
                     'rms_px': round(float(o.chamfer_rms_px), 2),
@@ -1774,6 +1810,7 @@ class CupFusionNode(Node):
                 height=self.cup_h, floor_z=e['z_base'], n_seg=self.cup_n_seg)
             members = [{
                 'cam': cam,
+                'iid': int(c.get('iid', -1)),
                 'class_name': 'upright-cup',
                 'score': c['score'],
                 'rgb': np.zeros(0, np.float32),   # color via color_name
@@ -2034,7 +2071,10 @@ class CupFusionNode(Node):
         now_s = self.get_clock().now().nanoseconds * 1e-9
         alive: set[int] = set()
         for f in final_fits:
-            gid = self._resolve_gid(f['center'])
+            idkeys = {(m['cam'], int(m.get('iid', -1)))
+                      for m in f['members']}
+            idkeys = {k for k in idkeys if k[1] >= 0}
+            gid = self._resolve_gid(f['center'], idkeys)
             tr = self._tracks.get(gid)
             if tr is None:
                 tr = {'kf': PositionKF(f['center'], self.p0_diag, self.q_diag),
@@ -2054,6 +2094,14 @@ class CupFusionNode(Node):
             tr['miss'] = 0
             tr['last_match_t'] = now_s
             tr['last_match_rs'] = self._rim_stream_now   # rim-array stream t
+            # Refresh identity bindings (Pass-1 association source). Lazy
+            # cleanup: dead-gid entries are filtered at lookup; prune when
+            # the table outgrows any plausible live id population.
+            for k in idkeys:
+                self._idkey_gid[k] = gid
+            if len(self._idkey_gid) > 256:
+                self._idkey_gid = {k: g for k, g in self._idkey_gid.items()
+                                   if g in self._tracks}
             tr['scan_backed'] = bool(f.get('scan'))
             if f.get('scan'):
                 tr['scan_keys'] = f.get('scan_keys', [])
