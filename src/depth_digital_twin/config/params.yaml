@@ -259,20 +259,42 @@ cup_fusion_node:
     # (global /joint_states has no publisher). scan-lock arrival
     # detection reads this; joint names already match joint_1..6.
     scan_joint_states_topic: /dsr01/joint_states
-    # ── Scan & Lock (multi-view accumulate-at-waypoints) ──────────────────
-    # Edit here and relaunch (no rebuild — params.yaml is symlink-installed).
-    # Waypoints: a FLAT list of 6 joint angles (deg) per waypoint, concatenated.
-    # The arm visits each in order; arrival is auto-detected by joint match.
-    # Default below = a SINGLE waypoint (pos1). Append 6 more values to add a
-    # 2nd waypoint, etc.  ← set this to the robot's new scan pose.
+    # ── Scan & Lock (auto re-capture at the agent home pose) ─────────────
+    # NEW agent flow (2026-06-13): the agent no longer calls the scan API —
+    # after every command it returns to a HIGH home pose that sees the whole
+    # workspace. With live_use_hand=true the FSM is armed PERMANENTLY (no
+    # scan_lock_active needed) and every return to the waypoint re-runs
+    # capture→freeze (leave-latch re-arms on departure; the commit REPLACES
+    # the waypoint's frozen subset = atomic clear→scan→lock, [S] cups never
+    # blank during the capture window).
+    #   → scan_waypoints_deg MUST be the agent's home joint angles. Update
+    #     live without relaunch:
+    #       ros2 param set /cup_fusion_node scan_waypoints_deg "[j1..j6]"
+    #     (live set drops the old waypoints' frozen captures.)
+    # Arrival detection: 'cartesian' matches the EE position (TF base_link→
+    # link_6) against scan_home_xyz — the agent returns to ONE home XYZ but
+    # its wrist joints differ per task (place orientations), so the joint
+    # match below would never re-fire. 'joint' = legacy waypoint match.
+    scan_arrival_mode: cartesian
+    scan_home_xyz: [0.244, -0.012, 0.515]   # agent home, base_link frame (m)
+    #   measured 2026-06-13: EE=(0.2444,-0.0118,0.5149), joints
+    #   [-2.84,-14.92,88.48,-2.96,107.60,86.61]° (wrist ≠ bringup default —
+    #   exactly why cartesian matching is needed). Live update:
+    #     ros2 param set /cup_fusion_node scan_home_xyz "[x,y,z]"
+    scan_home_tol_m: 0.02        # arrival sphere radius (m)
+    # Joint waypoints — used only when scan_arrival_mode: joint.
     scan_waypoints_deg: [103.4671, -4.3731, 100.2539, -29.3674, 115.5776, -139.6331]
-    scan_capture_s: 1.0          # HAND depth accumulation time per waypoint (s)
-    scan_wait_s: 1.0             # settle wait after arrival before capturing (s)
-    scan_arrival_tol_rad: 0.02   # per-joint arrival gate (~1.15°)
-    # Live hand-view toggle (Tk "Use hand (live)" checkbox). false (default)
-    # = live fit is EXO ONLY; hand observations show in the panel (H-cloud/
-    # H-box) but never enter the fit or RViz. Scan-frozen hand observations
-    # ([S]) always participate regardless.
+    scan_capture_s: 1.0          # HAND obs accumulation time per waypoint (s)
+    scan_wait_s: 0.3             # settle wait after arrival before capturing —
+    #                              the wrist may still be ROTATING when the EE
+    #                              XYZ is already at home (rotation moves no
+    #                              XYZ); 0.3 s + the joint-velocity settle
+    #                              gate covers it (agent flow, 2026-06-13)
+    scan_arrival_tol_rad: 0.02   # per-joint arrival gate (~1.15°, joint mode)
+    # Live hand-view toggle (Tk "Use hand (live)" checkbox). false = live fit
+    # is EXO ONLY; hand observations show in the panel (H-cloud/H-box) but
+    # never enter the fit or RViz. Scan-frozen hand observations ([S]) always
+    # participate regardless. true ALSO arms the scan FSM (see above).
     live_use_hand: true
 
     # ── Live noise suppression ────────────────────────────────────────────

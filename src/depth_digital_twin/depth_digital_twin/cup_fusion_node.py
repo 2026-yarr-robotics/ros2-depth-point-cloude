@@ -309,6 +309,23 @@ class CupFusionNode(Node):
         gp('scan_wait_s', 1.0)               # dwell-in wait before capturing
         gp('scan_capture_s', 1.0)            # capture/accumulation duration
         gp('scan_js_timeout_s', 0.5)         # joints older than this → UNKNOWN
+        # Arrival detection mode. 'joint' matches /joint_states against
+        # scan_waypoints_deg. 'cartesian' (the agent flow) matches the EE
+        # position (TF scan_base_frame→scan_ee_frame) against scan_home_xyz:
+        # the agent returns to ONE home XYZ but the wrist joints differ per
+        # task (place orientations), so a joint match would never re-fire.
+        # Settle still uses joint VELOCITY — a pure wrist rotation moves no
+        # XYZ, and capture must not start mid-rotation (hence scan_wait_s).
+        gp('scan_arrival_mode', 'joint')     # joint | cartesian (relaunch)
+        gp('scan_home_xyz', [0.244, -0.012, 0.515])   # base-frame EE home (m)
+        gp('scan_home_tol_m', 0.02)          # arrival sphere radius
+        gp('scan_base_frame', 'base_link')
+        gp('scan_ee_frame', 'link_6')
+        # Scan lifecycle events (latched JSON): {'event':'capture_start'|
+        # 'frozen', 'wp', 'n_cups', 't'}. The agent's goal_state_publisher
+        # holds the next /llm_input until a 'frozen' newer than the last
+        # /action_result — the LLM must reason on the POST-scan world.
+        gp('scan_event_topic', '/digital_twin/scan_event')
         # Looser merge/fit gates for the COMPUTE pass: a multi-view union of one
         # cup is more spread (top disc + side slab) than a single view.
         gp('scan_merge_dist_m', 0.06)
@@ -492,16 +509,6 @@ class CupFusionNode(Node):
         self.scan_lock_active = bool(P('scan_lock_active'))
         self.scan_joint_states_topic = str(P('scan_joint_states_topic'))
         self.scan_joint_names = list(P('scan_joint_names'))
-        # Parse N waypoints from the flat (N*6) list → {1: rad6, 2: rad6, ...}.
-        _wps = np.asarray(P('scan_waypoints_deg'), dtype=float)
-        if _wps.size == 0 or _wps.size % 6 != 0:
-            self.get_logger().error(
-                f'scan_waypoints_deg length {_wps.size} is not a positive '
-                f'multiple of 6 — using one zero waypoint')
-            _wps = np.zeros(6)
-        _wps = _wps.reshape(-1, 6)
-        self._wp_rad = {i + 1: np.deg2rad(_wps[i]) for i in range(len(_wps))}
-        self._wp_keys = tuple(self._wp_rad)     # (1,) single | (1,2,...) multi
         self.scan_tol = float(P('scan_arrival_tol_rad'))
         self.scan_settle_vel = float(P('scan_settle_vel_rad_s'))
         self.scan_wait_s = float(P('scan_wait_s'))
@@ -520,16 +527,29 @@ class CupFusionNode(Node):
         if not (0.005 <= self.scan_tol <= 0.1):
             self.get_logger().warn(
                 f'scan_arrival_tol_rad={self.scan_tol} outside [0.005, 0.1]')
-        if len(self._wp_keys) >= 2:     # only multi-waypoint can mis-attribute
-            seps = [float(np.max(np.abs(self._wp_rad[a] - self._wp_rad[b])))
-                    for a in self._wp_keys for b in self._wp_keys if a < b]
-            if min(seps) < 2.0 * self.scan_tol:
-                self.get_logger().warn(
-                    f'two scan waypoints are within 2*tol (min inf-norm '
-                    f'{min(seps):.3f} rad) — captures may be mis-attributed')
-        self.get_logger().info(
-            f'scan: {len(self._wp_keys)} waypoint(s) configured '
-            f'(pos{list(self._wp_keys)})')
+        self.scan_arrival_mode = str(P('scan_arrival_mode')).strip().lower()
+        self.scan_home_xyz = np.asarray(P('scan_home_xyz'), dtype=float)
+        self.scan_home_tol = float(P('scan_home_tol_m'))
+        self.scan_base_frame = str(P('scan_base_frame'))
+        self.scan_ee_frame = str(P('scan_ee_frame'))
+        self._scan_home_dist = float('inf')   # latest EE↔home distance (m)
+        if self.scan_arrival_mode == 'cartesian':
+            from tf2_ros import Buffer, TransformListener
+            self._scan_tf_buf = Buffer()
+            self._scan_tf_lis = TransformListener(
+                self._scan_tf_buf, self, spin_thread=False)
+            # Single Cartesian home — the joint waypoint table is unused.
+            self._wp_rad = {1: np.zeros(6)}
+            self._wp_keys = (1,)
+            self._captured = {1: False}
+            self._scan_visited = set()
+            self._scan_done = False
+            self.get_logger().info(
+                f'scan: cartesian home {self.scan_home_xyz.tolist()} m '
+                f'(tol {1e3 * self.scan_home_tol:.0f} mm, '
+                f'{self.scan_base_frame}→{self.scan_ee_frame})')
+        else:
+            self._set_waypoints(P('scan_waypoints_deg'))
         # SINGLE-THREADED executor (rclpy.spin): the joint_states callback, the
         # 2 cloud callbacks, the timer, ~/clear_scan and the param callback are
         # all serialized on ONE thread → no locks needed for the state below.
@@ -676,6 +696,11 @@ class CupFusionNode(Node):
             MarkerArray, str(P('rim_boxes_dbg_topic')), latched)
         self.health_pub = self.create_publisher(
             String, str(P('fusion_health_topic')), 10)
+        # Latched: a late-joining agent still sees the LAST scan event; the
+        # consumer must compare event 't' against its own action timestamp
+        # (a stale latched event must not satisfy a NEW action's wait).
+        self.scan_event_pub = self.create_publisher(
+            String, str(P('scan_event_topic')), latched)
         if self.fit_source == 'rim' and not self.rim_enabled:
             self.get_logger().warning(
                 'fit_source=rim with rim_enabled=false — debug/health ticks '
@@ -740,6 +765,7 @@ class CupFusionNode(Node):
             'scan_wait_s': ('scan_wait_s', float),
             'scan_capture_s': ('scan_capture_s', float),
             'scan_js_timeout_s': ('scan_js_timeout', float),
+            'scan_home_tol_m': ('scan_home_tol', float),
             'scan_merge_dist_m': ('scan_merge_dist', float),
             'scan_premerge_dxy_m': ('scan_premerge_dxy', float),
             'scan_premerge_dz_m': ('scan_premerge_dz', float),
@@ -789,6 +815,33 @@ class CupFusionNode(Node):
 
     def _on_set_params(self, params):
         for p in params:
+            if p.name == 'scan_home_xyz':
+                # Live home change (cartesian mode): old captures belong to
+                # the old vantage — drop them and re-arm, same as a joint
+                # waypoint change below.
+                self.scan_home_xyz = np.asarray(p.value, dtype=float)
+                self._scan_obs = {}
+                self._scan_pending = {}
+                self._refresh_scan_ids()
+                self._scan_state = 'IDLE'
+                self._cur_wp = None
+                self._captured = {k: False for k in self._wp_keys}
+                self._scan_visited = set()
+                self._scan_done = False
+                self.get_logger().info(
+                    f'scan: cartesian home → {self.scan_home_xyz.tolist()} m')
+                continue
+            if p.name == 'scan_waypoints_deg':
+                # Live waypoint change (agent home pose): the frozen captures
+                # belong to the OLD waypoints — drop them and abort any
+                # in-flight visit before installing the new table.
+                self._scan_obs = {}
+                self._scan_pending = {}
+                self._refresh_scan_ids()
+                self._scan_state = 'IDLE'
+                self._cur_wp = None
+                self._set_waypoints(p.value)
+                continue
             spec = self._tunable.get(p.name)
             if spec is not None:
                 attr, cast = spec
@@ -1045,7 +1098,12 @@ class CupFusionNode(Node):
 
     def _scan_snapshot(self, now):
         """(settled, near_enter{k}, near_leave{k}, unknown) from the cached
-        joint state. UNKNOWN if joints are stale / unseen / first sample."""
+        joint state. UNKNOWN if joints are stale / unseen / first sample.
+
+        cartesian mode: 'near' is the EE position (TF base→ee) inside the
+        scan_home_xyz sphere; 'settled' STAYS joint-velocity based — the
+        wrist can still be rotating while the EE XYZ is already at home,
+        and capture must not start mid-rotation."""
         unknown = (self._cur_q is None or self._js_t is None
                    or not np.isfinite(self._cur_vmax)
                    or (now - self._js_t).nanoseconds * 1e-9 > self.scan_js_timeout)
@@ -1053,6 +1111,28 @@ class CupFusionNode(Node):
             return (False, {k: False for k in self._wp_keys},
                     {k: False for k in self._wp_keys}, True)
         settled = self._cur_vmax < self.scan_settle_vel
+        if self.scan_arrival_mode == 'cartesian':
+            p = None
+            try:
+                t = self._scan_tf_buf.lookup_transform(
+                    self.scan_base_frame, self.scan_ee_frame,
+                    rclpy.time.Time())
+                tr = t.transform.translation
+                p = np.array([tr.x, tr.y, tr.z])
+            except Exception:
+                pass
+            if p is None:    # TF chain not up yet (joint staleness is already
+                #              gated above — same /joint_states source as rsp)
+                return (False, {k: False for k in self._wp_keys},
+                        {k: False for k in self._wp_keys}, True)
+            d = float(np.linalg.norm(p - self.scan_home_xyz))
+            self._scan_home_dist = d
+            k0 = self._wp_keys[0]
+            ne = {k: False for k in self._wp_keys}
+            nl = {k: False for k in self._wp_keys}
+            ne[k0] = d <= self.scan_home_tol
+            nl[k0] = d <= 1.5 * self.scan_home_tol
+            return settled, ne, nl, False
         ne, nl = {}, {}
         for k in self._wp_keys:
             d = float(np.max(np.abs(self._cur_q - self._wp_rad[k])))
@@ -1092,15 +1172,23 @@ class CupFusionNode(Node):
                     throttle_duration_sec=3.0)
                 return
             tol_deg = np.degrees(self.scan_tol)
+            cartesian = self.scan_arrival_mode == 'cartesian'
             cand = [k for k in self._wp_keys
                     if near[k] and settled and not self._captured[k]]
             if cand:                            # nearest wins (loose-tol tie)
-                k = min(cand, key=lambda j: float(
-                    np.max(np.abs(self._cur_q - self._wp_rad[j]))))
-                err = np.degrees(np.max(np.abs(self._cur_q - self._wp_rad[k])))
+                if cartesian:
+                    k = cand[0]
+                    arrived = (f'home dist {1e3 * self._scan_home_dist:.0f} mm'
+                               f' ≤ tol {1e3 * self.scan_home_tol:.0f} mm')
+                else:
+                    k = min(cand, key=lambda j: float(
+                        np.max(np.abs(self._cur_q - self._wp_rad[j]))))
+                    err = np.degrees(
+                        np.max(np.abs(self._cur_q - self._wp_rad[k])))
+                    arrived = f'max joint err {err:.2f}° ≤ tol {tol_deg:.2f}°'
                 self.get_logger().info(
-                    f'scan: ▶ ARRIVED at pos{k} (max joint err {err:.2f}° ≤ '
-                    f'tol {tol_deg:.2f}°, settled) — wait {self.scan_wait_s:.1f}s '
+                    f'scan: ▶ ARRIVED at pos{k} ({arrived}, settled) — '
+                    f'wait {self.scan_wait_s:.1f}s '
                     f'then capture {self.scan_capture_s:.1f}s')
                 self._cur_wp = k
                 self._t_arrive = now
@@ -1110,13 +1198,17 @@ class CupFusionNode(Node):
                 # pass is done (all waypoints captured). Shows how far the arm
                 # is from EACH waypoint so the motion + arrival detection can be
                 # verified live. Goes silent after the scan finishes.
-                errs = ', '.join(
-                    f'pos{k} '
-                    f'{np.degrees(np.max(np.abs(self._cur_q - self._wp_rad[k]))):.1f}°'
-                    for k in self._wp_keys)
+                if cartesian:
+                    errs = (f'home dist {1e3 * self._scan_home_dist:.0f} mm '
+                            f'(tol {1e3 * self.scan_home_tol:.0f} mm)')
+                else:
+                    errs = ', '.join(
+                        f'pos{k} '
+                        f'{np.degrees(np.max(np.abs(self._cur_q - self._wp_rad[k]))):.1f}°'
+                        for k in self._wp_keys) + f' (tol {tol_deg:.1f}°)'
                 self.get_logger().info(
-                    f'scan: waiting for a waypoint — {errs} '
-                    f'(tol {tol_deg:.1f}°), settled={settled}',
+                    f'scan: waiting for a waypoint — {errs}, '
+                    f'settled={settled}',
                     throttle_duration_sec=1.0)
         elif self._scan_state == 'WAIT':
             if (now - self._t_arrive).nanoseconds * 1e-9 >= self.scan_wait_s:
@@ -1125,6 +1217,7 @@ class CupFusionNode(Node):
                 self.get_logger().info(
                     f'scan: ● CAPTURING pos{self._cur_wp} for '
                     f'{self.scan_capture_s:.1f}s (freezing hand observations)')
+                self._scan_event('capture_start', wp=self._cur_wp)
                 self._scan_state = 'CAPTURE'
         elif self._scan_state == 'CAPTURE':
             self._scan_capture_tick()
@@ -1134,6 +1227,11 @@ class CupFusionNode(Node):
                     f'scan: ✓ pos{k} capture done '
                     f'({len(self._scan_pending)} cup(s)) → frozen')
                 self._scan_commit(k)
+                # Sync signal for the agent loop: goal_state_publisher holds
+                # the next /llm_input until this 'frozen' event (newer than
+                # its /action_result) — the LLM reasons on the post-scan fit.
+                self._scan_event('frozen', wp=k,
+                                 n_cups=len(self._scan_obs.get(k, {})))
                 self._captured[k] = True
                 self._scan_visited.add(k)
                 self._cur_wp = None
@@ -1179,6 +1277,44 @@ class CupFusionNode(Node):
                 'w': self.w_hand_base if cam == 'hand' else self.w_exo_base,
             })
         return out
+
+    def _scan_event(self, event: str, **kw) -> None:
+        """Latched JSON lifecycle event ('capture_start' | 'frozen') with a
+        wall timestamp — consumers compare 't' against their own action time
+        so a stale latched event never satisfies a new wait."""
+        kw.update(event=event,
+                  t=self.get_clock().now().nanoseconds * 1e-9)
+        self.scan_event_pub.publish(String(data=json.dumps(kw)))
+
+    def _set_waypoints(self, deg_flat) -> None:
+        """Parse scan_waypoints_deg (flat N*6 list, degrees) into the waypoint
+        table and reset the per-waypoint pass bookkeeping. Called at init AND
+        when the parameter is re-set live — the agent flow points the single
+        waypoint at its high home pose without a relaunch:
+            ros2 param set /cup_fusion_node scan_waypoints_deg "[j1..j6]"
+        """
+        _wps = np.asarray(deg_flat, dtype=float)
+        if _wps.size == 0 or _wps.size % 6 != 0:
+            self.get_logger().error(
+                f'scan_waypoints_deg length {_wps.size} is not a positive '
+                f'multiple of 6 — using one zero waypoint')
+            _wps = np.zeros(6)
+        _wps = _wps.reshape(-1, 6)
+        self._wp_rad = {i + 1: np.deg2rad(_wps[i]) for i in range(len(_wps))}
+        self._wp_keys = tuple(self._wp_rad)     # (1,) single | (1,2,...) multi
+        if len(self._wp_keys) >= 2:     # only multi-waypoint can mis-attribute
+            seps = [float(np.max(np.abs(self._wp_rad[a] - self._wp_rad[b])))
+                    for a in self._wp_keys for b in self._wp_keys if a < b]
+            if min(seps) < 2.0 * self.scan_tol:
+                self.get_logger().warn(
+                    f'two scan waypoints are within 2*tol (min inf-norm '
+                    f'{min(seps):.3f} rad) — captures may be mis-attributed')
+        self._captured = {k: False for k in self._wp_keys}
+        self._scan_visited = set()
+        self._scan_done = False
+        self.get_logger().info(
+            f'scan: {len(self._wp_keys)} waypoint(s) configured '
+            f'(pos{list(self._wp_keys)})')
 
     def _enter_active(self) -> None:
         """OFF → ACTIVE: arm a fresh scan pass. Existing frozen observations
@@ -1786,11 +1922,18 @@ class CupFusionNode(Node):
                 self.get_logger().warn(
                     f'rim estimator error: {e}', throttle_duration_sec=5.0)
 
-        # Scan session state: armed by scan_lock_active (skill-manager).
+        # Scan session state: armed by scan_lock_active (skill-manager scan
+        # API) OR by live_use_hand (the new agent flow: the agent no longer
+        # calls the scan API — it just returns to its high home pose after
+        # every command. With live_use_hand on, that home pose is the single
+        # scan waypoint, and every return auto-runs capture→freeze: the
+        # leave-latch re-arms the waypoint when the arm departs, and
+        # _scan_commit REPLACES the waypoint's frozen subset on each visit —
+        # an atomic clear→scan→lock with no blank gap while capturing).
         # There is no lock — exo always refits live; the FSM only decides
         # WHEN to freeze a 1 s batch of hand observations at a waypoint.
         in_session = bool(self._scan_pending) or self._scan_state != 'IDLE'
-        if not self.scan_lock_active:
+        if not (self.scan_lock_active or self.live_use_hand):
             self._mode = 'PAUSED' if in_session else 'OFF'
         else:
             if self._mode == 'OFF':
