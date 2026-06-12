@@ -31,11 +31,23 @@ def _resolve_weight_path(model_name: str, logger) -> str:
     auto-download them.
     """
     p = Path(model_name)
-    if not p.is_absolute() or p.exists():
+    # p.exists() stat()s the path; a live-host absolute like /home/ssu/... may be
+    # mode 0750 on this machine, so the stat raises PermissionError (not False).
+    # Treat any un-stat-able absolute path as "not here" and fall through to the
+    # re-anchor loop instead of crashing the node.
+    try:
+        here = p.exists()
+    except OSError:
+        here = False
+    if not p.is_absolute() or here:
         return model_name
     for anc in Path(__file__).resolve().parents:
         local = anc / "vision" / "yolo" / p.name
-        if local.exists():
+        try:
+            found = local.exists()
+        except OSError:
+            found = False
+        if found:
             logger.warning(
                 f"model path {model_name} not on this machine — using {local}")
             return str(local)
