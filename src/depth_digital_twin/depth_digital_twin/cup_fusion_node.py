@@ -1734,12 +1734,19 @@ class CupFusionNode(Node):
             # Measurement event = fresh silhouette obs OR fresh clouds
             # (clouds still serve fallen cups + the /points display).
             if objs is None and not self._rim_fresh:
+                self._coast_idle(rim_mode)
                 return
             self._rim_fresh = False
             objs = objs or []
         elif objs is None:
-            # Not a fresh measurement event → don't touch the markers; the last
-            # published set persists in RViz. (No flicker between measurements.)
+            # No fresh measurement → skip the KF/fit pipeline but still
+            # REPUBLISH surviving markers (+ evict timed-out rim tracks). The
+            # last set does NOT silently persist: /digital_twin/boxes markers
+            # have a 0.4 s lifetime and were only re-sent on a fresh event, so a
+            # measurement gap > 0.4 s (bursty Isaac camera) expired them and
+            # blinked live cups off in RViz — while the per-frame producer
+            # overlay the panel shows stayed up.
+            self._coast_idle(rim_mode)
             return
         # objs already carry aabb + cup-geom fields (_build_cam_objs).
 
@@ -1923,6 +1930,28 @@ class CupFusionNode(Node):
 
         # STAGE-5: render final fused tracks — gated by the Plot F toggle
         # is on (it is by default). /points = the FULL raw union (every point).
+        stamp = self.get_clock().now().to_msg()
+        self._publish_markers(stamp, enabled=self.dbg_final)
+        self._publish_cups_on_table()
+
+    def _coast_idle(self, rim_mode: bool) -> None:
+        """No fresh measurement this tick — only REPUBLISH the existing tracks'
+        markers; do NOT run the KF/fit pipeline AND do NOT evict.
+
+        /digital_twin/boxes markers carry a 0.4 s lifetime and were previously
+        re-sent only on a fresh measurement event, so any event gap > 0.4 s
+        (Isaac's camera is bursty under sim lag) let them expire and RViz blinked
+        the cup off — even though the producer's per-frame rim overlay (the panel
+        view) never stopped. Re-sending at the tick rate keeps them alive.
+
+        Eviction stays in STAGE-4 (fresh events only): a measurement gap makes
+        EVERY track's last_match_t age together, so evicting here wiped ALL cups
+        at once during a stall (then min_hits re-acquisition blinked 6→0→6). On
+        a fresh event the present cups are in `alive` and survive while only the
+        genuinely-gone cup evicts — which is where eviction belongs. (Cost: the
+        last cup picked in an otherwise-empty scene coasts until the next event;
+        far better than wiping live cups on every camera hiccup.)"""
+        # rim_mode kept for signature symmetry; eviction intentionally omitted.
         stamp = self.get_clock().now().to_msg()
         self._publish_markers(stamp, enabled=self.dbg_final)
         self._publish_cups_on_table()

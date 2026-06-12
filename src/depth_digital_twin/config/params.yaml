@@ -205,11 +205,14 @@ cup_fusion_node:
     #                              MEASURE: stack 2 cups, total − cup_height_m
     rim_layer_height_m: 0.093    # pyramid slot lattice — MUST mirror the
     #                              server's PYRAMID_LAYER_HEIGHT (robot.py)
-    rim_obs_max_age_s: 3.0       # obs cache lifetime (hand publishes ~0.5Hz;
-    #                              1.0s silently aged its view out of fusion)
-    rim_keepalive_s: 3.5         # rim-mode track eviction is WALL TIME (not
-    #                              event count) — events fire at cloud rate
-    #                              while obs refresh at 0.3-2s
+    rim_obs_max_age_s: 0.8       # obs cache lifetime. LOW ⇒ picked/moved cups
+    #                              vanish fast (ghost ≈ obs_age + keepalive).
+    #                              TRADEOFF: < ~2s ages the 0.5Hz hand-cam view
+    #                              out of fusion (exo-only). Was 3.0 to keep hand.
+    rim_keepalive_s: 0.4         # rim-mode track eviction WALL TIME after last
+    #                              match. LOW ⇒ no ghost coast once obs stop.
+    #                              Was 3.5 (events fire at cloud rate while obs
+    #                              refresh at 0.3-2s).
     rim_level_hyst_m: 0.008      # level switch needs this much improvement
     rim_layer_pref_tol_m: 0.010  # pyramid preferred within real z_top noise
     #                              < |5*nest - layer| = 7mm (nest L5 vs pyr L1
@@ -246,7 +249,7 @@ cup_fusion_node:
     # = live fit is EXO ONLY; hand observations show in the panel (H-cloud/
     # H-box) but never enter the fit or RViz. Scan-frozen hand observations
     # ([S]) always participate regardless.
-    live_use_hand: false
+    live_use_hand: true
 
     # ── Live noise suppression ────────────────────────────────────────────
     # (A) Temporal frame accumulation: union each camera's clouds over this
