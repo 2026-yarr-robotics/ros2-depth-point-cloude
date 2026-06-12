@@ -395,8 +395,13 @@ class CupFusionNode(Node):
         gp('rim_min_visible', 0.10)
         # Pyramid-lattice preference window: if the pyramid snap error is
         # within this, take it over a (numerically closer) nest snap.
-        gp('rim_layer_pref_tol_m', 0.005)  # 0.007 collided with nest L5
-        #                                    (|5*0.02-0.093|=0.007) and L9
+        # Pyramid layers occur CONSTANTLY in this task while 4-5-cup nested
+        # columns (the only configs where nest and pyramid lattices nearly
+        # coincide) are rare — prefer the pyramid lattice within the real
+        # z_top noise (±10 mm at the low exo elevation). 0.005 let the
+        # 20 mm-pitch nest lattice (always within ±10 mm of ANY z) steal
+        # tier-2 cups and the slide amplified the level error ~4x into XY.
+        gp('rim_layer_pref_tol_m', 0.010)
         # Wall-time track keepalive for rim mode (s). Slightly above the obs
         # cache age so a track survives an occlusion exactly as long as its
         # observations can.
