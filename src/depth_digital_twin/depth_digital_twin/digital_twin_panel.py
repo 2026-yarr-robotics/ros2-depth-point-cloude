@@ -78,6 +78,11 @@ class DigitalTwinPanel(Node):
         gp('exo_redetect_srv', '/world_origin_node/redetect')
         gp('hand_redetect_srv', '/world_origin_node_hand/redetect')
         gp('fusion_node_name', 'cup_fusion_node')   # for checkboxes + tuning
+        # Producer node names differ per topology: the fusion launch
+        # uses point_cloud_node_exo/_hand, the live start.sh stack
+        # names the exo producer plain 'point_cloud_node'.
+        gp('exo_pc_node', 'point_cloud_node_exo')
+        gp('hand_pc_node', 'point_cloud_node_hand')
         gp('tuning_save_dir', '')                   # '' → package share config dir
 
         def P(n):
@@ -109,6 +114,8 @@ class DigitalTwinPanel(Node):
         self._param_q: queue.Queue = queue.Queue()
         self._param_clis: dict = {}
         self.fusion_node = P('fusion_node_name')
+        self._node_alias = {'point_cloud_node_exo': str(P('exo_pc_node')),
+                            'point_cloud_node_hand': str(P('hand_pc_node'))}
         # Scan&Lock clear: Trigger service on the fusion node (~/clear_scan).
         self._clear_q: queue.Queue = queue.Queue()
         self._clear_scan_cli = self.create_client(
@@ -166,6 +173,7 @@ class DigitalTwinPanel(Node):
 
     def request_param(self, node_name: str, name: str, value,
                       ptype: str = 'double') -> None:
+        node_name = self._node_alias.get(node_name, node_name)
         self._param_q.put((node_name, name, value, ptype))
 
     def request_clear_scan(self) -> None:
@@ -358,11 +366,14 @@ class PanelUI:
         tk.Label(dbg, text='Debug plot:', bg='#1e1e1e', fg='#9cdcfe').pack(
             side='left', padx=(0, 6))
         self._dbg_vars: dict[str, tk.BooleanVar] = {}
+        # Per-camera rough channels (Hand=orange, Exo=blue) + the final fused
+        # estimate (Plot F = /digital_twin/boxes, the only precise display).
         for text, pname, default in (
-                ('1 Detections', 'dbg_detections', False),
-                ('2 Pre-merge', 'dbg_premerge', False),
-                ('3 Fit-1', 'dbg_fit1', False),
-                ('4 Fit-2 (final)', 'dbg_fit2', True)):
+                ('1 H-cloud', 'dbg_hand_cloud', True),
+                ('2 H-box', 'dbg_hand_box', False),
+                ('3 E-cloud', 'dbg_exo_cloud', True),
+                ('4 E-box', 'dbg_exo_box', False),
+                ('5 F (final)', 'dbg_final', True)):
             var = tk.BooleanVar(value=default)
             self._dbg_vars[pname] = var
             tk.Checkbutton(
@@ -373,10 +384,10 @@ class PanelUI:
                     self.node.fusion_node, p, v.get(), 'bool')
             ).pack(side='left', padx=4)
 
-        # Live hand-view toggle (not a debug plot): unchecked excludes the hand
-        # cloud from the LIVE fit (exo only); scan/lock always use hand.
+        # Live hand-view toggle: OFF (default) = hand never contributes to
+        # the live fit (scan-frozen hand observations still do).
         tk.Label(dbg, text='  |  ', bg='#1e1e1e', fg='#555').pack(side='left')
-        self._use_hand_var = tk.BooleanVar(value=True)
+        self._use_hand_var = tk.BooleanVar(value=False)
         uh = tk.Checkbutton(
             dbg, text='Use hand (live)', variable=self._use_hand_var,
             bg='#1e1e1e', fg='#9cdcfe', selectcolor='#333333',
@@ -385,55 +396,25 @@ class PanelUI:
                 self.node.fusion_node, 'live_use_hand',
                 self._use_hand_var.get(), 'bool'))
         uh.pack(side='left', padx=4)
-        _Tooltip(uh, 'live_use_hand\n'
-                     '체크(기본): 라이브 fit에 hand 클라우드 포함.\n'
-                     '해제: 라이브에서 hand 제외(exo만).\n'
-                     '스캔/lock은 이 설정과 무관하게 항상 hand 사용.')
+        _Tooltip(uh, 'live_use_hand (기본 해제)\n'
+                     '해제: 라이브 fit은 exo 단독 — hand는 패널 표시(H-cloud/\n'
+                     'H-box)만 되고 RViz/측정에는 안 들어감. 스캔으로 동결된\n'
+                     'hand 관측은 이 설정과 무관하게 항상 사용([S]).\n'
+                     '체크: 라이브 hand 관측도 융합([F]).')
 
-        # Scan & Lock: multi-view accumulate-at-waypoints. Checkbox toggles the
-        # cup_fusion scan_lock_active param; Clear Lock calls ~/clear_scan.
+        # Scan: armed by skill-manager (scan_lock_active). Here only the
+        # Clear button — drops frozen scan observations + scan-only cups.
         scan = tk.Frame(bar, bg='#1e1e1e')
         scan.grid(row=3, column=1, columnspan=2, pady=(4, 2))
-        self._scan_var = tk.BooleanVar(value=False)
-        scan_cb = tk.Checkbutton(
-            scan, text='Scan & Lock', variable=self._scan_var, bg='#1e1e1e',
-            fg='#ffd479', selectcolor='#333333', activebackground='#1e1e1e',
-            activeforeground='#ffffff',
-            command=lambda: self.node.request_param(
-                self.node.fusion_node, 'scan_lock_active',
-                self._scan_var.get(), 'bool'))
-        scan_cb.pack(side='left', padx=4)
-        _Tooltip(scan_cb,
-                 'scan_lock_active\n'
-                 '체크: 스캔 웨이포인트에서 멀티뷰 누적 후 안정된 lock 발행.\n'
-                 '해제: 캡처만 일시정지(lock은 유지).\n'
-                 '완전 초기화는 [Clear Lock] 또는 skill_manager.')
 
-        def _clear_lock():
-            self._scan_var.set(False)
+        def _clear_scan():
             self.node.request_clear_scan()
-        clr_btn = tk.Button(scan, text='Clear Lock', width=10,
-                            command=_clear_lock)
+        clr_btn = tk.Button(scan, text='Clear Scan', width=10,
+                            command=_clear_scan)
         clr_btn.pack(side='left', padx=8)
         _Tooltip(clr_btn, 'cup_fusion_node/clear_scan (Trigger)\n'
-                          '누적·lock 폐기 → 라이브 검출 복귀.')
-
-        # Lock scope: unchecked (default) = hand frozen + exo LIVE re-fuse;
-        # checked = freeze both cameras into one static lock.
-        self._lock_exo_var = tk.BooleanVar(value=False)
-        exo_cb = tk.Checkbutton(
-            scan, text='Lock exo too', variable=self._lock_exo_var,
-            bg='#1e1e1e', fg='#9cdcfe', selectcolor='#333333',
-            activebackground='#1e1e1e', activeforeground='#ffffff',
-            command=lambda: self.node.request_param(
-                self.node.fusion_node, 'scan_lock_exo',
-                self._lock_exo_var.get(), 'bool'))
-        exo_cb.pack(side='left', padx=4)
-        _Tooltip(exo_cb,
-                 'scan_lock_exo\n'
-                 '해제(기본): hand만 고정, exo는 라이브로 매 tick 재융합\n'
-                 '  → exo가 새로 본 컵 추가, 집어간 컵은 hand lock에 유지.\n'
-                 '체크: exo도 고정(둘 다 정적 lock).')
+                          '동결된 scan 관측 + scan 전용([S]) 컵 제거.\n'
+                          '라이브 검출은 그대로 유지.')
 
         grid = tk.Frame(parent, bg='#1e1e1e')
         grid.grid(row=1, column=0, sticky='nsew')

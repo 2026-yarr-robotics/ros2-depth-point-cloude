@@ -146,8 +146,15 @@ def _make_nodes(context, *args, **kwargs):
         in ('true', '1')
     pc_params = list(common_params)
     if fusion:
+        # Per-camera rim topics: the producer defaults are SHARED names --
+        # with hand_fusion_add.launch.py running too, both cameras would
+        # interleave frames on one rim_debug topic (violent flicker) and
+        # cup_fusion_node would never see the obs (it subscribes _exo/_hand).
         pc_params.append({'role': 'producer',
-                          'world_clouds_topic': '/digital_twin/cups_exo'})
+                          'world_clouds_topic': '/digital_twin/cups_exo',
+                          'camera_name': 'exo',
+                          'cup_obs_topic': '/digital_twin/cup_obs_exo',
+                          'rim_debug_topic': '/digital_twin/rim_debug_exo'})
     point_cloud = Node(
         package='depth_digital_twin', executable='point_cloud_node',
         name='point_cloud_node', output='screen', parameters=pc_params,
@@ -171,11 +178,14 @@ def _make_nodes(context, *args, **kwargs):
             parameters=[{
                 'exo_color_topic': '/exo/exo/color/image_raw',
                 'exo_depth_topic': '/exo/exo/aligned_depth_to_color/image_raw',
-                'exo_debug_topic': '/digital_twin/detection_debug',
+                # 3D pane = rim-fit overlay (the actual live measurement);
+            # raw YOLO stays on /digital_twin/detection_debug*
+            'exo_debug_topic': '/digital_twin/rim_debug_exo',
+            'exo_pc_node': 'point_cloud_node',
                 'hand_color_topic': '/hand/hand/color/image_raw',
                 'hand_depth_topic':
                     '/hand/hand/aligned_depth_to_color/image_raw',
-                'hand_debug_topic': '/digital_twin/detection_debug_hand',
+                'hand_debug_topic': '/digital_twin/rim_debug_hand',
                 'exo_redetect_srv': '/world_origin_node/redetect',
                 # Hand redetect is the handeye_aruco node added by
                 # hand_fusion_add.launch.py (VISION_MODE=fusion_dual). In

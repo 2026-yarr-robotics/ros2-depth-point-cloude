@@ -16,6 +16,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/SegmentedObjectArray.msg"
   "msg/WorldObjectCloud.msg"
   "msg/WorldObjectCloudArray.msg"
+  "msg/CupObservation.msg"
+  "msg/CupObservationArray.msg"
   DEPENDENCIES std_msgs sensor_msgs geometry_msgs
 )
 

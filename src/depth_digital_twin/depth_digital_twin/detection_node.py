@@ -6,6 +6,7 @@ and publishes per-frame masks aligned to the source image.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Iterable
 
 import cv2
@@ -16,6 +17,32 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 
 from depth_digital_twin_msgs.msg import SegmentedObject, SegmentedObjectArray
+
+def _resolve_weight_path(model_name: str, logger) -> str:
+    """Re-anchor an absolute weight path from another machine's checkout.
+
+    params.yaml carries absolute paths from the live host (/home/ssu/...);
+    on any other checkout those don't exist, but the same file ships in this
+    repo's vision/yolo/. Walk UP from this file until an ancestor contains
+    vision/yolo/<name> — a fixed parents[N] only works from the src tree,
+    while `ros2 launch` runs the INSTALLED copy
+    (install/.../site-packages/...), whose repo root is 3 levels higher.
+    Leave non-path names (yolo26n-seg.pt …) alone so ultralytics can
+    auto-download them.
+    """
+    p = Path(model_name)
+    if not p.is_absolute() or p.exists():
+        return model_name
+    for anc in Path(__file__).resolve().parents:
+        local = anc / "vision" / "yolo" / p.name
+        if local.exists():
+            logger.warning(
+                f"model path {model_name} not on this machine — using {local}")
+            return str(local)
+    logger.error(
+        f"model path {model_name} not found and no vision/yolo/{p.name} "
+        f"in any ancestor of {Path(__file__).resolve()}")
+    return model_name
 
 
 class DetectionNode(Node):
@@ -41,7 +68,8 @@ class DetectionNode(Node):
             raise RuntimeError(
                 'ultralytics is not installed. Run: pip install ultralytics') from e
 
-        model_name: str = self.get_parameter('model').value
+        model_name: str = _resolve_weight_path(
+            self.get_parameter('model').value, self.get_logger())
         device: str = self.get_parameter('device').value
         self.get_logger().info(f'Loading YOLO model: {model_name}')
         try:

@@ -123,6 +123,8 @@ def _setup(context, *a, **k):
                      'detections_topic': '/digital_twin/detections_hand',
                      'box_debug_topic': '/digital_twin/box_debug_hand',
                      'depth_debug_topic': '/digital_twin/depth_debug_hand',
+                     'cup_obs_topic': '/digital_twin/cup_obs_hand',
+                     'rim_debug_topic': '/digital_twin/rim_debug_hand',
                      'camera_frame': 'hand_color_optical_frame',
                      'world_frame': 'world',
                      'role': 'producer',

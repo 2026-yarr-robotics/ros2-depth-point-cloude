@@ -1,39 +1,69 @@
 # ROS 2 Depth Digital Twin
 
-RealSense D435i + YOLO segmentation 기반 **단일 카메라 디지털 트윈**.
-YOLO로 컵을 검출하고, 깊이 카메라로 3D 위치를 추정해 RViz2에 Doosan 로봇 모델과 함께 표시한다.
+RealSense D435i + YOLO segmentation 기반 **컵 디지털 트윈** (단일/듀얼 카메라).
 작업 공간에 배치된 ArUco 마커를 인식해 **world 프레임 = 로봇 base 프레임**으로 자동 정렬한다.
+
+직립 컵의 위치 측정은 **실루엣(rim) 방식**이 기본이다: 컵은 제원이 알려진
+truncated cone(자유도 = 축 x,y)이므로, YOLO 마스크 윤곽 + 카메라 캘리브레이션이
+노이즈 많은 depth 점군보다 훨씬 정밀하게 축을 구속한다 (1 m에서 마스크 1 px ≈ 1.5 mm
+vs 컵 벽면 depth 바이어스 mm~cm). **depth는 단 수(레벨) 분류로 강등**되어 z를 격자
+(포개기 `nesting_offset_m` / 피라미드 `rim_layer_height_m` = 서버
+`PYRAMID_LAYER_HEIGHT`)에 스냅하는 데만 쓰인다. 융합 모드에서 직립 컵 점군은 더
+이상 생성하지 않으며(`upright_clouds: false`), 점군 경로는 누운 컵 OBB 전용으로
+남아 있다. 롤백: `cup_fusion_node fit_source: cloud`.
 
 ---
 
 ## 1. 개요
 
 ```
-RealSense (RGB + aligned depth)
+RealSense (RGB + aligned depth)                ← 카메라당 1세트 (exo / hand)
     │
     ├─► world_origin_node ─── ArUco 마커 인식 → static TF camera→world(=robot base)
-    │                          (15 s 검출 실패 시 depth plane-fit으로 자동 폴백)
+    │                          (hand: handeye_aruco — FK 체인 + 핸드아이 자동 산출)
     │
-    ├─► detection_node ─────── YOLO seg → SegmentedObjectArray
+    ├─► detection_node ─────── YOLO seg + ByteTrack → SegmentedObjectArray
     │
-    └─► point_cloud_node ───── 누적 윈도우 포인트 클라우드 + 3D box + cup frustum
+    └─► point_cloud_node ──┬── CupObservationArray  (직립 컵: 실루엣 fit + 시선 광선)
+                           └── WorldObjectCloudArray (누운 컵 전용 world 점군)
+                                    │
+                       cup_fusion_node (fit_source=rim)
+                           · 관측 3D 클러스터 → z 격자 스냅 → 광선 슬라이드
+                           · 역공분산 융합 + extrinsic 자가 보정 + 컵당 KF
+                           → /digital_twin/boxes, /vision/cups_on_table,
+                             /digital_twin/fusion_health (잔차·바이어스 JSON)
 ```
 
 패키지 구성:
 
 | 패키지 | 설명 |
 |---|---|
-| `depth_digital_twin` | ROS 노드 + 런치 파일 (Python) |
-| `depth_digital_twin_msgs` | 커스텀 메시지 `SegmentedObject`, `SegmentedObjectArray` (CMake) |
+| `depth_digital_twin` | ROS 노드 + 런치 파일 + `cup_geometry.py` 측정 수학 (Python) |
+| `depth_digital_twin_msgs` | `SegmentedObject(Array)`, `WorldObjectCloud(Array)`, `CupObservation(Array)` (CMake) |
 
 ---
 
 ## 2. 기능
 
 - **ArUco-origin world frame**: 작업 공간에 놓인 ArUco 마커(ID 0, 4×4)를 인식해 카메라→로봇 base 정적 TF를 자동 발행. 마커가 없으면 depth plane-fit으로 폴백.
-- **YOLO segmentation**: cup 클래스 검출 + 인스턴스 마스크.
+- **YOLO segmentation**: cup 클래스 검출 + 인스턴스 마스크 (+ ByteTrack id).
+- **실루엣(rim) 측정** (`cup_geometry.py`): 마스크 윤곽 거리변환에 cone 실루엣을
+  chamfer 정렬(soft_l1, 2-DOF). 세 번째 파라미터 b가 YOLO 경계의 균일 과소/과대
+  세그먼트 바이어스를 흡수하고, image-gradient **edge-snap**이 최종 경계를 마스크가
+  아닌 실제 영상 에지에 재정렬한다. 정지 컵 per-frame σ 1.6–2.9 mm (seq 0010,
+  imgsz 1280). 디버그 오버레이: `/digital_twin/rim_debug_{exo,hand}`.
+- **듀얼 카메라 역공분산 융합** (`cup_fusion_node fit_source: rim`): 카메라별 관측
+  (`CupObservation` = fit 축 + 시선 광선 + 품질 + 색)을 3D 타원체 클러스터 →
+  z 이중 격자 스냅(포개기/피라미드 중 rough z에 맞는 쪽) → 광선 슬라이드 →
+  역공분산 융합. 시선이 비스듬할수록 시선 방향 분산을 키워 exo(원거리·경사)와
+  hand(근거리·수직)가 올바른 가중치로 섞이고, **한쪽 카메라에만 보이는 컵도
+  단독 트랙**으로 유지된다. 모션 중 hand 관측은 폐기(`rim_drop_moving`).
+- **extrinsic 자가 보정**: 두 카메라가 같은 컵을 보면 그 (x,y) 차이가 곧 extrinsic
+  불일치다. EMA로 비기준 카메라(exo)의 world 바이어스를 추정해 보정
+  (`rim_bias_apply`). seq 0010: exo ArUco 바이어스 (+15.8, −21.4) mm 수렴, 공유 컵
+  잔차 30 mm → 6–11 mm. 진단 JSON: `/digital_twin/fusion_health`.
 - **Speed Stack 컵 frustum 모델**: 위·아래 지름/높이를 사전 정보로 활용해 자기 가림이 있어도 컵 전체 크기의 box를 생성. frustum wireframe 동시 발행.
-- **누적 윈도우 파이프라인**: 0.1 s 윈도우 동안 포인트를 누적 후 MAD 필터 → 박스 fit. depth 단발 노이즈로 인한 box 진동 억제.
+- **누적 윈도우 파이프라인** (점군 경로 — 누운 컵 OBB 전용): 윈도우 누적 + MAD 필터 → 박스 fit.
 - **Doosan URDF 통합**: robot_state_publisher + `/dsr01/joint_states` 미러를 통해 로봇 모델과 컵 검출이 같은 좌표계에 표시됨.
 - **카메라 내부 파라미터 캘리브레이션**: 체커보드 캡처 → `calibrate` → `intrinsics.yaml`.
 
@@ -148,15 +178,12 @@ ros2 launch depth_digital_twin digital_twin_with_robot.launch.py \
 [world_origin_node] [aruco-origin] Static TF published: camera_color_optical_frame → world
 ```
 
-### 3.4 Hand view (예정)
+### 3.4 Hand view (구현됨 — UC-4 참고)
 
-카메라를 Doosan 그리퍼에 장착해 gripper-mounted camera로 segmentation 및 3D 위치 추정.
-
-- 현재 미구현.
-- **2대 카메라 구성 시 namespace 분리 방안**:
-  - RealSense 시리얼 번호로 두 카메라를 구분 (각각 `camera_exo`, `camera_hand` 네임스페이스).
-  - `detection_node`, `point_cloud_node`를 각 카메라 네임스페이스에 맞게 인스턴스 2개 실행.
-  - `world_origin_node`는 exo 카메라 기준으로 world 프레임 설정; hand 카메라는 TF로 연결.
+손목(link_6) 장착 카메라는 `world_origin_node`의 `handeye_aruco` 모드가 핸드아이를
+런타임에 자동 산출하고, FK 체인(`base_link→link_6→hand_color_optical_frame`)으로
+world 변환을 공급한다. exo + hand 동시 구동·융합은 `digital_twin_fusion.launch.py`
+하나로 끝난다 — 토폴로지/실행법은 아래 **UC-4** 참고.
 
 ---
 
@@ -214,10 +241,10 @@ source ~/Projects/ros2-depth-point-cloude/install/setup.bash
 
 # exo (기본)
 ros2 launch depth_digital_twin digital_twin_sequence.launch.py \
-    sequence:=/home/eunwoosong/Projects/record_sequence/0010
+    sequence:=/home/eunwoo/Projects/cup_stack/seq_record/0010
 # hand 카메라로 보기  (ROS2는 --hand 가 아니라 view:=hand)
 ros2 launch depth_digital_twin digital_twin_sequence.launch.py \
-    sequence:=/home/eunwoosong/Projects/record_sequence/0010 view:=hand
+    sequence:=/home/eunwoo/Projects/cup_stack/seq_record/0010 view:=hand
 ```
 
 | arg | default | 설명 |
@@ -404,7 +431,7 @@ source ~/Projects/ros2-depth-point-cloude/install/setup.bash
 
 # exo view (기본)
 ros2 launch depth_digital_twin digital_twin_sequence.launch.py \
-    sequence:=/home/eunwoosong/Projects/record_sequence/0010
+    sequence:=/home/eunwoo/Projects/cup_stack/seq_record/0010
 
 # pick UI (별도 터미널)
 ros2 run depth_digital_twin pick_ui_node
@@ -425,17 +452,17 @@ source ~/Projects/ros2-recode-sequence/install/setup.bash
 source ~/Projects/ros2-depth-point-cloude/install/setup.bash
 
 ros2 launch depth_digital_twin digital_twin_sequence.launch.py \
-    sequence:=/home/eunwoosong/Projects/record_sequence/0010 view:=hand
+    sequence:=/home/eunwoo/Projects/cup_stack/seq_record/0010 view:=hand
 ```
 
 > ⚠ 라이브 `dsr_bringup2`가 켜져 있으면 TF 충돌. 종료 후 실행하거나 `ROS_DOMAIN_ID` 분리.
 
 ---
 
-## UC-4. Hand/Exo 통합 재생 및 실행
+## UC-4. Hand/Exo 통합 재생 및 실행 (rim 융합 — 기본 경로)
 
 녹화 시퀀스에서 **exo + hand 두 카메라를 동시에** 파이프라인에 투입하고, 두 뷰의
-컵 검출을 **하나의 물리 컵으로 융합**해 통합 추정한다. 이미지는 RViz가 아니라
+실루엣 관측을 **하나의 물리 컵으로 융합**해 통합 추정한다. 이미지는 RViz가 아니라
 **통합 Tk 패널**(`digital_twin_panel`)에 뜬다.
 
 ```bash
@@ -445,35 +472,73 @@ source ~/Projects/ros2-recode-sequence/install/setup.bash
 source ~/Projects/yarr_projects/install/setup.bash
 
 ros2 launch depth_digital_twin digital_twin_fusion.launch.py \
-    sequence:=/home/eunwoo/Projects/yarr_projects/seq_record/0013 \
+    sequence:=/home/eunwoo/Projects/cup_stack/seq_record/0010 \
     loop:=true
 ```
 
-### 토폴로지 (Producer → Fusion)
+### 토폴로지 (Producer → Fusion, fit_source=rim)
 
 ```
 sequence_player ─► /camera_exo/*, /camera_hand/*, /joint_states
   ├─ world_origin_node_exo  (ArUco)        → world ← exo_color_optical_frame
   ├─ world_origin_node_hand (handeye_aruco)→ link_6 → hand_color_optical_frame
-  ├─ detection_node_exo|hand (YOLO-seg)    → /digital_twin/detections_*
+  ├─ detection_node_exo|hand (YOLO-seg + ByteTrack) → /digital_twin/detections_*
   ├─ point_cloud_node_exo|hand (role=producer)
-  │      → /digital_twin/cups_exo, /cups_hand   (per-object world 점군; fit/KF 안 함)
-  └─ cup_fusion_node
-         · world 기하로 연관(중복·교차카메라 병합) → 가중 merge → fit → 컵당 KF
-         → /digital_twin/boxes (통합), /digital_twin/points
+  │      → /digital_twin/cup_obs_{exo,hand}   (직립: 실루엣 fit 관측 — 주 측정)
+  │      → /digital_twin/cups_{exo,hand}      (누운 컵 전용 점군; upright_clouds=false)
+  │      → /digital_twin/rim_debug_{exo,hand} (fit 오버레이: 윤곽·실루엣·실패 사유)
+  └─ cup_fusion_node (fit_source=rim)
+         · 관측 3D 타원체 클러스터(피라미드 층 분리) → z 이중 격자 스냅
+         · 광선 슬라이드 → extrinsic 바이어스 보정 → 역공분산 융합 → 컵당 KF
+         → /digital_twin/boxes, /vision/cups_on_table,
+           /digital_twin/fusion_health (컵별·카메라별 잔차 + 바이어스 JSON)
 ```
 
-핵심: per-camera 노드는 **점 생산자**일 뿐, 컵 fit·Kalman·박스 발행은 모두
-`cup_fusion_node`가 단독으로 한다. 단일 뷰(`view:=`)와 이중 뷰가 같은 경로다.
+핵심: per-camera 노드는 **관측 생산자**일 뿐, 융합·Kalman·박스 발행은 모두
+`cup_fusion_node`가 단독으로 한다. 한쪽 카메라에만 보이는 컵(exo 사각지대 등)도
+그 카메라 단독 트랙으로 유지된다. 레거시 점군 경로로 롤백:
+`ros2 param set /cup_fusion_node fit_source cloud`.
+
+### 융합 상태 진단
+
+```bash
+ros2 topic echo /digital_twin/fusion_health   # 컵별 카메라 잔차(mm), 레벨,
+                                              # extrinsic_bias_mm (exo 자가 보정)
+```
+
+정지 장면에서 공유 컵의 카메라 간 잔차가 크게(>15 mm) 유지되면 extrinsic 문제다 —
+자가 보정(`rim_bias_apply`)이 EMA로 수렴할 때까지 수십 초 기다리거나, ArUco
+재검출 버튼으로 캘리브레이션 자체를 갱신한다.
 
 ### 통합 Tk 패널 (`digital_twin_panel`)
 
 - 상단: **ArUco 재검출 버튼 3개 / 2행** — `ArUco Re-detect All (hand, exo)`,
   그 아래 `ArUco Exo` · `ArUco Hand` (고정 크기, 가운데 정렬). 각 버튼은 해당
   카메라의 `world_origin_node_{exo,hand}/redetect` 서비스를 호출한다.
-- 본문: **2행 × 3열 이미지 그리드** — (exo/hand) × (RGB, Depth, 3D). 세 열이 항상
-  균일 1/3, 창 크기 변경에 맞춰 각 셀이 비율을 유지하며 잘리지 않게 리사이즈된다.
-- 기존 `world_origin_control` 팝업은 이 패널로 대체된다.
+- 본문: **2행 × 3열 이미지 그리드** — (exo/hand) × (RGB, Depth, 3D). **3D 열은
+  rim fit 오버레이**(`/digital_twin/rim_debug_*`): 관측 윤곽(녹), fit 실루엣(시안),
+  depth 초기값(빨강), 컵별 `iou/rms/b/cov` 텍스트(실패 시 사유), ArUco/base 축
+  투영. 원시 YOLO 박스는 `/digital_twin/detection_debug_*`에 그대로 남아 있다.
+- **Debug plot 행**: `1 H-cloud(주황, 기본 on) / 2 H-box / 3 E-cloud(파랑, 기본
+  on) / 4 E-box / 5 F(final, 기본 on) | Use hand(live, 기본 off)`.
+  H/E 채널은 카메라별 단색 러프 표시(`/digital_twin/points_{exo,hand}`,
+  `/digital_twin/dbg_boxes_{exo,hand}`, 박스에는 `Hand1`/`Exo2` 텍스트)이고,
+  정밀 추정은 **F = `/digital_twin/boxes`** 하나뿐이다. 융합 `/digital_twin/points`
+  토픽은 제거되었다.
+- **Use hand(live)**: 해제(기본) 시 라이브 fit은 exo 단독 — hand 검출은 패널에는
+  보이지만 RViz/측정에는 들어가지 않는다. 스캔으로 동결된 hand 관측([S])은 이
+  설정과 무관하게 항상 사용된다.
+- **라벨 v2**: `[F] [S] #N <color> cup(x, y, z)` — `[F]`=exo+hand 융합,
+  `[S]`=scan 지지(둘 다면 `[F] [S]`), 좌표는 KF 중심. 구 `[L]`(settled) 태그는
+  폐지. 다운스트림 파서(skill-manager/plan_executor/pick_node/
+  boxes_to_detections)는 구·신 포맷을 모두 수용한다.
+- **Scan**: skill-manager가 `scan_lock_active`를 켜면 관절이 `scan_waypoints_deg`
+  범위로 들어올 때 1 s 대기 후 1 s간 hand 관측을 동결한다(점군 lock 아님 — exo는
+  항상 라이브 재피팅). exo가 못 보는 컵은 `[S]`로 영구 추적되고, exo와 한 번이라도
+  융합된 `[S]` 컵은 exo가 놓치면 함께 사라진다. 패널 **Clear Scan**(=`~/clear_scan`)
+  으로 동결 해제; replay/sim 검증용 `~/capture_scan_now` 서비스도 있다.
+- 기존 `world_origin_control` 팝업은 이 패널로 대체된다. (구 Scan&Lock /
+  Lock exo too / Clear Lock 컨트롤은 제거되었다.)
 
 > ⚠ 라이브 `dsr_bringup2`가 켜져 있으면 `world→base_link→…→link_6` TF가 충돌한다.
 > 종료 후 실행하거나 `ROS_DOMAIN_ID`/`ns:=`로 분리한다.
@@ -492,3 +557,38 @@ ros2 service call /point_cloud_node/trigger_scan std_srvs/srv/Trigger
 ```
 
 또는 pick UI 창의 **⟳ Re-scan** 버튼 클릭.
+
+---
+
+## UC-6. 오프라인 실루엣 fit 검증 (ROS 불필요)
+
+녹화 시퀀스에 대해 실루엣 측정 수학(`cup_geometry.py`)을 ROS 없이 단독 검증한다.
+회귀 테스트·파라미터 튜닝·fit 품질 정량화에 사용.
+
+**단일 프레임** — 컵별 fit 표 + 오버레이 PNG:
+
+```bash
+cd ~/Projects/cup_stack/cup-stack-integration/vision/ros2-depth-point-cloude
+python3 src/depth_digital_twin/test/fit_check_frame.py \
+    --seq /home/eunwoo/Projects/cup_stack/seq_record/0010 --frame 1666
+# → /tmp/fit_check_0010_001666_exo.png (윤곽 녹 / fit 실루엣 시안 / depth 초기값 빨강)
+```
+
+**시퀀스 전체** — ByteTrack id 기반 트랙별 통계 + CSV + 오버레이 영상:
+
+```bash
+python3 src/depth_digital_twin/test/fit_check_sequence.py \
+    --seq /home/eunwoo/Projects/cup_stack/seq_record/0010 --stride 3 \
+    --csv /tmp/fit_0010.csv --video /tmp/fit_0010.avi
+# 종료 시 트랙별 요약: 정지 구간 σ_xy (fit vs depth-init A/B), IoU/rms, 실패율
+```
+
+- 영상은 `.avi` 권장 (**MJPEG** — 코덱 팩 없이 어디서나 재생). `.mp4`는 mp4v로
+  쓴 뒤 ffmpeg가 있으면 H.264 재인코딩.
+- ablation 플래그: `--no-boundary-offset`, `--no-edge-snap`, `--try-flip`
+  (mouth-up 프로파일), `--imgsz`(기본 1280 = 라이브와 동일).
+- 합성 단위 테스트(렌더링된 cone 마스크로 수학 자체를 검증, 13개):
+  `python3 src/depth_digital_twin/test/test_cup_geometry.py`
+
+측정 기준치 (seq 0010, imgsz 1280): fit 실패율 0 %, 정지 컵 per-frame σ_xy
+1.6–2.9 mm, exo 마스크 경계 바이어스 b ≈ −0.95 px.
