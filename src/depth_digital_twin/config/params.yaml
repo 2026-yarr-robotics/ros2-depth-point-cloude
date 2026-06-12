@@ -211,7 +211,7 @@ cup_fusion_node:
     #                              event count) — events fire at cloud rate
     #                              while obs refresh at 0.3-2s
     rim_level_hyst_m: 0.008      # level switch needs this much improvement
-    rim_layer_pref_tol_m: 0.005  # pyramid-lattice preference window; must be
+    rim_layer_pref_tol_m: 0.010  # pyramid preferred within real z_top noise
     #                              < |5*nest - layer| = 7mm (nest L5 vs pyr L1
     #                              nearly coincide — 0.007 misclassified them)
     rim_cluster_xy_m: 0.05       # cross-camera same-cup XY gate

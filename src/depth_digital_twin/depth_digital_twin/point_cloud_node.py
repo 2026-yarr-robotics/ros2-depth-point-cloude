@@ -891,7 +891,27 @@ class PointCloudNode(Node):
                 # good fits will consume.
                 if tf_stamped_ok or not moving_at:
                     hist = track.setdefault('ztop_hist', [])
-                    hist.append(float(np.percentile(obj_world[:, 2], 97.0)))
+                    # NON-eroded mask for the level evidence: at a low
+                    # camera elevation the top rim is a few-px band that
+                    # mask_erode eats — the 97th percentile then lands
+                    # BELOW the rim (−10 mm seen on Isaac tier-2 cups) and
+                    # flips the lattice snap. Robust top = median of the
+                    # top-5% band (averages depth noise instead of riding
+                    # its tail like a max/99th would).
+                    zy2, zx2 = np.where(mb & valid)
+                    if zy2.size >= 32:
+                        zy2 = zy2[::2]
+                        zx2 = zx2[::2]
+                        zz2 = z[zy2, zx2]
+                        xc2 = (zx2 - self.intr.cx) * zz2 / self.intr.fx
+                        yc2 = (zy2 - self.intr.cy) * zz2 / self.intr.fy
+                        zw2 = (R_wc[2, 0] * xc2 + R_wc[2, 1] * yc2
+                               + R_wc[2, 2] * zz2) + t_wc[2]
+                        band = zw2[zw2 >= np.percentile(zw2, 95.0)]
+                        hist.append(float(np.median(band)))
+                    else:
+                        hist.append(float(
+                            np.percentile(obj_world[:, 2], 97.0)))
                     if len(hist) > 7:
                         hist.pop(0)
                 occ_ctx = None
