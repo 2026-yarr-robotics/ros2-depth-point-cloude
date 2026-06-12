@@ -1,0 +1,78 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded: ~
+      Splitter Ratio: 0.5
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Color: 160; 160; 164
+      Plane Cell Count: 20
+      Reference Frame: <Fixed Frame>
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Marker Scale: 0.3
+      Show Names: true
+      Show Axes: true
+      Show Arrows: false
+    - Class: rviz_default_plugins/RobotModel
+      Name: RobotModel
+      Enabled: true
+      Description Topic:
+        Value: /robot_description
+        Depth: 5
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+      Visual Enabled: true
+    - Class: rviz_default_plugins/MarkerArray
+      Name: EE (recorded)
+      Enabled: true
+      Topic:
+        Value: /sequence_player_node/ee_marker
+        Depth: 5
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/Image
+      Name: Exo Color
+      Enabled: true
+      Topic:
+        Value: /exo/exo/color/image_raw
+        Reliability Policy: Best Effort
+    - Class: rviz_default_plugins/Image
+      Name: Hand Color
+      Enabled: true
+      Topic:
+        Value: /hand/hand/color/image_raw
+        Reliability Policy: Best Effort
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: base_link
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+      Distance: 2.5
+      Focal Point:
+        X: 0.2
+        Y: 0
+        Z: 0.3
+      Pitch: 0.4
+      Yaw: 0.8
+      Target Frame: base_link
+Window Geometry:
+  Height: 900
+  Width: 1500
+  Hide Left Dock: false
+  Hide Right Dock: false

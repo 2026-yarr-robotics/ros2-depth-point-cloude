@@ -1,0 +1,77 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# recode_sequence parameters
+# ─────────────────────────────────────────────────────────────────────────────
+
+recorder_node:
+  ros__parameters:
+    # Where sequences are written. A new auto-incrementing folder (0001, 0002…)
+    # is created under here on every launch; recording starts immediately.
+    output_root: /home/eunwoosong/Projects/record_sequence
+
+    # Single shared timeline: on every tick the recorder grabs the LATEST
+    # exo / hand / robot sample and writes them as one step with the same
+    # index across all streams (requirement: identical timeline everywhere).
+    record_rate_hz: 30.0
+
+    # Camera topics (namespaces fixed by cameras_only.launch.py).
+    exo_color_topic: /exo/exo/color/image_raw
+    exo_depth_topic: /exo/exo/aligned_depth_to_color/image_raw
+    exo_info_topic: /exo/exo/color/camera_info
+    hand_color_topic: /hand/hand/color/image_raw
+    hand_depth_topic: /hand/hand/aligned_depth_to_color/image_raw
+    hand_info_topic: /hand/hand/color/camera_info
+
+    # joint_states: sensor_msgs/JointState [radian] from dsr_bringup2 —
+    # RViz visualisation only.
+    joint_states_topic: /dsr01/joint_states
+
+    # EE pose: DSR API get_current_posx() (same as Calibration_Tutorial
+    # samples) → [x,y,z,a,b,c] mm/deg ZYZ, polled in a background thread.
+    # Needs the doosan workspace sourced (source ~/ros2_ws/install/setup.bash)
+    # and the robot/emulator connected. If unavailable the recorder records
+    # images (+ joints) only and warns once.
+    robot_id: dsr01
+    robot_model: m0609
+    dsr_imp_path: /home/eunwoosong/ros2_ws/src/doosan-robot2/dsr_common2/imp
+    ee_poll_hz: 30.0
+
+    # Wait this long after the node starts before the FIRST step is
+    # written. record.launch.py starts the cameras and the recorder
+    # together, so this ≈ "start recording 20 s after the camera node",
+    # letting both D435i fully warm up (otherwise the first few
+    # hand_depth frames are missing). Subscriptions/CameraInfo still
+    # fill during the wait.
+    start_delay_s: 20.0
+
+    # Background PNG-encode/disk workers + crash-safe checkpoint period.
+    write_workers: 4
+    checkpoint_every: 90
+
+    # Require at least the exo camera before a step is written (hand/robot
+    # may lag at startup; missing fields are stored as null for that step).
+    require_exo: true
+    # Stop the recorder after this many seconds (0 = until Ctrl-C).
+    max_duration_s: 0.0
+
+sequence_player_node:
+  ros__parameters:
+    # Absolute path to a sequence folder, e.g. /…/record_sequence/0001
+    sequence_dir: ''
+    # Republish recorded streams on these topics (defaults mirror the
+    # recorder so the digital-twin pipeline can consume them unchanged).
+    exo_color_topic: /exo/exo/color/image_raw
+    exo_depth_topic: /exo/exo/aligned_depth_to_color/image_raw
+    exo_info_topic: /exo/exo/color/camera_info
+    hand_color_topic: /hand/hand/color/image_raw
+    hand_depth_topic: /hand/hand/aligned_depth_to_color/image_raw
+    hand_info_topic: /hand/hand/color/camera_info
+    joint_states_topic: /joint_states
+    # Frames
+    exo_frame: exo_color_optical_frame
+    hand_frame: hand_color_optical_frame
+    base_frame: base_link
+    ee_frame: ee_recorded
+    # Playback starts running immediately at step 0.
+    autostart: true
+    # Loop? Requirement: stop at the end (do NOT wrap to start).
+    loop: false
