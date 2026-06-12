@@ -379,6 +379,9 @@ class CupFusionNode(Node):
         # Frozen-vs-live-exo disagreement above this inside ONE cluster
         # = stale frozen obs (drop it; good pairs sit within ~25 mm).
         gp('rim_scan_stale_m', 0.035)
+        # Drop observations whose fitted silhouette was almost entirely
+        # hidden by other instances (degenerate arc).
+        gp('rim_min_visible', 0.10)
         # Pyramid-lattice preference window: if the pyramid snap error is
         # within this, take it over a (numerically closer) nest snap.
         gp('rim_layer_pref_tol_m', 0.005)  # 0.007 collided with nest L5
@@ -599,6 +602,7 @@ class CupFusionNode(Node):
         self.rim_level_hyst = float(P('rim_level_hyst_m'))
         self.rim_scan_dedup = float(P('rim_scan_dedup_m'))
         self.rim_scan_stale = float(P('rim_scan_stale_m'))
+        self.rim_min_visible = float(P('rim_min_visible'))
         self.rim_layer_pref_tol = float(P('rim_layer_pref_tol_m'))
         self.rim_keepalive_s = float(P('rim_keepalive_s'))
         self._rim_ests_tick = None      # per-tick shared estimate cache
@@ -712,6 +716,7 @@ class CupFusionNode(Node):
             'rim_level_hyst_m': ('rim_level_hyst', float),
             'rim_scan_dedup_m': ('rim_scan_dedup', float),
             'rim_scan_stale_m': ('rim_scan_stale', float),
+            'rim_min_visible': ('rim_min_visible', float),
             'rim_layer_pref_tol_m': ('rim_layer_pref_tol', float),
             'rim_keepalive_s': ('rim_keepalive_s', float),
         }
@@ -1142,7 +1147,7 @@ class CupFusionNode(Node):
             if cam != 'hand' or t < t_cap or not self._obs_ok(ob):
                 continue
             cur = self._scan_pending.get(iid)
-            if cur is None or ob.mask_iou > cur.mask_iou:
+            if cur is None or self._obs_rank(ob) > self._obs_rank(cur):
                 self._scan_pending[iid] = ob
 
     def _scan_commit(self, wp) -> None:
@@ -1170,7 +1175,7 @@ class CupFusionNode(Node):
             if cam != 'hand' or not self._obs_ok(ob):
                 continue
             cur = pend.get(iid)
-            if cur is None or ob.mask_iou > cur.mask_iou:
+            if cur is None or self._obs_rank(ob) > self._obs_rank(cur):
                 pend[iid] = ob
         self._scan_obs[0] = pend
         self._refresh_scan_ids()
@@ -1191,6 +1196,13 @@ class CupFusionNode(Node):
         self.get_logger().info(response.message)
         return response
 
+    @staticmethod
+    def _obs_rank(ob) -> float:
+        """Candidate ranking: a 30%-visible fit with a high visibility-
+        NORMALISED IoU must not outrank a clean full view."""
+        vf = ob.visible_fraction if ob.visible_fraction > 0.0 else 1.0
+        return float(ob.mask_iou) * float(vf)
+
     def _obs_ok(self, ob) -> bool:
         if not np.all(np.isfinite([
                 ob.x0, ob.y0, ob.z_base0, ob.z_top_rough_m, ob.sigma_px,
@@ -1198,6 +1210,7 @@ class CupFusionNode(Node):
             return False      # a NaN field would hijack the fusion weights
         return (ob.mask_iou >= self.rim_min_iou
                 and ob.chamfer_rms_px <= self.rim_max_rms
+                and ob.visible_fraction >= self.rim_min_visible
                 and not (self.rim_drop_moving and ob.moving))
 
     def _on_cup_obs(self, msg: CupObservationArray, cam: str) -> None:
@@ -1309,7 +1322,7 @@ class CupFusionNode(Node):
             hand_cands = [o for o in members if o.camera == 'hand'
                           and (self.live_use_hand
                                or id(o) in self._scan_obj_ids)]
-            hand_meas = max(hand_cands, key=lambda o: o.mask_iou,
+            hand_meas = max(hand_cands, key=self._obs_rank,
                             default=None)
             meas_obs: dict[str, object] = {}
             if 'exo' in best:
@@ -1457,6 +1470,7 @@ class CupFusionNode(Node):
                     'rms_px': round(float(o.chamfer_rms_px), 2),
                     'score': float(o.score),
                     'color': str(o.color),
+                    'vis': round(float(o.visible_fraction), 2),
                     'moving': bool(o.moving)}
                     for o, r in zip(used, resid)},
             })

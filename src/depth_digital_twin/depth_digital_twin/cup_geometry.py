@@ -149,7 +149,11 @@ def fit_silhouette_xy(mask_u8: np.ndarray, *, K: np.ndarray, dist: np.ndarray,
                       f_scale_px: float = 2.0,
                       flip_profile: bool = False,
                       fit_boundary_offset: bool = False,
-                      max_offset_px: float = 4.0) -> dict:
+                      max_offset_px: float = 4.0,
+                      occluder_mask: np.ndarray | None = None,
+                      occ_dilate_px: int = 3,
+                      min_visible_contour: int = 15,
+                      min_b_contour: int = 60) -> dict:
     """Fit the cup axis (x, y) at ASSUMED base elevation `z_base` by aligning
     the projected cone silhouette to the observed mask contour.
 
@@ -160,6 +164,18 @@ def fit_silhouette_xy(mask_u8: np.ndarray, *, K: np.ndarray, dist: np.ndarray,
 
     flip_profile=True swaps r_top/r_bot — a MOUTH-UP cup (wide opening up,
     e.g. detectors without a dedicated mouth-up class label it upright).
+
+    occluder_mask (same shape as mask_u8, nonzero = pixels of OTHER
+    instances in front) enables OCCLUSION-AWARE fitting: observed contour
+    pixels adjacent to the (3 px-dilated) occluder are OCCLUSION EDGES —
+    they are excluded from the distance-transform targets, and model
+    silhouette samples that project INSIDE the occluder are excluded from
+    the residual (legitimately hidden: no pull, no penalty). The fit then
+    aligns only the truly visible arc while the KNOWN cone dimensions fill
+    in the hidden part — without this, a small visible fragment ends up in
+    the MIDDLE of the fitted cone (every model sample drags toward the only
+    contour there is). b is frozen when fewer than min_b_contour true-
+    silhouette pixels remain (b vs radial position becomes unobservable).
 
     fit_boundary_offset=True adds a third parameter b (px, |b| ≤
     max_offset_px): the model silhouette is displaced by b along its outward
@@ -191,10 +207,27 @@ def fit_silhouette_xy(mask_u8: np.ndarray, *, K: np.ndarray, dist: np.ndarray,
     roi_w, roi_h = u_hi - u_lo, v_hi - v_lo
     if roi_w < 8 or roi_h < 8:
         return {'ok': False, 'fail': 'roi_small'}
-    canvas = np.full((roi_h, roi_w), 255, dtype=np.uint8)
     cu = np.clip(contour[:, 0].astype(np.int32) - u_lo, 0, roi_w - 1)
     cv_ = np.clip(contour[:, 1].astype(np.int32) - v_lo, 0, roi_h - 1)
-    canvas[cv_, cu] = 0
+    occ_roi = None
+    if occluder_mask is not None:
+        occ_roi = (occluder_mask[v_lo:v_hi, u_lo:u_hi] > 0).astype(np.uint8)
+        if occ_roi.any():
+            occ_roi = cv2.dilate(
+                occ_roi, np.ones((3, 3), np.uint8),
+                iterations=max(1, int(occ_dilate_px)))
+        else:
+            occ_roi = None
+    if occ_roi is not None:
+        true_sil = occ_roi[cv_, cu] == 0     # contour px NOT against occluder
+        n_true = int(true_sil.sum())
+        if n_true < min_visible_contour:
+            return {'ok': False, 'fail': 'few_visible'}
+    else:
+        true_sil = np.ones(len(cu), dtype=bool)
+        n_true = len(cu)
+    canvas = np.full((roi_h, roi_w), 255, dtype=np.uint8)
+    canvas[cv_[true_sil], cu[true_sil]] = 0
     dt = cv2.distanceTransform(canvas, cv2.DIST_L2, 5)
     # Out-of-ROI model points clamp onto the border, where dt is already
     # large (≥ roi_pad_px away from any contour) — a natural escape penalty.
@@ -214,6 +247,14 @@ def fit_silhouette_xy(mask_u8: np.ndarray, *, K: np.ndarray, dist: np.ndarray,
         # frame for free.
         oob = ((sil[:, 0] < -2.0) | (sil[:, 0] > w + 1.0)
                | (sil[:, 1] < -2.0) | (sil[:, 1] > h + 1.0))
+        hidden = None
+        if occ_roi is not None:
+            hu = np.round(sil[:, 0]).astype(np.int64) - u_lo
+            hv = np.round(sil[:, 1]).astype(np.int64) - v_lo
+            inroi = ((hu >= 0) & (hu < roi_w) & (hv >= 0) & (hv < roi_h))
+            hidden = np.zeros(len(sil), dtype=bool)
+            ii = np.where(inroi)[0]
+            hidden[ii] = occ_roi[hv[ii], hu[ii]] > 0
         # Bilinear DT sampling — keeps the residual continuous in (x, y) so
         # finite-difference gradients are meaningful at sub-pixel steps
         # (nearest-pixel sampling plateaus and stalls the optimizer mm-scale).
@@ -230,8 +271,12 @@ def fit_silhouette_xy(mask_u8: np.ndarray, *, K: np.ndarray, dist: np.ndarray,
         r = ((1 - av) * ((1 - au) * d00 + au * d01)
              + av * ((1 - au) * d10 + au * d11)).astype(np.float64)
         r[oob] = float(roi_pad_px)
+        if hidden is not None:
+            r[hidden] = 0.0      # legitimately occluded: no pull, no penalty
         return r
 
+    if fit_boundary_offset and occ_roi is not None and n_true < min_b_contour:
+        fit_boundary_offset = False     # b unobservable on a small arc
     if fit_boundary_offset:
         x0 = np.array([xy0[0], xy0[1], 0.0])
         lb = np.array([-np.inf, -np.inf, -max_offset_px])
@@ -253,8 +298,32 @@ def fit_silhouette_xy(mask_u8: np.ndarray, *, K: np.ndarray, dist: np.ndarray,
         return {'ok': False, 'fail': 'non_finite'}
     x_fit, y_fit = float(res.x[0]), float(res.x[1])
     b_px = float(res.x[2]) if fit_boundary_offset else 0.0
+    if occ_roi is not None:
+        # Degenerate-occlusion guard: with (almost) every model sample
+        # hidden, the residual vector is all-zero — no gradient, the solver
+        # returns the INIT pose with rms 0 looking like a perfect fit.
+        sil_f = cone_silhouette_px(
+            x_fit, y_fit, z_base, r_top=r_top, r_bot=r_bot, height=height,
+            K=K, dist=dist, R_wc=R_wc, t_wc=t_wc,
+            n_theta=n_theta, n_samples=n_samples)
+        if sil_f is None:
+            return {'ok': False, 'fail': 'behind_cam'}
+        if fit_boundary_offset:
+            sil_f = sil_f + b_px * _polyline_normals(sil_f)
+        hu = np.round(sil_f[:, 0]).astype(np.int64) - u_lo
+        hv = np.round(sil_f[:, 1]).astype(np.int64) - v_lo
+        inroi_f = ((hu >= 0) & (hu < roi_w) & (hv >= 0) & (hv < roi_h))
+        hidden_f = np.zeros(len(sil_f), dtype=bool)
+        ii = np.where(inroi_f)[0]
+        hidden_f[ii] = occ_roi[hv[ii], hu[ii]] > 0
+        if int((~hidden_f).sum()) < 12:
+            return {'ok': False, 'fail': 'occluded'}
     r = residuals(res.x)
-    rms = float(np.sqrt(np.mean(r ** 2)))
+    if occ_roi is not None:
+        vis_r = r[~hidden_f]
+        rms = float(np.sqrt(np.mean(vis_r ** 2))) if vis_r.size else 0.0
+    else:
+        rms = float(np.sqrt(np.mean(r ** 2)))
 
     # Verification: rendered silhouette vs observed mask IoU on the ROI.
     sil = cone_silhouette_px(
@@ -265,17 +334,31 @@ def fit_silhouette_xy(mask_u8: np.ndarray, *, K: np.ndarray, dist: np.ndarray,
         # IoU is rendered-vs-MASK agreement, so include the mask-bias term.
         sil = sil + b_px * _polyline_normals(sil)
     iou = 0.0
+    vis_frac = 1.0
     if sil is not None:
         model_fill = np.zeros((roi_h, roi_w), dtype=np.uint8)
         poly = np.round(sil - np.array([u_lo, v_lo])).astype(np.int32)
         cv2.fillConvexPoly(model_fill, poly, 1)
         obs_fill = (mask_u8[v_lo:v_hi, u_lo:u_hi] > 0).astype(np.uint8)
+        if occ_roi is not None:
+            # Visibility-normalised: judge agreement only where the cup
+            # COULD be seen — a half-occluded cup must not score 0.3 and
+            # get gated out when its visible part matches perfectly.
+            model_total = int(model_fill.sum())
+            vis = (occ_roi == 0).astype(np.uint8)
+            model_fill = model_fill & vis
+            obs_fill = obs_fill & vis
+            vis_frac = (float(model_fill.sum()) / float(model_total)
+                        if model_total > 0 else 0.0)
         inter = int(np.sum(model_fill & obs_fill))
         union = int(np.sum(model_fill | obs_fill))
         iou = float(inter) / float(union) if union > 0 else 0.0
+    if occ_roi is not None and vis_frac < 0.08:
+        return {'ok': False, 'fail': 'occluded'}
 
     return {'ok': True, 'x': x_fit, 'y': y_fit, 'b_px': b_px, 'rms_px': rms,
             'iou': iou, 'n_contour': int(contour.shape[0]),
+            'n_true_contour': int(n_true), 'vis_frac': float(vis_frac),
             'truncated': truncated, 'flipped': bool(flip_profile)}
 
 
@@ -290,7 +373,8 @@ def edge_snap_fit(gray: np.ndarray, *, K: np.ndarray, dist: np.ndarray,
                   min_grad: float = 8.0, n_theta: int = 36,
                   n_samples: int = 120, iters: int = 2,
                   min_cov: float = 0.3,
-                  grad_mag: np.ndarray | None = None) -> dict:
+                  grad_mag: np.ndarray | None = None,
+                  occluder_mask: np.ndarray | None = None) -> dict:
     """Refine a silhouette fit by snapping the model boundary to IMAGE
     gradient edges instead of the YOLO mask contour.
 
@@ -314,6 +398,13 @@ def edge_snap_fit(gray: np.ndarray, *, K: np.ndarray, dist: np.ndarray,
         gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
         mag = cv2.magnitude(gx, gy)
     h, w = gray.shape[:2]
+    occ_d = None
+    if occluder_mask is not None and occluder_mask.any():
+        # In clusters the strongest gradient within the search window is
+        # often the NEIGHBOUR cup's edge — never snap onto or from inside
+        # another instance.
+        occ_d = cv2.dilate((occluder_mask > 0).astype(np.uint8),
+                           np.ones((3, 3), np.uint8), iterations=3)
     offs = np.linspace(-search_px, search_px, int(search_px * 4) + 1)
     step = offs[1] - offs[0]
     p = np.array([xy0[0], xy0[1]], dtype=np.float64)
@@ -347,6 +438,10 @@ def edge_snap_fit(gray: np.ndarray, *, K: np.ndarray, dist: np.ndarray,
         # outside the window — snapping to it would bias the fit toward the
         # window border (and the parabolic refinement degenerates there).
         valid = (peak >= min_grad) & (k > 0) & (k < len(offs) - 1)
+        if occ_d is not None:
+            su = np.clip(np.round(sil[:, 0]).astype(np.int64), 0, w - 1)
+            sv = np.clip(np.round(sil[:, 1]).astype(np.int64), 0, h - 1)
+            valid &= occ_d[sv, su] == 0
         n_snap = int(valid.sum())
         cov = n_snap / float(n_samples)
         if cov < min_cov:
@@ -361,6 +456,17 @@ def edge_snap_fit(gray: np.ndarray, *, K: np.ndarray, dist: np.ndarray,
                                                     den, 1.0), 0.0)
         snapped = sil + nrm * (offs[k]
                                + np.clip(delta, -1.0, 1.0) * step)[:, None]
+        if occ_d is not None:
+            pu = np.clip(np.round(snapped[:, 0]).astype(np.int64), 0, w - 1)
+            pv = np.clip(np.round(snapped[:, 1]).astype(np.int64), 0, h - 1)
+            valid &= occ_d[pv, pu] == 0     # snapped onto an occluder edge
+        # Re-check coverage AFTER the post-snap filters: an empty/near-empty
+        # idx made least_squares silently return x0 and np.mean([]) produce
+        # a NaN rms that poisoned the observation downstream.
+        n_snap = int(valid.sum())
+        cov = n_snap / float(n_samples)
+        if cov < min_cov:
+            return {'ok': False, 'fail': 'few_edges'}
         idx = np.where(valid)[0]
 
         def residuals(q):

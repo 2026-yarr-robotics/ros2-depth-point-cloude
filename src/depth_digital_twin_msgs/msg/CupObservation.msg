@@ -48,6 +48,10 @@ float32 boundary_offset_px # recovered uniform mask-boundary bias b (px):
 float32 edge_coverage      # fraction of silhouette samples snapped to a
                            # strong image-gradient edge (0 = edge-snap off or
                            # failed; the chamfer/mask fit was used as-is)
+float32 visible_fraction   # fraction of the model silhouette NOT hidden by
+                           # other instances at the fitted pose (occlusion-
+                           # aware fit; 1.0 = fully visible). The producer
+                           # already inflates sigma_px by 1/max(vf, 0.25).
 
 # Depth's demoted role: rough elevation for LEVEL CLASSIFICATION only.
 float32 median_depth_m     # median depth inside the mask (0 = no valid depth)

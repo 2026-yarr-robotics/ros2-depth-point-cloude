@@ -295,6 +295,90 @@ def test_fit_flip_profile_mouth_up_cup():
     assert err_mm < 3.0, f'flip fit error {err_mm:.2f} mm'
 
 
+def test_occlusion_aware_fit_rear_cup():
+    """A rear cup mostly hidden behind a front cup: the naive fit drags the
+    cone onto the visible fragment's centroid (the reported 'fragment lands
+    mid-cone' bug); the occlusion-aware fit recovers the true centre from
+    the visible arc + the known cone dimensions."""
+    cam = look_at(eye=(0.62, 0.0, 0.18), target=(0.20, 0.0, 0.06))
+    R_wc, t_wc = cam
+    front_xy = (0.42, 0.010)      # nearer the camera
+    rear_xy = (0.30, 0.000)       # ~62% hidden behind the front cup
+    front = render_cone_mask(*front_xy, 0.0, R_wc, t_wc)
+    rear_full = render_cone_mask(*rear_xy, 0.0, R_wc, t_wc)
+    rear_vis = cv2.bitwise_and(rear_full, cv2.bitwise_not(front))
+    vis_ratio = rear_vis.sum() / max(rear_full.sum(), 1)
+    assert 0.10 < vis_ratio < 0.75, f'occlusion setup ratio {vis_ratio:.2f}'
+
+    naive = fit_silhouette_xy(
+        rear_vis, K=K, dist=DIST, R_wc=R_wc, t_wc=t_wc, r_top=R_TOP,
+        r_bot=R_BOT, height=CUP_H, z_base=0.0,
+        xy0=(rear_xy[0] + 0.01, rear_xy[1] + 0.01))
+    aware = fit_silhouette_xy(
+        rear_vis, K=K, dist=DIST, R_wc=R_wc, t_wc=t_wc, r_top=R_TOP,
+        r_bot=R_BOT, height=CUP_H, z_base=0.0,
+        xy0=(rear_xy[0] + 0.01, rear_xy[1] + 0.01),
+        occluder_mask=front)
+    assert aware['ok']
+    err_aware = 1e3 * math.hypot(aware['x'] - rear_xy[0],
+                                 aware['y'] - rear_xy[1])
+    err_naive = (1e3 * math.hypot(naive['x'] - rear_xy[0],
+                                  naive['y'] - rear_xy[1])
+                 if naive['ok'] else 999.0)
+    print(f'    occlusion {1-vis_ratio:.0%}: naive {err_naive:.1f}mm '
+          f'-> aware {err_aware:.1f}mm (vis_frac {aware["vis_frac"]:.2f})')
+    assert err_aware < 6.0, f'aware fit error {err_aware:.1f} mm'
+    assert err_aware < err_naive, (err_naive, err_aware)
+    assert aware['vis_frac'] < 0.9
+
+
+def test_occlusion_top_band_only():
+    """Only the TOP band of the cup visible (the user-reported case: upper
+    rim segmented, rest hidden behind front cups) — the aware fit must put
+    the fragment at the TOP of the cone, not in its middle."""
+    R_wc, t_wc = look_at(eye=(0.62, 0.05, 0.55), target=(0.0, 0.0, 0.05))
+    true_xy = (0.02, -0.03)
+    full = render_cone_mask(*true_xy, 0.0, R_wc, t_wc)
+    ys, xs = np.nonzero(full)
+    cut = ys.min() + int(0.35 * (ys.max() - ys.min()))   # keep top 35%
+    occ = np.zeros_like(full)
+    occ[cut:, :] = 255                                   # occluder band below
+    vis = cv2.bitwise_and(full, cv2.bitwise_not(occ))
+    aware = fit_silhouette_xy(
+        vis, K=K, dist=DIST, R_wc=R_wc, t_wc=t_wc, r_top=R_TOP,
+        r_bot=R_BOT, height=CUP_H, z_base=0.0,
+        xy0=(true_xy[0] + 0.012, true_xy[1] - 0.012), occluder_mask=occ)
+    assert aware['ok']
+    err = 1e3 * math.hypot(aware['x'] - true_xy[0], aware['y'] - true_xy[1])
+    naive = fit_silhouette_xy(
+        vis, K=K, dist=DIST, R_wc=R_wc, t_wc=t_wc, r_top=R_TOP,
+        r_bot=R_BOT, height=CUP_H, z_base=0.0,
+        xy0=(true_xy[0] + 0.012, true_xy[1] - 0.012))
+    err_naive = (1e3 * math.hypot(naive['x'] - true_xy[0],
+                                  naive['y'] - true_xy[1])
+                 if naive['ok'] else 999.0)
+    print(f'    top-band only: naive {err_naive:.1f}mm -> aware {err:.1f}mm')
+    assert err < 6.0, f'top-band aware error {err:.1f} mm'
+    assert err < err_naive
+
+
+def test_occlusion_degenerate_fragment_fails():
+    """A sliver (top ~8%) must be rejected, not fitted."""
+    R_wc, t_wc = look_at(eye=(0.62, 0.05, 0.55), target=(0.0, 0.0, 0.05))
+    full = render_cone_mask(0.0, 0.0, 0.0, R_wc, t_wc)
+    ys, xs = np.nonzero(full)
+    cut = ys.min() + int(0.08 * (ys.max() - ys.min()))
+    occ = np.zeros_like(full)
+    occ[cut:, :] = 255
+    vis = cv2.bitwise_and(full, cv2.bitwise_not(occ))
+    r = fit_silhouette_xy(
+        vis, K=K, dist=DIST, R_wc=R_wc, t_wc=t_wc, r_top=R_TOP,
+        r_bot=R_BOT, height=CUP_H, z_base=0.0, xy0=(0.01, 0.01),
+        occluder_mask=occ)
+    assert not r['ok'] and r['fail'] in ('few_visible', 'few_contour',
+                                         'occluded'), r
+
+
 def test_contour_helpers():
     mask = np.zeros((100, 100), dtype=np.uint8)
     cv2.circle(mask, (50, 50), 20, 255, -1)

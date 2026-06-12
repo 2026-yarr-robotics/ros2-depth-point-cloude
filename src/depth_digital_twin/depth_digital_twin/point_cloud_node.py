@@ -318,6 +318,11 @@ class PointCloudNode(Node):
         # → the chamfer/mask fit is published as-is.
         self.declare_parameter('rim_edge_snap', True)
         self.declare_parameter('rim_edge_min_grad', 8.0)
+        # Occlusion-aware rim fit: pass the union of the OTHER instances'
+        # masks so occlusion edges are excluded from the fit targets and
+        # hidden model samples are free (a small visible fragment otherwise
+        # lands in the MIDDLE of the fitted cone).
+        self.declare_parameter('rim_occlusion_aware', True)
         # Max seconds a frame may wait for its stamped TF before falling back
         # to latest (fallback frames produce NO rim observation on a moving
         # camera — the image↔FK pairing would be wrong).
@@ -448,6 +453,8 @@ class PointCloudNode(Node):
             self.get_parameter('rim_edge_snap').value)
         self._rim_edge_min_grad: float = float(
             self.get_parameter('rim_edge_min_grad').value)
+        self._rim_occlusion: bool = bool(
+            self.get_parameter('rim_occlusion_aware').value)
         self._tf_defer_s: float = float(
             self.get_parameter('rim_tf_defer_s').value)
         self._tf_pending: list = []   # frames awaiting their stamped TF
@@ -772,6 +779,14 @@ class PointCloudNode(Node):
         # pair a mask with the TF of ITS OWN frame — a moving hand camera
         # cannot defer that pairing to the window.)
         rim_obs: list = []
+        # Coarse per-detection median depth (subsampled): only instances
+        # NEARER the camera than a cup can occlude it — a cup BEHIND must
+        # not erase the shared contour or deflate visible_fraction.
+        det_depth: list = []
+        for _obj, _mb in per_object_masks:
+            zz = z[_mb & valid]
+            det_depth.append(float(np.median(zz[::13])) if zz.size >= 16
+                             else float('inf'))
         # Always-on canvas: the debug stream must be a LIVE video (panel 3D
         # pane), not a sparse one that only updates when a throttled fit
         # fires — that read as "rim detection randomly stops".
@@ -779,9 +794,10 @@ class PointCloudNode(Node):
         if (self.rim_debug_pub is not None and self._rim_enabled
                 and self.rim_debug_pub.get_subscription_count() > 0):
             rim_dbg['canvas'] = rgb.copy()
-        for obj, mb in per_object_masks:
+        for det_i, (obj, mb) in enumerate(per_object_masks):
             if rim_dbg['canvas'] is not None:
-                self._draw_det_overlay(rim_dbg['canvas'], obj, mb)
+                occ_dbg = (union_mask & ~mb) if self._rim_occlusion else None
+                self._draw_det_overlay(rim_dbg['canvas'], obj, mb, occ_dbg)
             mb_box = self._erode_mask(mb)
             if mb_box.sum() < 32:
                 mb_box = mb
@@ -873,9 +889,12 @@ class PointCloudNode(Node):
                     hist.append(float(np.percentile(obj_world[:, 2], 97.0)))
                     if len(hist) > 7:
                         hist.pop(0)
+                occ_ctx = None
+                if self._rim_occlusion:
+                    occ_ctx = (per_object_masks, det_depth, det_i)
                 ob = self._rim_observe(
                     obj, mb, oz, obj_world, R_wc, t_wc, track, class_name,
-                    tid, rgb, rim_dbg, tf_stamped_ok, moving_at)
+                    tid, rgb, rim_dbg, tf_stamped_ok, moving_at, occ_ctx)
                 if ob is not None:
                     rim_obs.append(ob)
 
@@ -949,13 +968,26 @@ class PointCloudNode(Node):
             self._window_start_stamp = now
 
     # ------------------------------------------------------------------
-    def _draw_det_overlay(self, canvas, obj, mb) -> None:
+    def _draw_det_overlay(self, canvas, obj, mb, occ=None) -> None:
         """YOLO segmentation overlay (mask tint + bbox + label) for EVERY
         detection — same look as detection_debug, so the rim stream shows
-        the raw segmentation evidence alongside the fits."""
+        the raw segmentation evidence alongside the fits. Contour pixels
+        classified as OCCLUSION edges (adjacent to another instance) are
+        drawn red — the fit ignores them."""
         sel = canvas[mb]
         canvas[mb] = (sel.astype(np.float32) * 0.65
                       + np.array([0.0, 0.0, 255.0]) * 0.35).astype(np.uint8)
+        if occ is not None and occ.any():
+            cnts, _ = cv2.findContours(mb.astype(np.uint8),
+                                       cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_NONE)
+            occ_d = cv2.dilate(occ.astype(np.uint8),
+                               np.ones((3, 3), np.uint8), iterations=3)
+            for c in cnts:
+                pts = c.reshape(-1, 2)
+                bad = occ_d[pts[:, 1], pts[:, 0]] > 0
+                canvas[pts[bad, 1], pts[bad, 0]] = (0, 0, 255)
+                canvas[pts[~bad, 1], pts[~bad, 0]] = (0, 255, 0)
         x1, y1 = int(obj.x_min), int(obj.y_min)
         cv2.rectangle(canvas, (x1, y1),
                       (int(obj.x_max), int(obj.y_max)), (0, 255, 0), 1)
@@ -968,7 +1000,7 @@ class PointCloudNode(Node):
     # ------------------------------------------------------------------
     def _rim_observe(self, obj, mb, oz, obj_world, R_wc, t_wc, track,
                      class_name, tid, rgb, rim_dbg, tf_stamped_ok=True,
-                     moving_at=False):
+                     moving_at=False, occ_ctx=None):
         """Throttled silhouette chamfer fit for one upright-cup detection.
 
         Returns a CupObservation or None. The fit aligns the KNOWN truncated
@@ -1007,19 +1039,42 @@ class PointCloudNode(Node):
 
         canvas = rim_dbg['canvas']
 
+        occ_u8 = None
+        if occ_ctx is not None:
+            masks, depths, i_self = occ_ctx
+            own_z = depths[i_self]
+            occ = None
+            for j, (_o, mbj) in enumerate(masks):
+                # nearer by >1 cm = can occlude me (depth-blind occluders
+                # erased shared contours from BOTH sides of every pair)
+                if j == i_self or not depths[j] < own_z - 0.01:
+                    continue
+                occ = mbj.copy() if occ is None else (occ | mbj)
+            if occ is not None:
+                occ_u8 = occ.astype(np.uint8)
+
         hist = track.get('ztop_hist') or []
         z_top_rough = (float(np.median(hist)) if hist
                        else float(np.percentile(obj_world[:, 2], 97.0)))
         z_base0 = z_top_rough - self.cup_h
-        xy0 = (float(np.median(obj_world[:, 0])),
-               float(np.median(obj_world[:, 1])))
+        # Init from the track's last fit when fresh: a fragment's depth
+        # median is biased toward the visible side, which starts the
+        # optimizer in the wrong basin exactly when occlusion makes the
+        # basin narrow.
+        prior = track.get('rim_prior')
+        if prior is not None and now_s - prior[2] < 1.0:
+            xy0 = (prior[0], prior[1])
+        else:
+            xy0 = (float(np.median(obj_world[:, 0])),
+                   float(np.median(obj_world[:, 1])))
         mask_u8 = mb.astype(np.uint8) * 255
         try:
             fit = fit_silhouette_xy(
                 mask_u8, K=self.K, dist=self.intr.dist, R_wc=R_wc, t_wc=t_wc,
                 r_top=self.cup_top_d * 0.5, r_bot=self.cup_bot_d * 0.5,
                 height=self.cup_h, z_base=z_base0, xy0=xy0,
-                fit_boundary_offset=self._rim_boundary_offset)
+                fit_boundary_offset=self._rim_boundary_offset,
+                occluder_mask=occ_u8)
         except Exception as e:  # never let the obs path break frame ingest
             self.get_logger().warn(
                 f'silhouette fit failed: {e}', throttle_duration_sec=5.0)
@@ -1046,7 +1101,8 @@ class PointCloudNode(Node):
                     t_wc=t_wc, r_top=self.cup_top_d * 0.5,
                     r_bot=self.cup_bot_d * 0.5, height=self.cup_h,
                     z_base=z_base0, xy0=(fit['x'], fit['y']),
-                    min_grad=self._rim_edge_min_grad, grad_mag=mag)
+                    min_grad=self._rim_edge_min_grad, grad_mag=mag,
+                    occluder_mask=occ_u8)
             except Exception:
                 snap = {'ok': False}
             if snap.get('ok'):
@@ -1095,6 +1151,11 @@ class PointCloudNode(Node):
             sigma *= 3.0
         if fit['truncated']:
             sigma *= 2.0
+        # Partial visibility: contribute, but honestly weaker (KF + the
+        # other camera + time average it out).
+        vis = float(fit.get('vis_frac', 1.0))
+        sigma /= max(vis, 0.25)
+        track['rim_prior'] = (float(fit['x']), float(fit['y']), now_s)
         origin, ray_d = ray_through_point(
             np.array([fit['x'], fit['y'], z_base0]), t_wc)
 
@@ -1119,7 +1180,9 @@ class PointCloudNode(Node):
         ob.sigma_px = float(sigma)
         ob.chamfer_rms_px = float(fit['rms_px'])
         ob.mask_iou = float(fit['iou'])
-        ob.contour_points = int(fit['n_contour'])
+        ob.contour_points = int(fit.get('n_true_contour',
+                                         fit['n_contour']))
+        ob.visible_fraction = vis
         ob.boundary_offset_px = float(fit.get('b_px', 0.0))
         ob.edge_coverage = edge_cov
         ob.median_depth_m = float(np.median(oz)) if oz.size else 0.0
