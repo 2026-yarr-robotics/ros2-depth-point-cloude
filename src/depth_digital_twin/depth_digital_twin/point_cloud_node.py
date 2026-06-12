@@ -794,7 +794,10 @@ class PointCloudNode(Node):
             per_object_masks.append((obj, mb))
 
         # Per-frame: depth debug stream is independent of detection success.
-        self._publish_depth_debug(depth_msg, z, valid, union_mask)
+        # Render only when someone is actually watching: the JET colormap +
+        # outline pass costs ~12% CPU of this node (py-spy 2026-06-12).
+        if self.depth_debug_pub.get_subscription_count() > 0:
+            self._publish_depth_debug(depth_msg, z, valid, union_mask)
 
         # Per-frame: ingest each detection's world points into its track's
         # accumulating buffer. No fitting / cloud / marker publish here — the

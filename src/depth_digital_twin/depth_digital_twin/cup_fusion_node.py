@@ -1927,6 +1927,13 @@ class CupFusionNode(Node):
         clouds (hand=orange, exo=blue) and rough AABB boxes with Hand<N>/
         Exo<N> texts. Rough-position aids only — the precise estimate is the
         fused /digital_twin/boxes (Plot F)."""
+        # Building these clouds is ~47% of this node's CPU (py-spy
+        # 2026-06-12); skip entirely while no panel/RViz subscribes.
+        if (self.points_exo_pub.get_subscription_count() == 0
+                and self.points_hand_pub.get_subscription_count() == 0
+                and self.boxes_exo_pub.get_subscription_count() == 0
+                and self.boxes_hand_pub.get_subscription_count() == 0):
+            return
         header = Header(stamp=stamp, frame_id=self.world_frame)
         now = self.get_clock().now()
         for cam, cloud_on, box_on, cloud_pub, box_pub, rgbf, name in (
