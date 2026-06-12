@@ -1010,8 +1010,18 @@ class CupFusionNode(Node):
         independently). XY-only distance collapsed a pyramid's vertical
         column into one track; an ellipsoid keeps layers apart (Z gate <
         layer spacing) while merging cross-view jitter (XY)."""
+        # EXO bindings only: hand ByteTrack swaps ids between identical
+        # adjacent cups while the arm places (measured 2026-06-13: the
+        # L1_mid fit carried a hand iid still bound to the L1_left track
+        # 77 mm away — inside any radius loose enough to rescue the
+        # ~68 mm exo level-slide, since pyramid slots are only 78 mm
+        # apart — and every fit was absorbed into the neighbour, so the
+        # placed cup NEVER got a track and /stack never confirmed the
+        # slot). The slide this pass exists to rescue is exo-only; hand
+        # observations still contribute geometry, just not identity.
         bound = {g for k in idkeys
-                 if (g := self._idkey_gid.get(k)) is not None
+                 if k[0] == 'exo'
+                 and (g := self._idkey_gid.get(k)) is not None
                  and g in self._tracks}
         if bound:
             best, best_d = None, float('inf')
