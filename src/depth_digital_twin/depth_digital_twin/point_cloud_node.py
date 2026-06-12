@@ -796,7 +796,12 @@ class PointCloudNode(Node):
             rim_dbg['canvas'] = rgb.copy()
         for det_i, (obj, mb) in enumerate(per_object_masks):
             if rim_dbg['canvas'] is not None:
-                occ_dbg = (union_mask & ~mb) if self._rim_occlusion else None
+                occ_dbg = None
+                if self._rim_occlusion:
+                    zown = det_depth[det_i]
+                    occ_dbg = (union_mask & ~mb)
+                    if np.isfinite(zown):
+                        occ_dbg = occ_dbg | (valid & (z < zown - 0.08) & ~mb)
                 self._draw_det_overlay(rim_dbg['canvas'], obj, mb, occ_dbg)
             mb_box = self._erode_mask(mb)
             if mb_box.sum() < 32:
@@ -891,7 +896,7 @@ class PointCloudNode(Node):
                         hist.pop(0)
                 occ_ctx = None
                 if self._rim_occlusion:
-                    occ_ctx = (per_object_masks, det_depth, det_i)
+                    occ_ctx = (per_object_masks, det_depth, det_i, z, valid)
                 ob = self._rim_observe(
                     obj, mb, oz, obj_world, R_wc, t_wc, track, class_name,
                     tid, rgb, rim_dbg, tf_stamped_ok, moving_at, occ_ctx)
@@ -1041,7 +1046,7 @@ class PointCloudNode(Node):
 
         occ_u8 = None
         if occ_ctx is not None:
-            masks, depths, i_self = occ_ctx
+            masks, depths, i_self, z_img, valid_px = occ_ctx
             own_z = depths[i_self]
             occ = None
             for j, (_o, mbj) in enumerate(masks):
@@ -1050,7 +1055,17 @@ class PointCloudNode(Node):
                 if j == i_self or not depths[j] < own_z - 0.01:
                     continue
                 occ = mbj.copy() if occ is None else (occ | mbj)
-            if occ is not None:
+            if np.isfinite(own_z):
+                # DEPTH-based occluder: anything physically nearer than the
+                # cup at pixel level — the ROBOT ARM/GRIPPER (no YOLO class)
+                # and cups the detector missed. Without this, an arm-clipped
+                # mask reads as 'fully visible' (vis=1.0) and the fit slides
+                # away from the camera. 8 cm margin clears the cup's own
+                # front wall (≤4 cm nearer than the mask median) and the
+                # adjacent table.
+                docc = valid_px & (z_img < own_z - 0.08) & ~mb
+                occ = docc if occ is None else (occ | docc)
+            if occ is not None and occ.any():
                 occ_u8 = occ.astype(np.uint8)
 
         hist = track.get('ztop_hist') or []
