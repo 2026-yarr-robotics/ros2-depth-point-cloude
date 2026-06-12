@@ -1536,8 +1536,14 @@ class CupFusionNode(Node):
                     or now_s - tw > self.rim_obs_backstop):
                 del self._rim_latest[k]
                 self._rim_arr_miss.pop(k, None)
+        # live_use_hand=false ⇒ the LIVE fit is exo-only on the rim path too
+        # (the cloud path already gates hand in _gather). Scan-frozen hand
+        # observations ([S]) below participate regardless — documented
+        # contract in params.yaml. Hand obs stay cached while off, so the
+        # Tk toggle takes effect within one tick, both directions.
         live = [ob for ob, _, _ in self._rim_latest.values()
-                if self._obs_ok(ob)]
+                if self._obs_ok(ob)
+                and (self.live_use_hand or ob.camera != 'hand')]
         scan = [ob for sub in self._scan_obs.values() for ob in sub.values()]
         return live + scan
 

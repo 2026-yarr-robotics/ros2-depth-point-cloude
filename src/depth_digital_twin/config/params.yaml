@@ -124,6 +124,10 @@ point_cloud_node:
     rim_obs_enabled: true
     rim_fit_period_s: 0.3        # min seconds between fits per track (~6ms/fit)
     rim_sigma_px: 2.0            # assumed contour 1σ (×3 moving, ×2 truncated)
+    rim_skip_truncated: true     # border-cut mask ⇒ obs NOT published at all
+    #                              (edge-band fits biased toward the cut side;
+    #                               2026-06-13 — cup re-enters when fully in
+    #                               frame; false = legacy σ×2 publish)
     rim_min_iou: 0.2             # producer-side sanity gate (consumer: 0.5)
     rim_boundary_offset: true    # 3rd fit param b: uniform YOLO boundary bias
     #                              (px) absorbed instead of leaking into (x,y)
@@ -244,6 +248,12 @@ cup_fusion_node:
     rim_cluster_xy_m: 0.05       # cross-camera same-cup XY gate
     rim_min_iou: 0.5             # drop low-quality silhouette fits
     rim_max_rms_px: 6.0
+    rim_min_visible: 0.80        # fuse only mostly-visible silhouettes
+    #                              (2026-06-13: was 0.10). NOTE this also
+    #                              counts cup-on-cup occlusion — if pyramid
+    #                              lower-layer cups start dropping out of
+    #                              the fit, lower live:
+    #                              ros2 param set /cup_fusion_node rim_min_visible 0.5
     rim_log_dir: ""              # set to e.g. /tmp/rim_ab to record A/B CSV
 
     # ── Cross-camera extrinsic self-calibration ──────────────────────────
@@ -295,7 +305,7 @@ cup_fusion_node:
     # is EXO ONLY; hand observations show in the panel (H-cloud/H-box) but
     # never enter the fit or RViz. Scan-frozen hand observations ([S]) always
     # participate regardless. true ALSO arms the scan FSM (see above).
-    live_use_hand: true
+    live_use_hand: false
 
     # ── Live noise suppression ────────────────────────────────────────────
     # (A) Temporal frame accumulation: union each camera's clouds over this

@@ -320,6 +320,13 @@ class PointCloudNode(Node):
         # Assumed 1σ contour-pixel noise; inflated x3 when the wrist camera is
         # moving and x2 when the mask is cut by the image border.
         self.declare_parameter('rim_sigma_px', 2.0)
+        # Border-cut silhouettes (contour touches the image edge): the
+        # visible arc constrains the axis poorly and biases the fit toward
+        # the cut side (hand camera, ~150 px edge band). True (2026-06-13
+        # decision) = EXCLUDE such observations from fusion entirely — the
+        # cup re-enters as soon as it is fully inside the frame. False =
+        # legacy behaviour (publish with sigma x2).
+        self.declare_parameter('rim_skip_truncated', True)
         # Drop fits whose rendered-silhouette-vs-mask IoU is below this (the
         # consumer applies its own, stricter gate on top).
         self.declare_parameter('rim_min_iou', 0.2)
@@ -469,6 +476,8 @@ class PointCloudNode(Node):
             0.05, float(self.get_parameter('rim_fit_period_s').value))
         self._rim_sigma_px: float = float(
             self.get_parameter('rim_sigma_px').value)
+        self._rim_skip_truncated: bool = bool(
+            self.get_parameter('rim_skip_truncated').value)
         self._rim_min_iou: float = float(
             self.get_parameter('rim_min_iou').value)
         self._rim_boundary_offset: bool = bool(
@@ -1212,6 +1221,15 @@ class PointCloudNode(Node):
         if moving_at:
             sigma *= 3.0
         if fit['truncated']:
+            if self._rim_skip_truncated:
+                # Border-cut mask: excluded from fusion (see the parameter
+                # declaration). Surface the drop on the panel overlay so a
+                # cup vanishing near the frame edge is explainable.
+                track['rim_overlay'] = {
+                    'ok': False, 'sil': None, 'dot': None,
+                    'label': f'#{tid} FIT-DROP border-cut',
+                    'pos': (tx, ty + 14), 't': now_s}
+                return None
             sigma *= 2.0
         # Partial visibility: contribute, but honestly weaker (KF + the
         # other camera + time average it out).
