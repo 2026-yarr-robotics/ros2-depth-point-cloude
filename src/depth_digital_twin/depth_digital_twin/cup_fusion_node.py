@@ -1576,8 +1576,9 @@ class CupFusionNode(Node):
             t.color = ColorRGBA(r=0.0, g=0.95, b=0.95, a=0.9)
             t.lifetime = self._dbg_lifetime
             cams = '+'.join(sorted(e['cams']))
-            t.text = (f"R{i} L{e['level']} ±{e['sigma_mm']:.0f}mm "
-                      f"[{cams}]")
+            # underscores, not spaces — RViz TEXT_VIEW_FACING space-gap bug
+            t.text = f"R{i}_L{e['level']}_±{e['sigma_mm']:.0f}mm_[{cams}]"
+
             arr.markers.append(t)
         # Publish even when empty: skipping while existing markers expire on
         # the 0.4 s lifetime made the whole overlay blink off during gating
@@ -1885,6 +1886,11 @@ class CupFusionNode(Node):
             msg, t = self._latest[cam]
             objs = (list(msg.objects) if msg is not None
                     and (now - t).nanoseconds * 1e-9 <= self.max_age else [])
+            # Motion-smeared hand clouds (image paired with a moving/laggy
+            # FK pose) are poison even for a rough display — same gate the
+            # fit path uses.
+            if cam == 'hand' and self.hand_gating:
+                objs = [o for o in objs if not o.moving]
             xyzs = []
             if cloud_on:
                 for o in objs:
@@ -1956,15 +1962,16 @@ class CupFusionNode(Node):
             top_world = np.array([cx, cy, z_base + self.cup_h])
         else:
             top_world = center + R @ np.array([0.0, 0.0, float(size[2]) * 0.5])
-        # Label contract v2: `[F] [S] #<id> <color> cup(x, y, z)` —
+        # Label = LEGACY token structure + meta additions, ALL underscore-
+        # separated. Two hard constraints: (a) too many dependants parse the
+        # `#id_c=color_cls_score` token form — keep it intact, only append
+        # meta; (b) RViz TEXT_VIEW_FACING renders spaces with huge gaps
+        # (known bug) — never use spaces.
+        #   [F]_[S]_#7_c=red_upright-cup_0.87_(0.305,0.400,0.075)
         # [F]=exo+hand fused, [S]=scan-backed, position = KF centre.
-        # Downstream parsers (skill_manager / plan_executor / pick_node /
-        # boxes_to_detections) are upgraded to a tolerant matcher that
-        # accepts BOTH this and the legacy `#id_c=color_cls_score` form.
-        prefix = ('[F] ' if fused else '') + ('[S] ' if scan else '')
-        disp_cls = 'cup' if cls == 'upright-cup' else cls
-        label = (f"{prefix}#{gid} {color} {disp_cls}"
-                 f"({float(center[0]):.3f}, {float(center[1]):.3f}, "
+        prefix = ('[F]_' if fused else '') + ('[S]_' if scan else '')
+        label = (f"{prefix}#{gid}_c={color}_{cls}_{score:.2f}_"
+                 f"({float(center[0]):.3f},{float(center[1]):.3f},"
                  f"{float(center[2]):.3f})")
         return {'center': np.asarray(center), 'R': R, 'size': np.asarray(size),
                 'top_world': top_world, 'frustum': frustum, 'label': label}

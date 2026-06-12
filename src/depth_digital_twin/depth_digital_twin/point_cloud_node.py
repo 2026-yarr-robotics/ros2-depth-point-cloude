@@ -839,7 +839,12 @@ class PointCloudNode(Node):
             # serialize). obj_world above is still computed: rim needs the
             # rough z (level) and xy init from it.
             track['seen'] = True
-            if self._upright_clouds or class_name not in self.cup_class_names:
+            if not tf_stamped_ok and moving_at:
+                # Mis-paired frame (latest-TF fallback while the camera
+                # moved): its world points are smeared — keep them out of
+                # the cloud buffer too, not just out of the rim/ztop paths.
+                pass
+            elif self._upright_clouds or class_name not in self.cup_class_names:
                 track['points_buf'].append(obj_world)
                 track['colors_buf'].append(obj_rgb_packed)
             track['last_score'] = float(obj.score)
