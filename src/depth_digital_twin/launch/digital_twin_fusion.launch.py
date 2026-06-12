@@ -271,8 +271,12 @@ def _setup(context, *_, **__):
         'cup_top_diameter_m', 'cup_bottom_diameter_m', 'cup_height_m',
         'cup_fit_residual_max', 'cup_polygon_segments', 'cup_class_names',
         'box_standing_ratio', 'box_min_elongation') if k in pn}
-    model_exo = dn.get('model_exo') or dn.get('model') or ''
-    model_hand = dn.get('model_hand') or dn.get('model') or ''
+    # 런치 인자 오버라이드 (빈 값 = params.yaml 폴백 — 실기 기본 동작 불변).
+    # Isaac 트윈이 sim 가중치를 주입하는 단일 지점 (start_isaac.sh SIM_YOLO_*).
+    _ov_exo = LaunchConfiguration('model_exo').perform(context).strip()
+    _ov_hand = LaunchConfiguration('model_hand').perform(context).strip()
+    model_exo = _ov_exo or dn.get('model_exo') or dn.get('model') or ''
+    model_hand = _ov_hand or dn.get('model_hand') or dn.get('model') or ''
     # Like `wo`/`pn` above: the params.yaml `detection_node:` section does
     # NOT match the RENAMED detection_node_exo/_hand, so its class filter /
     # confidence / device silently fell back to code defaults (the 3-class
@@ -540,6 +544,14 @@ def generate_launch_description() -> LaunchDescription:
             'imgsz', default_value='640',
             description='YOLO inference size for BOTH detectors (dual = heavy; '
                         '640 default, set 1280 if GPU allows)'),
+        DeclareLaunchArgument(
+            'model_exo', default_value='',
+            description='exo detector 가중치 오버라이드 (빈 값 = params.yaml '
+                        'detection_node.model_exo) — Isaac sim 가중치 주입용'),
+        DeclareLaunchArgument(
+            'model_hand', default_value='',
+            description='hand detector 가중치 오버라이드 (빈 값 = params.yaml '
+                        'detection_node.model_hand)'),
         DeclareLaunchArgument(
             'params',
             default_value=os.path.join(pkg, 'config', 'params.yaml')),
