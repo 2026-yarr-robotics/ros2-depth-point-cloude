@@ -354,9 +354,25 @@ class CupFusionNode(Node):
         # A wrong z slides the estimate along the view ray: at the exo
         # elevation (~20°) a 7 mm z error becomes ~19 mm in XY.
         gp('rim_layer_height_m', 0.093)
-        gp('rim_obs_max_age_s', 3.0)   # forget observations older than this
+        gp('rim_obs_max_age_s', 3.0)   # forget observations older than this.
+        #                                STREAM time, not wall time: array
+        #                                gaps beyond rim_gap_grace_s freeze
+        #                                this clock (discounted on resume in
+        #                                _on_cup_obs), so a bursty camera no
+        #                                longer ages the whole cache out at
+        #                                once — which blinked EVERY rim
+        #                                marker off together, then back.
         #                                (hand publishes slower than exo —
         #                                 1.0s aged its obs out between ticks)
+        gp('rim_gap_grace_s', 0.45)    # inter-array gap beyond this = stream
+        #                                stall (producer fit throttle is
+        #                                0.3 s); only the grace portion of a
+        #                                stall counts toward the obs age
+        gp('rim_obs_backstop_s', 5.0)  # WALL-time hard limit: a camera that
+        #                                never resumes publishes no arrays, so
+        #                                negative evidence AND stream aging
+        #                                both freeze — this alone reaps its
+        #                                frozen obs (no permanent ghosts)
         gp('rim_cluster_xy_m', 0.05)   # cross-camera same-cup XY gate
         gp('rim_cluster_z_m', 0.04)    # z gate (must be < layer spacing 0.093
         #                                so pyramid layers stay separate)
@@ -402,9 +418,12 @@ class CupFusionNode(Node):
         # 20 mm-pitch nest lattice (always within ±10 mm of ANY z) steal
         # tier-2 cups and the slide amplified the level error ~4x into XY.
         gp('rim_layer_pref_tol_m', 0.010)
-        # Wall-time track keepalive for rim mode (s). Slightly above the obs
-        # cache age so a track survives an occlusion exactly as long as its
-        # observations can.
+        # Track keepalive for rim mode (s), counted in rim-array STREAM time
+        # (the clock advances ≤ rim_gap_grace_s per array and pauses during
+        # stalls). A track evicts only after ~keepalive/array-period arrays
+        # arrived WITHOUT matching it — true negative evidence. Wall-time
+        # counting evicted ALL tracks together whenever one obs array ran
+        # late while cloud events kept firing (the all-cups blink).
         gp('rim_keepalive_s', 3.5)
 
         def P(n):
@@ -605,12 +624,24 @@ class CupFusionNode(Node):
         self.nest_off = float(P('nesting_offset_m'))
         self.rim_layer_h = float(P('rim_layer_height_m'))
         self.rim_obs_max_age = float(P('rim_obs_max_age_s'))
+        self.rim_gap_grace = float(P('rim_gap_grace_s'))
+        self.rim_obs_backstop = float(P('rim_obs_backstop_s'))
         self.rim_cluster_xy = float(P('rim_cluster_xy_m'))
         self.rim_cluster_z = float(P('rim_cluster_z_m'))
         self.rim_min_iou = float(P('rim_min_iou'))
         self.rim_max_rms = float(P('rim_max_rms_px'))
         self.rim_log_dir = str(P('rim_log_dir'))
-        self._rim_latest: dict[tuple, tuple] = {}   # (cam, iid) → (obs, t_s)
+        # (cam, iid) → (obs, t_stream_s, t_wall_s). t_stream ages the cache
+        # (camera-stall gaps discounted); t_wall feeds the dead-camera
+        # backstop and the scan-capture window (t_cap comparisons).
+        self._rim_latest: dict[tuple, tuple] = {}
+        self._rim_arr_last_t: dict[str, float] = {}  # cam → last array wall-t
+        # Rim-array STREAM clocks: advance ≤ grace per array, pause during
+        # stalls. Track keepalive counts these, so an obs-array hiccup while
+        # cloud events keep firing no longer evicts every track at once.
+        self._rim_stream_now = 0.0                   # any-cam stream clock
+        self._rim_cam_stream: dict[str, float] = {}  # per-cam stream clock
+        self._rim_arr_any_t: float | None = None     # last array wall-t (any)
         self.rim_bias_apply = bool(P('rim_bias_apply'))
         self.rim_bias_ref = str(P('rim_bias_ref_cam'))
         self.rim_bias_alpha = float(P('rim_bias_alpha'))
@@ -725,6 +756,8 @@ class CupFusionNode(Node):
             'nesting_offset_m': ('nest_off', float),
             'rim_layer_height_m': ('rim_layer_h', float),
             'rim_obs_max_age_s': ('rim_obs_max_age', float),
+            'rim_gap_grace_s': ('rim_gap_grace', float),
+            'rim_obs_backstop_s': ('rim_obs_backstop', float),
             'rim_cluster_xy_m': ('rim_cluster_xy', float),
             'rim_cluster_z_m': ('rim_cluster_z', float),
             'rim_min_iou': ('rim_min_iou', float),
@@ -1182,8 +1215,11 @@ class CupFusionNode(Node):
         """During CAPTURE: harvest fresh, quality-passing HAND observations
         into the pending set (best IoU per instance id)."""
         t_cap = self._t_cap.nanoseconds * 1e-9
-        for (cam, iid), (ob, t) in self._rim_latest.items():
-            if cam != 'hand' or t < t_cap or not self._obs_ok(ob):
+        # t_wall, NOT the gap-discounted stream stamp: the capture window is
+        # a wall-clock interval — a shifted stream stamp crossing t_cap would
+        # leak a pre-capture obs into the scan.
+        for (cam, iid), (ob, _ts, t_wall) in self._rim_latest.items():
+            if cam != 'hand' or t_wall < t_cap or not self._obs_ok(ob):
                 continue
             cur = self._scan_pending.get(iid)
             if cur is None or self._obs_rank(ob) > self._obs_rank(cur):
@@ -1210,7 +1246,7 @@ class CupFusionNode(Node):
         """Trigger ~/capture_scan_now: freeze the CURRENT hand cache as a
         scan (no robot motion needed — replay/sim validation)."""
         pend = {}
-        for (cam, iid), (ob, _t) in self._rim_latest.items():
+        for (cam, iid), (ob, _ts, _tw) in self._rim_latest.items():
             if cam != 'hand' or not self._obs_ok(ob):
                 continue
             cur = pend.get(iid)
@@ -1254,6 +1290,31 @@ class CupFusionNode(Node):
 
     def _on_cup_obs(self, msg: CupObservationArray, cam: str) -> None:
         now_s = self.get_clock().now().nanoseconds * 1e-9
+        # Stream-gap discount: the obs cache must age on time the camera
+        # stream was ALIVE, not wall time. During a stall (bursty Isaac
+        # camera, YOLO hiccup) no arrays arrive, so negative evidence can't
+        # fire — and wall-clock aging expired every cached obs together,
+        # blinking ALL rim markers off at once, then back on resume. Forgive
+        # the stall retroactively by shifting this camera's stream stamps;
+        # _rim_collect freezes the age mid-gap and its wall-time backstop
+        # still reaps a camera that never resumes.
+        prev_t = self._rim_arr_last_t.get(cam)
+        if prev_t is not None:
+            excess = (now_s - prev_t) - self.rim_gap_grace
+            if excess > 0.0:
+                for key, (ob_c, ts_c, tw_c) in list(self._rim_latest.items()):
+                    if key[0] == cam:
+                        self._rim_latest[key] = (ob_c, ts_c + excess, tw_c)
+            self._rim_cam_stream[cam] = (self._rim_cam_stream.get(cam, 0.0)
+                                         + min(now_s - prev_t,
+                                               self.rim_gap_grace))
+        else:
+            self._rim_cam_stream.setdefault(cam, 0.0)
+        self._rim_arr_last_t[cam] = now_s
+        if self._rim_arr_any_t is not None:
+            self._rim_stream_now += min(
+                now_s - self._rim_arr_any_t, self.rim_gap_grace)
+        self._rim_arr_any_t = now_s
         # Negative evidence: a (cam, iid) repeatedly ABSENT from this
         # camera's arrays is gone (picked cup / ByteTrack re-id) — without
         # this the 3 s cache + keepalive ghosted removed cups for ~6.5 s.
@@ -1278,7 +1339,7 @@ class CupFusionNode(Node):
                     # the next obs period and the box blinked out (eviction)
                     # then back in under a fresh gid/colour.
                     continue
-            self._rim_latest[key] = (ob, now_s)
+            self._rim_latest[key] = (ob, now_s, now_s)
         if msg.observations:
             self._rim_fresh = True
             self._rim_meas_fresh = True
@@ -1286,12 +1347,25 @@ class CupFusionNode(Node):
 
     def _rim_collect(self) -> list:
         """Quality-gated, age-pruned snapshot of the cached observations —
-        shared by the live rim estimator and the debug tick."""
+        shared by the live rim estimator and the debug tick.
+
+        Aging counts STREAM time: mid-gap the per-camera clock freezes at
+        the last array arrival (+grace) — a stalled camera must not evict
+        its whole cache at once (the stall is discounted retroactively in
+        _on_cup_obs when arrays resume). The wall-time backstop alone reaps
+        obs from a camera that never resumes, where neither stream aging
+        nor per-array negative evidence can fire."""
         now_s = self.get_clock().now().nanoseconds * 1e-9
-        for k in [k for k, (_, t) in self._rim_latest.items()
-                  if now_s - t > self.rim_obs_max_age]:
-            del self._rim_latest[k]
-        live = [ob for ob, _ in self._rim_latest.values()
+        for k in list(self._rim_latest):
+            _ob, ts, tw = self._rim_latest[k]
+            last = self._rim_arr_last_t.get(k[0])
+            eff_now = now_s if last is None else min(
+                now_s, last + self.rim_gap_grace)
+            if (eff_now - ts > self.rim_obs_max_age
+                    or now_s - tw > self.rim_obs_backstop):
+                del self._rim_latest[k]
+                self._rim_arr_miss.pop(k, None)
+        live = [ob for ob, _, _ in self._rim_latest.values()
                 if self._obs_ok(ob)]
         scan = [ob for sub in self._scan_obs.values() for ob in sub.values()]
         return live + scan
@@ -1836,6 +1910,7 @@ class CupFusionNode(Node):
             tr['cams'] = {m['cam'] for m in f['members']}
             tr['miss'] = 0
             tr['last_match_t'] = now_s
+            tr['last_match_rs'] = self._rim_stream_now   # rim-array stream t
             tr['scan_backed'] = bool(f.get('scan'))
             if f.get('scan'):
                 tr['scan_keys'] = f.get('scan_keys', [])
@@ -1845,6 +1920,7 @@ class CupFusionNode(Node):
                     tr['exo_bound'] = True
             if 'exo' in tr['cams']:
                 tr['last_exo_t'] = now_s
+                tr['last_exo_rs'] = self._rim_cam_stream.get('exo', 0.0)
             # ── Color: per-view HSV vote with decay (recency-weighted, ──
             # bounded ~= weight/(1-decay)). Each measurement event decays prior
             # votes then adds a FIXED per-view weight (not point-count), so an
@@ -1898,20 +1974,29 @@ class CupFusionNode(Node):
             alive.add(gid)
 
         # STAGE-4: coast/evict tracks with no match.
-        # rim mode evicts on WALL TIME, not event count: measurement events
-        # fire at cloud-window rate (10-20 Hz) while rim observations refresh
-        # at 0.3-2 s, so an event-counted keepalive (9 events ≈ 0.5 s) evicted
-        # tracks during ordinary observation gaps and the cup blinked off,
-        # then re-minted a gid (new colour, min_hits re-earned) — the
-        # motion-correlated flicker.
+        # rim mode evicts on rim-array STREAM time — NOT cloud-event count
+        # (events fire at 10-20 Hz while rim obs refresh at 0.3-2 s: a
+        # 9-event keepalive ≈ 0.5 s evicted tracks during ordinary obs gaps)
+        # and NOT wall time either (every cup's obs share the same arrays,
+        # so ONE array running late past the keepalive while cloud events
+        # kept the pipeline firing evicted ALL tracks at once → the whole
+        # overlay blinked off, then re-earned min_hits together). The stream
+        # clock advances ≤ grace per array and pauses during stalls, so
+        # "keepalive exceeded" now means: arrays kept coming and this track
+        # went unmatched through ~keepalive/period of them — true negative
+        # evidence, per cup.
+        rim_stream_now = self._rim_stream_now
+        exo_stream_now = self._rim_cam_stream.get('exo', 0.0)
         for gid in list(self._tracks.keys()):
             tr = self._tracks[gid]
             if gid in alive:
                 # Scanned cup that exo once confirmed: when exo stops seeing
-                # it for keepalive, the cup is GONE (picked) — drop the
-                # frozen scan obs that would otherwise resurrect it forever.
+                # it for keepalive (exo-array stream time), the cup is GONE
+                # (picked) — drop the frozen scan obs that would otherwise
+                # resurrect it forever.
                 if (tr.get('exo_bound') and tr.get('scan_backed')
-                        and now_s - tr.get('last_exo_t', now_s)
+                        and exo_stream_now
+                        - tr.get('last_exo_rs', exo_stream_now)
                         > self.rim_keepalive_s):
                     for key in tr.get('scan_keys', []):
                         wp, iid = key
@@ -1923,7 +2008,8 @@ class CupFusionNode(Node):
             if rim_mode:
                 if tr.get('scan_backed') and not tr.get('exo_bound'):
                     continue    # scan-only cup: lives until Clear Scan
-                if now_s - tr.get('last_match_t', now_s) > self.rim_keepalive_s:
+                if (rim_stream_now - tr.get('last_match_rs', rim_stream_now)
+                        > self.rim_keepalive_s):
                     self._tracks.pop(gid, None)
             elif tr['miss'] > self.keepalive:
                 self._tracks.pop(gid, None)

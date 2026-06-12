@@ -205,14 +205,38 @@ cup_fusion_node:
     #                              MEASURE: stack 2 cups, total − cup_height_m
     rim_layer_height_m: 0.093    # pyramid slot lattice — MUST mirror the
     #                              server's PYRAMID_LAYER_HEIGHT (robot.py)
-    rim_obs_max_age_s: 0.8       # obs cache lifetime. LOW ⇒ picked/moved cups
-    #                              vanish fast (ghost ≈ obs_age + keepalive).
-    #                              TRADEOFF: < ~2s ages the 0.5Hz hand-cam view
-    #                              out of fusion (exo-only). Was 3.0 to keep hand.
-    rim_keepalive_s: 0.4         # rim-mode track eviction WALL TIME after last
-    #                              match. LOW ⇒ no ghost coast once obs stop.
-    #                              Was 3.5 (events fire at cloud rate while obs
-    #                              refresh at 0.3-2s).
+    rim_obs_max_age_s: 0.8       # obs cache lifetime in STREAM time: camera-
+    #                              stall gaps (> rim_gap_grace_s between
+    #                              arrays) freeze this clock and are forgiven
+    #                              on resume — a bursty source no longer ages
+    #                              the whole cache out at once (= every rim
+    #                              frustum blinking off together). LOW ⇒
+    #                              picked/moved cups vanish fast while the
+    #                              stream is alive (ghost ≈ obs_age +
+    #                              keepalive). TRADEOFF: < ~2s ages the 0.5Hz
+    #                              hand-cam view out of fusion (exo-only).
+    rim_gap_grace_s: 0.45        # inter-array gap beyond this = stream stall
+    #                              (producer rim_fit_period_s is 0.3); only
+    #                              the grace portion counts toward obs age
+    rim_obs_backstop_s: 12.0     # WALL-time hard limit: a camera that never
+    #                              resumes sends no arrays (stream aging +
+    #                              negative evidence both frozen) — this
+    #                              alone clears its obs (no permanent ghosts).
+    #                              12 s: measured Isaac exo obs droughts reach
+    #                              9.7 s (2026-06-12 50 s capture) — must
+    #                              bridge those; only a truly dead camera
+    #                              shows stale cups this long
+    rim_keepalive_s: 0.9         # rim-mode track eviction, rim-array STREAM
+    #                              time since last match (clock pauses during
+    #                              stalls, advances ≤ rim_gap_grace_s per
+    #                              array). 0.9 ≈ 3 array periods: a cup must
+    #                              miss ~3 consecutive arrays while arrays
+    #                              FLOW to evict — per-cup negative evidence.
+    #                              Was 0.4 WALL time: one late array (cloud
+    #                              events still firing) evicted EVERY track
+    #                              at once → all-cups blink + min_hits
+    #                              re-earn. Ghost after pick ≈ obs cache
+    #                              (0.8s) + this (~1.7s total).
     rim_level_hyst_m: 0.008      # level switch needs this much improvement
     rim_layer_pref_tol_m: 0.010  # pyramid preferred within real z_top noise
     #                              < |5*nest - layer| = 7mm (nest L5 vs pyr L1
