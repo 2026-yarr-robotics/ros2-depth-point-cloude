@@ -367,11 +367,18 @@ class CupFusionNode(Node):
         gp('rim_bias_apply', False)    # estimation always runs; this gates use
         gp('rim_bias_ref_cam', 'hand')
         gp('rim_bias_alpha', 0.05)     # EMA gain per shared-cup event
-        gp('rim_bias_max_m', 0.05)     # clamp |bias|
+        gp('rim_bias_max_m', 0.08)     # clamp |bias| (Isaac exo ArUco
+        #                                 PnP bias ≈55 mm saturated 0.05)
         gp('rim_bias_delta_max_m', 0.08)  # ignore absurd per-cup deltas
         # Level-snap hysteresis: switch a cup's level only when the new snap
         # beats the previous one by this margin (m) on |rough z - lattice|.
         gp('rim_level_hyst_m', 0.008)
+        # Scan-only estimate within this XY of an exo-backed one = same
+        # cup -> drop the frozen obs (duplicate [S] suppression).
+        gp('rim_scan_dedup_m', 0.05)
+        # Frozen-vs-live-exo disagreement above this inside ONE cluster
+        # = stale frozen obs (drop it; good pairs sit within ~25 mm).
+        gp('rim_scan_stale_m', 0.035)
         # Pyramid-lattice preference window: if the pyramid snap error is
         # within this, take it over a (numerically closer) nest snap.
         gp('rim_layer_pref_tol_m', 0.005)  # 0.007 collided with nest L5
@@ -590,6 +597,8 @@ class CupFusionNode(Node):
         self._rim_meas_fresh = False       # new obs since last KF consumption
         self._rim_arr_miss: dict[tuple, int] = {}   # (cam,iid) absence count
         self.rim_level_hyst = float(P('rim_level_hyst_m'))
+        self.rim_scan_dedup = float(P('rim_scan_dedup_m'))
+        self.rim_scan_stale = float(P('rim_scan_stale_m'))
         self.rim_layer_pref_tol = float(P('rim_layer_pref_tol_m'))
         self.rim_keepalive_s = float(P('rim_keepalive_s'))
         self._rim_ests_tick = None      # per-tick shared estimate cache
@@ -701,6 +710,8 @@ class CupFusionNode(Node):
             'rim_bias_alpha': ('rim_bias_alpha', float),
             'rim_bias_max_m': ('rim_bias_max', float),
             'rim_level_hyst_m': ('rim_level_hyst', float),
+            'rim_scan_dedup_m': ('rim_scan_dedup', float),
+            'rim_scan_stale_m': ('rim_scan_stale', float),
             'rim_layer_pref_tol_m': ('rim_layer_pref_tol', float),
             'rim_keepalive_s': ('rim_keepalive_s', float),
         }
@@ -1267,8 +1278,22 @@ class CupFusionNode(Node):
         # spacing in XY (0.039 < 0.05 gate) and only differ in z.
         xy_g = max(self.rim_cluster_xy, 1e-6)
         z_g = max(self.rim_cluster_z, 1e-6)
-        scaled = [np.array([o.x0 / xy_g, o.y0 / xy_g,
-                            o.z_top_rough_m / z_g]) for o in obs]
+
+        def _cxy(o):
+            # Cluster in BIAS-CORRECTED space: with a large learned extrinsic
+            # bias (Isaac exo ArUco ≈55 mm) raw exo and hand coords of the
+            # SAME cup split into two clusters — duplicate [S] tracks, and
+            # the shared-cup bias learning freezes exactly when most needed.
+            if self.rim_bias_apply and o.camera != self.rim_bias_ref:
+                b = self._cam_bias.get(o.camera)
+                if b is not None:
+                    return float(o.x0 - b[0]), float(o.y0 - b[1])
+            return float(o.x0), float(o.y0)
+
+        cxy = [_cxy(o) for o in obs]
+        scaled = [np.array([cx / xy_g, cy / xy_g,
+                            o.z_top_rough_m / z_g])
+                  for o, (cx, cy) in zip(obs, cxy)]
         ests = []
         for grp in _cluster_indices(scaled, 1.0):
             members = [obs[i] for i in grp]
@@ -1319,8 +1344,8 @@ class CupFusionNode(Node):
             # Depth noise near a lattice midpoint otherwise flips the level
             # — and via the ray slide, a z flip is an XY jump too.
             key_xy = np.array([
-                float(np.mean([o.x0 for o in meas_obs.values()])),
-                float(np.mean([o.y0 for o in meas_obs.values()]))])
+                float(np.mean([_cxy(o)[0] for o in meas_obs.values()])),
+                float(np.mean([_cxy(o)[1] for o in meas_obs.values()]))])
             cand = [e for e in self._rim_prev_lvl
                     if float(np.hypot(*(key_xy - e[0]))) <= 0.03]
             if cand:
@@ -1353,6 +1378,32 @@ class CupFusionNode(Node):
             # shared cup is a calibration target. Update before applying so
             # the EMA tracks the true disagreement, not the residual of its
             # own correction.
+            # In-cluster staleness gate: a FROZEN hand observation that
+            # disagrees with LIVE exo by more than rim_scan_stale_m is a bad
+            # capture or a cup that has since moved — without this its tight
+            # nadir covariance would DRAG the fused estimate to the wrong
+            # spot. Live exo wins; the frozen obs is deleted.
+            if (scan_backed and 'exo' in meas_obs
+                    and id(meas_obs['exo']) in slids
+                    and id(hand_meas) in slids):
+                exo_xy = slids[id(meas_obs['exo'])][0]
+                if self.rim_bias_apply:
+                    b = self._cam_bias.get('exo')
+                    if b is not None:
+                        exo_xy = exo_xy - b
+                gap = float(np.linalg.norm(
+                    slids[id(hand_meas)][0] - exo_xy))
+                if gap > self.rim_scan_stale:
+                    for wp, iid in scan_keys:
+                        self._scan_obs.get(wp, {}).pop(iid, None)
+                    self._refresh_scan_ids()
+                    self.get_logger().info(
+                        f'scan stale: frozen obs {gap*1e3:.0f}mm from live '
+                        f'exo — dropped', throttle_duration_sec=2.0)
+                    del meas_obs['hand']
+                    hand_meas = None
+                    scan_backed = False
+                    scan_keys = []
             ref_o = best.get(self.rim_bias_ref)
             if ref_o is not None and id(ref_o) in slids:
                 ref_xy = slids[id(ref_o)][0]
@@ -1409,6 +1460,28 @@ class CupFusionNode(Node):
                     'moving': bool(o.moving)}
                     for o, r in zip(used, resid)},
             })
+        # Scan dedup: a scan-only estimate sitting on top of an exo-backed
+        # one is the SAME cup seen through a stale/poor frozen observation
+        # (cross-camera split or a bad capture). exo wins; drop the frozen
+        # obs so it cannot resurrect (adjacent cups are ≥0.11 m apart).
+        exo_pts = [(e['x'], e['y']) for e in ests if 'exo' in e['cams']]
+        if exo_pts:
+            kept = []
+            for e in ests:
+                if (e['scan'] and 'exo' not in e['cams'] and any(
+                        float(np.hypot(e['x'] - x, e['y'] - y))
+                        < self.rim_scan_dedup for x, y in exo_pts)):
+                    for wp, iid in e['scan_keys']:
+                        self._scan_obs.get(wp, {}).pop(iid, None)
+                    self._refresh_scan_ids()
+                    self.get_logger().info(
+                        f"scan dedup: dropped frozen obs at "
+                        f"({e['x']:+.3f},{e['y']:+.3f}) — exo already "
+                        f"tracks this cup", throttle_duration_sec=2.0)
+                    continue
+                kept.append(e)
+            ests = kept
+
         # Merge: fresh entries win; carry over recent memory for cups not
         # observed THIS call (brief occlusion must not lose their level).
         mem_s = max(self.rim_obs_max_age, self.rim_keepalive_s) + 1.5

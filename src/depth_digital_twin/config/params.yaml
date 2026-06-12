@@ -40,12 +40,14 @@ world_origin_node:
     #         and skip the live ArUco+FK calibration (no /tf-lag dependence).
     #         Re-calibrate on demand with the ~/redetect service.
     # false → auto-calibrate from ArUco on startup (legacy behaviour).
-    # Values are from a 'Handeye calibration complete' log:
-    #   handeye_offset_xyz_m  = pos (cm) / 100   [translation, metres]
-    #   handeye_offset_rpy_deg = euler_xyz (deg) [Euler-XYZ intrinsic]
+    # Values decomposed from the checkerboard hand-eye calibration matrix
+    # T_gripper2camera.npy (fallen-cup-recovery/Calibration_Tutorial,
+    # cv2.calibrateHandEye PARK; translation mm→m, rotation→Euler-XYZ same
+    # convention as _euler_xyz_to_R). Previous live-ArUco values for reference:
+    #   xyz [0.0087, 0.0765, 0.0281], rpy [-2.3, -4.2, -175.6]
     handeye_use_param_offset: true
-    handeye_offset_xyz_m: [0.0087, 0.0765, 0.0281]
-    handeye_offset_rpy_deg: [-2.3, -4.2, -175.6]
+    handeye_offset_xyz_m: [0.0286, 0.0602, 0.0106]
+    handeye_offset_rpy_deg: [0.0, -0.1, -177.9]
 
     # ── Floor fallback params ──────────────────────────────────────────────
     depth_topic: /camera/camera/aligned_depth_to_color/image_raw
@@ -225,7 +227,7 @@ cup_fusion_node:
     rim_bias_apply: true
     rim_bias_ref_cam: hand
     rim_bias_alpha: 0.05
-    rim_bias_max_m: 0.05
+    rim_bias_max_m: 0.08   # Isaac exo ArUco PnP bias ~55mm saturated 0.05
     # Doosan M0609 publishes joint states under the /dsr01 namespace
     # (global /joint_states has no publisher). scan-lock arrival
     # detection reads this; joint names already match joint_1..6.
