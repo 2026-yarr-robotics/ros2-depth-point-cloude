@@ -35,6 +35,17 @@ world_origin_node:
     world_marker_rot_y_deg: 0.0
     world_marker_rot_z_deg: -90.0
 
+    # ── param mode (SIM only): fixed exo camera→world, skip ArUco detection ──
+    # Sim camera/marker poses are exact, so live ArUco PnP only adds run-to-run
+    # variance (20-55 mm origin drift → wrong z → phantom level-snapped cups).
+    # start_isaac.sh sets exo_world_origin_mode:=param to use these instead of
+    # detecting; the REAL rig stays world_origin_mode=aruco and IGNORES them.
+    # Captured 2026-06-15 from a good redetect (tf2 camera_frame→world; bias
+    # 9 mm). Re-capture if the sim exo camera pose changes:
+    #   ros2 run tf2_ros tf2_echo exo_color_optical_frame world
+    param_origin_xyz_m: [-0.23833, -0.12835, 1.57597]
+    param_origin_quat_xyzw: [0.740311, 0.378591, -0.243887, 0.499127]
+
     # ── Hand-eye (handeye_aruco / view:=hand): reuse a fixed calibration ────
     # true  → publish the ee(link_6)→camera offset below DIRECTLY on startup
     #         and skip the live ArUco+FK calibration (no /tf-lag dependence).
@@ -60,6 +71,10 @@ detection_node:
     # `model` = default / live-camera weight (digital_twin.launch.py and
     # digital_twin_with_robot.launch.py when no view-specific override is
     # passed).  Both exo and hand ship the same 2-class taxonomy now.
+    # ⚠️ REAL 가중치(실 카메라 학습). sim 은 start_isaac.sh 가 launch arg
+    # model_exo:=$SIM_YOLO_EXO / model_hand:=$SIM_YOLO_HAND (=sim_*_best.pt) 로
+    # 오버라이드한다. 여기를 sim_*_best.pt 로 바꾸지 말 것 — sim 모델은 Isaac
+    # 렌더 전용이라 실 카메라에서 퇴행 (deploy_migration_policy.md §4-b).
     model: /home/ssu/cup-stack-integration/ros2-depth-point-cloude/vision/yolo/0610-2.pt
     # Per-view weights for digital_twin_sequence.launch.py (view:=exo|hand).
     model_exo: /home/ssu/cup-stack-integration/ros2-depth-point-cloude/vision/yolo/0610-2.pt
@@ -122,7 +137,14 @@ point_cloud_node:
     # depth cloud. Published on CupObservationArray ALONGSIDE the cloud path
     # (Phase 1 A/B; /digital_twin/boxes is unchanged).
     rim_obs_enabled: true
-    rim_fit_period_s: 0.3        # min seconds between fits per track (~6ms/fit)
+    rim_fit_period_s: 0.15       # min seconds between fits per track (~6ms/fit).
+    #                              0.3 throttled rim updates to ~2.2 Hz/cup
+    #                              while detection ran 10 Hz → the RViz rim
+    #                              box stepped at ~450 ms and read as "slow"
+    #                              (2026-06-15). 0.15 ≈ 6.6 Hz/cup; fits are
+    #                              cheap (rms 1-2px) and GPU/point_cloud CPU
+    #                              have headroom. Drop to 0.1 to match the
+    #                              ~10 Hz feed if still laggy.
     rim_sigma_px: 2.0            # assumed contour 1σ (×3 moving, ×2 truncated)
     rim_skip_truncated: true     # border-cut mask ⇒ obs NOT published at all
     #                              (edge-band fits biased toward the cut side;
@@ -248,12 +270,18 @@ cup_fusion_node:
     rim_cluster_xy_m: 0.05       # cross-camera same-cup XY gate
     rim_min_iou: 0.5             # drop low-quality silhouette fits
     rim_max_rms_px: 6.0
-    rim_min_visible: 0.80        # fuse only mostly-visible silhouettes
-    #                              (2026-06-13: was 0.10). NOTE this also
-    #                              counts cup-on-cup occlusion — if pyramid
-    #                              lower-layer cups start dropping out of
-    #                              the fit, lower live:
-    #                              ros2 param set /cup_fusion_node rim_min_visible 0.5
+    # Min visible fraction to FUSE a silhouette, PER CAMERA (2026-06-15).
+    # The occlusion-aware fit is symmetric (both producers exclude occluder
+    # pixels, the cone fills the hidden arc) — this gate is the ONLY place
+    # exo/hand separate. A single global 0.80 dropped exo cups the fit had
+    # nailed (#97 vis0.77/iou0.92). exo: far+oblique thin ellipse, poorly
+    # conditioned at low vis AND load-bearing → real floor 0.5. hand: feeds
+    # scan-freeze [S], keep clean → 0.8. Both live-tunable:
+    #   ros2 param set /cup_fusion_node rim_min_visible_exo 0.35   # pyramid lows
+    #   ros2 param set /cup_fusion_node rim_min_visible_hand 0.5   # "hand DOF too"
+    # iou(rim_min_iou)+rms(rim_max_rms_px) stay the fit-quality guards.
+    rim_min_visible_exo: 0.5
+    rim_min_visible_hand: 0.8
     rim_log_dir: ""              # set to e.g. /tmp/rim_ab to record A/B CSV
 
     # ── Cross-camera extrinsic self-calibration ──────────────────────────
@@ -295,16 +323,26 @@ cup_fusion_node:
     # Joint waypoints — used only when scan_arrival_mode: joint.
     scan_waypoints_deg: [103.4671, -4.3731, 100.2539, -29.3674, 115.5776, -139.6331]
     scan_capture_s: 1.0          # HAND obs accumulation time per waypoint (s)
-    scan_wait_s: 0.3             # settle wait after arrival before capturing —
+    scan_wait_s: 1.0             # settle wait after arrival before capturing —
     #                              the wrist may still be ROTATING when the EE
     #                              XYZ is already at home (rotation moves no
-    #                              XYZ); 0.3 s + the joint-velocity settle
-    #                              gate covers it (agent flow, 2026-06-13)
+    #                              XYZ); the joint-velocity settle gate + this
+    #                              dwell cover it (agent flow). 2026-06-15: 0.3→1.0
+    #                              — scan 위치에서 pose 가 아직 불안정 → capture 전
+    #                              dwell 연장. sim·real 공통(cup_fusion_node 가 두
+    #                              launch 공유). 런타임 튜닝(재빌드 불필요):
+    #                              ros2 param set /cup_fusion_node scan_wait_s <v>
     scan_arrival_tol_rad: 0.02   # per-joint arrival gate (~1.15°, joint mode)
-    # Live hand-view toggle (Tk "Use hand (live)" checkbox). false = live fit
-    # is EXO ONLY; hand observations show in the panel (H-cloud/H-box) but
-    # never enter the fit or RViz. Scan-frozen hand observations ([S]) always
-    # participate regardless. true ALSO arms the scan FSM (see above).
+    # Arms the scan FSM (auto capture→freeze at the home pose). DECOUPLED from
+    # live_use_hand (2026-06-15) so the live fit can stay exo-only while scan
+    # still produces [S]. scan_lock_active (skill-mgr) also arms it.
+    scan_auto_arm: true
+    # Live hand-view toggle (Tk "Use hand (live)" checkbox). false (default) =
+    # live fit is EXO ONLY; hand obs show in the panel (H-cloud/H-box) but
+    # never enter the fit → a fused [F] track then ALWAYS has [S] (hand came
+    # via scan-freeze). true let flaky live hand obs (iou ~0.38) fuse with exo
+    # intermittently → [F] flickered on/off independent of [S] (2026-06-15
+    # report). Scan-frozen [S] hand obs participate regardless of this flag.
     live_use_hand: false
 
     # ── Live noise suppression ────────────────────────────────────────────
