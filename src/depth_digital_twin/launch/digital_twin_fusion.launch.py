@@ -455,6 +455,7 @@ def _setup(context, *_, **__):
     panel = Node(
         package='depth_digital_twin', executable='digital_twin_panel',
         name='digital_twin_panel', output='screen',
+        condition=IfCondition(LaunchConfiguration('panel')),
         parameters=[{
             # This launch uses the exo_cam_ns/hand_cam_ns feeds and the
             # _exo/_hand world-origin nodes. Set image topics EXPLICITLY (do
@@ -555,6 +556,11 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument(
             'params',
             default_value=os.path.join(pkg, 'config', 'params.yaml')),
+        DeclareLaunchArgument(
+            'panel', default_value='true',
+            description='Depth tuning/control GUI (digital_twin_panel). Set '
+                        'false for headless/sim runs that do not tune depth '
+                        '(start_isaac.sh passes panel:=false).'),
         DeclareLaunchArgument('rviz', default_value='true'),
         DeclareLaunchArgument(
             'load_latest_tuning', default_value='true',

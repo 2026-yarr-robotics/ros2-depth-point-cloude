@@ -53,7 +53,11 @@ def _setup(context, *a, **k):
     # RENAMED (world_origin_node_hand) so that section would NOT auto-apply —
     # pass it inline (same trick as digital_twin_fusion.launch.py).
     wo = (P.get('world_origin_node') or {}).get('ros__parameters', {})
-    model_hand = det_p.get('model_hand') or det_p.get('model')
+    # model_hand launch arg overrides params.yaml when non-empty (empty =
+    # params.yaml default). Mirrors digital_twin_fusion.launch.py so a sim
+    # bringup can inject the sim-finetuned sim_hand_best.pt here.
+    _arg_model_hand = LaunchConfiguration('model_hand').perform(context).strip()
+    model_hand = _arg_model_hand or det_p.get('model_hand') or det_p.get('model')
 
     def L(n):
         return LaunchConfiguration(n).perform(context)
@@ -146,6 +150,10 @@ def generate_launch_description():
         DeclareLaunchArgument('world_base_y', default_value='-0.020'),
         DeclareLaunchArgument('world_base_z', default_value='-0.065'),
         DeclareLaunchArgument('world_base_yaw_deg', default_value='0'),
+        DeclareLaunchArgument(
+            'model_hand', default_value='',
+            description='Hand YOLO weight override (empty = params.yaml '
+                        'detection_node.model_hand).'),
         DeclareLaunchArgument(
             'load_latest_tuning', default_value='true',
             description='Overlay the newest panel-saved params_<ts>.yaml '
