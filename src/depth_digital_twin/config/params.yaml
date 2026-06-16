@@ -75,9 +75,9 @@ detection_node:
     # model_exo:=$SIM_YOLO_EXO / model_hand:=$SIM_YOLO_HAND (=sim_*_best.pt) 로
     # 오버라이드한다. 여기를 sim_*_best.pt 로 바꾸지 말 것 — sim 모델은 Isaac
     # 렌더 전용이라 실 카메라에서 퇴행 (deploy_migration_policy.md §4-b).
-    model: /home/ssu/cup-stack-integration/ros2-depth-point-cloude/vision/yolo/0610-2.pt
+    model: /home/ssu/cup-stack-integration/ros2-depth-point-cloude/vision/yolo/0616_exo_best.pt
     # Per-view weights for digital_twin_sequence.launch.py (view:=exo|hand).
-    model_exo: /home/ssu/cup-stack-integration/ros2-depth-point-cloude/vision/yolo/0610-2.pt
+    model_exo: /home/ssu/cup-stack-integration/ros2-depth-point-cloude/vision/yolo/0616_exo_best.pt
     model_hand: /home/ssu/cup-stack-integration/ros2-depth-point-cloude/vision/yolo/speedstack3class_yolo26s_seg_1280_epoch250_3class_lightaug_geom1_redp25_sm_a100_best.pt
     # Both models emit the same two classes:
     #   "fallen-cup"  (id=1)
