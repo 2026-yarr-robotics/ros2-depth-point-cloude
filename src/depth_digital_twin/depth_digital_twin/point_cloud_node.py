@@ -1453,6 +1453,13 @@ class PointCloudNode(Node):
                 continue
             if tid in self._stacked_ids:
                 continue
+            if track.get('class_name') == 'fallen-cup':
+                # A tipped-over cup is NOT a pickable upright cup. Counting it
+                # by colour lies to the planner ("blue available") so it retries
+                # an un-pickable cup forever instead of recovering it. Match
+                # select_cup, which skips 'fallen-cup'. The hand-eye fallen_count
+                # surfaces it for recovery once no upright cup remains.
+                continue
             colour = track.get('color') or 'unknown'
             counts[colour] = counts.get(colour, 0) + 1
         self.cups_on_table_pub.publish(
