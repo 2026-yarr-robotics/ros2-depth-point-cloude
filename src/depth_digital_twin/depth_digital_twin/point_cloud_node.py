@@ -77,14 +77,16 @@ def _pack_rgb(r: np.ndarray, g: np.ndarray, b: np.ndarray) -> np.ndarray:
     return np.frombuffer(rgb_uint.astype(np.uint32).tobytes(), dtype=np.float32)
 
 
-def _classify_color_bgr(bgr: np.ndarray, allowed: list[str]) -> str | None:
+def _classify_color_bgr(bgr: np.ndarray, allowed: list[str]):
     """Bucket the median HSV of a (N,3) BGR pixel block to a color name.
 
-    Returns None if the chosen color isn't in `allowed` (caller will fall back
-    to the existing track color). OpenCV hue range is 0–179.
+    Returns ``(color_or_None, (h_med, s_med, v_med))``. color is None if the
+    chosen bucket isn't in `allowed` (caller falls back to the existing track
+    color); the median HSV is returned alongside for diagnostics. OpenCV hue
+    range is 0–179.
     """
     if bgr.size == 0:
-        return None
+        return None, (0.0, 0.0, 0.0)
     hsv = cv2.cvtColor(bgr.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV).reshape(-1, 3)
     h_med = float(np.median(hsv[:, 0]))
     s_med = float(np.median(hsv[:, 1]))
@@ -107,7 +109,7 @@ def _classify_color_bgr(bgr: np.ndarray, allowed: list[str]) -> str | None:
     else:
         cand = 'purple'
 
-    return cand if cand in allowed else None
+    return (cand if cand in allowed else None), (h_med, s_med, v_med)
 
 
 class PositionKF:
@@ -282,6 +284,12 @@ class PointCloudNode(Node):
         # Min pixel count in the mask before a frame contributes a color
         # vote (avoid tiny masks with mostly edge noise).
         self.declare_parameter('color_min_pixels', 64)
+        # Color is voted from a TIGHTER core of the mask than the geometry
+        # points: rim/edge pixels blend with neighbours/background and can flip
+        # a cup's HSV bucket (e.g. a blue cup read as red at a pick spot). Erode
+        # this many px for the COLOR sample only (>= mask_erode_px; 0 = reuse the
+        # geometry mask).
+        self.declare_parameter('color_erode_px', 8)
 
         # ----- Cup model (truncated-cone prior; standing only) -----
         self.declare_parameter('cup_top_diameter_m', 0.054)
@@ -453,6 +461,8 @@ class PointCloudNode(Node):
             for c in self.get_parameter('color_classes').value]
         self._color_min_pixels: int = max(
             1, int(self.get_parameter('color_min_pixels').value))
+        self._color_erode_px: int = max(
+            0, int(self.get_parameter('color_erode_px').value))
         # depth-track ids that vision-node currently reports as stacked. These
         # are subtracted from /cups_on_table so a "stacked" cup is not double
         # counted (verifier owns the slot, depth owns the table count).
@@ -905,15 +915,34 @@ class PointCloudNode(Node):
                 track['points_buf'].append(obj_world)
                 track['colors_buf'].append(obj_rgb_packed)
             track['last_score'] = float(obj.score)
-            # Per-frame color vote from the masked pixels.
-            if bgr.shape[0] >= self._color_min_pixels:
-                color = _classify_color_bgr(bgr, self._color_classes)
+            # Per-frame color vote from a TIGHTER core of the mask: rim/edge
+            # pixels blend with neighbours/background and can flip the HSV bucket
+            # (a blue cup read as red at a pick spot). Sample color separately
+            # from the geometry points above.
+            mb_color = self._erode_mask(mb, self._color_erode_px)
+            if int(mb_color.sum()) < self._color_min_pixels:
+                mb_color = mb_box  # too small after the tight erode
+            color_bgr = rgb[mb_color]
+            if color_bgr.shape[0] >= self._color_min_pixels:
+                color, hsv_med = _classify_color_bgr(
+                    color_bgr, self._color_classes)
                 if color is not None:
                     track['color_votes'][color] = \
                         track['color_votes'].get(color, 0) + 1
-                    track['color'] = max(
-                        track['color_votes'],
-                        key=track['color_votes'].get)
+                    new_color = max(track['color_votes'],
+                                    key=track['color_votes'].get)
+                    # Diagnostic: log on first-set / change of a track's
+                    # committed color — the median H proves a mislabel's cause
+                    # (H~110 voted 'red' => bucket/contamination; H~0/180 =>
+                    # lighting/white-balance). Throttled to changes only.
+                    if new_color != track.get('color'):
+                        self.get_logger().info(
+                            f"[color] tid={tid} "
+                            f"{track.get('class_name')} "
+                            f"{track.get('color')} -> {new_color}  "
+                            f"H={hsv_med[0]:.0f} S={hsv_med[1]:.0f} "
+                            f"V={hsv_med[2]:.0f}  votes={track['color_votes']}")
+                    track['color'] = new_color
             track['last_display_name'] = obj.class_name
 
             if (self.cup_obs_pub is not None
@@ -1883,12 +1912,13 @@ class PointCloudNode(Node):
                 best_id = tid
         return best_id
 
-    def _erode_mask(self, mb: np.ndarray) -> np.ndarray:
-        """Shrink the YOLO mask by `mask_erode_px` to drop edge pixels whose
-        depth is unreliable (mixed foreground/background). No-op if disabled."""
-        if self.mask_erode_px <= 0:
+    def _erode_mask(self, mb: np.ndarray, px: int | None = None) -> np.ndarray:
+        """Shrink the YOLO mask by `px` (default `mask_erode_px`) to drop edge
+        pixels whose depth/color is unreliable (mixed foreground/background).
+        No-op if disabled."""
+        k = self.mask_erode_px if px is None else px
+        if k <= 0:
             return mb
-        k = self.mask_erode_px
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1))
         eroded = cv2.erode(mb.astype(np.uint8), kernel, iterations=1)
         return eroded > 0
