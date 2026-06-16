@@ -13,6 +13,7 @@ the horizontal projection is used to recover its orientation.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Iterable
 
@@ -46,6 +47,13 @@ from depth_digital_twin_msgs.msg import (CupObservation,
                                          SegmentedObjectArray,
                                          WorldObjectCloud,
                                          WorldObjectCloudArray)
+
+
+def _release_from_env() -> bool:
+    """True when DPC_RELEASE env is set truthy (1/true/yes/on). Lets a launcher
+    flip release mode for every node at once without per-launch wiring."""
+    return os.environ.get('DPC_RELEASE', '').strip().lower() in (
+        '1', 'true', 'yes', 'on')
 
 
 # Edge index pairs for the 12 edges of a box given the 8-corner layout used
@@ -180,6 +188,8 @@ class PointCloudNode(Node):
         self.declare_parameter('boxes_topic', '/digital_twin/boxes')
         self.declare_parameter('box_debug_topic', '/digital_twin/box_debug')
         self.declare_parameter('depth_debug_topic', '/digital_twin/depth_debug')
+        # --release: skip ALL debug-image synthesis (box/depth/rim overlays).
+        self.declare_parameter('release_mode', False)
         self.declare_parameter('camera_frame', 'camera_color_optical_frame')
         self.declare_parameter('world_frame', 'world')
         self.declare_parameter('depth_unit', 0.001)
@@ -536,13 +546,23 @@ class PointCloudNode(Node):
             history=QoSHistoryPolicy.KEEP_LAST,
             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
 
+        # --release / DPC_RELEASE: strip ALL debug-image synthesis (box/depth/
+        # rim overlay drawing + colorize + cv2_to_imgmsg + publish). Every
+        # measurement path (cone fit, rim silhouette fit, KF, /digital_twin/
+        # boxes, cup_obs) is UNAFFECTED — only the viz Image topics go dark.
+        self.release_mode: bool = bool(
+            self.get_parameter('release_mode').value) or _release_from_env()
+        if self.release_mode:
+            self.get_logger().info(
+                'release_mode ON — debug image topics (box/depth/rim) disabled')
+
         self.points_pub = self.create_publisher(
             PointCloud2, self.get_parameter('points_topic').value, 5)
         self.boxes_pub = self.create_publisher(
             MarkerArray, self.get_parameter('boxes_topic').value, latched)
-        self.box_debug_pub = self.create_publisher(
+        self.box_debug_pub = None if self.release_mode else self.create_publisher(
             Image, self.get_parameter('box_debug_topic').value, 1)
-        self.depth_debug_pub = self.create_publisher(
+        self.depth_debug_pub = None if self.release_mode else self.create_publisher(
             Image, self.get_parameter('depth_debug_topic').value, 1)
         # JSON {color: count} of cups on the table, EXCLUDING any track id
         # vision-node has reported as occupying a stack slot. Latched so a
@@ -557,8 +577,11 @@ class PointCloudNode(Node):
             self.cup_obs_pub = self.create_publisher(
                 CupObservationArray,
                 self.get_parameter('cup_obs_topic').value, 5)
-            self.rim_debug_pub = self.create_publisher(
-                Image, self.get_parameter('rim_debug_topic').value, 1)
+            # rim_debug_pub stays None in release_mode (cup_obs measurement
+            # output above is kept — only the silhouette overlay Image is cut).
+            if not self.release_mode:
+                self.rim_debug_pub = self.create_publisher(
+                    Image, self.get_parameter('rim_debug_topic').value, 1)
         # Producer-role output: per-object world clouds for cup_fusion_node.
         self.world_clouds_pub = None
         if self.role == 'producer':
@@ -796,7 +819,8 @@ class PointCloudNode(Node):
         # Per-frame: depth debug stream is independent of detection success.
         # Render only when someone is actually watching: the JET colormap +
         # outline pass costs ~12% CPU of this node (py-spy 2026-06-12).
-        if self.depth_debug_pub.get_subscription_count() > 0:
+        if (self.depth_debug_pub is not None
+                and self.depth_debug_pub.get_subscription_count() > 0):
             self._publish_depth_debug(depth_msg, z, valid, union_mask)
 
         # Per-frame: ingest each detection's world points into its track's
@@ -991,23 +1015,24 @@ class PointCloudNode(Node):
         # Per-frame box debug overlay using the LAST window's fit (frozen
         # box / frustum between updates is expected — they refresh every
         # window_period_s).
-        debug_img = rgb.copy()
-        n_drawn = 0
-        for tid, track in self._tracks.items():
-            ls = track.get('last_state')
-            if ls is None:
-                continue
-            colour = _palette(tid - 1)
-            self._draw_box_overlay(
-                debug_img, ls['center'], ls['R'], ls['size'], ls['top_world'],
-                colour, ls['label'], R_wc, t_wc)
-            if ls.get('frustum') is not None:
-                self._draw_frustum_overlay(
-                    debug_img, ls['frustum'], colour, R_wc, t_wc)
-            n_drawn += 1
-        self._annotate_status(debug_img, n_drawn)
-        self._draw_aruco_axes(debug_img)
-        self._publish_debug(debug_img, rgb_msg.header)
+        if self.box_debug_pub is not None:
+            debug_img = rgb.copy()
+            n_drawn = 0
+            for tid, track in self._tracks.items():
+                ls = track.get('last_state')
+                if ls is None:
+                    continue
+                colour = _palette(tid - 1)
+                self._draw_box_overlay(
+                    debug_img, ls['center'], ls['R'], ls['size'],
+                    ls['top_world'], colour, ls['label'], R_wc, t_wc)
+                if ls.get('frustum') is not None:
+                    self._draw_frustum_overlay(
+                        debug_img, ls['frustum'], colour, R_wc, t_wc)
+                n_drawn += 1
+            self._annotate_status(debug_img, n_drawn)
+            self._draw_aruco_axes(debug_img)
+            self._publish_debug(debug_img, rgb_msg.header)
 
         # Window check — finalize after window_period_s elapsed.
         now = self.get_clock().now()
@@ -1934,6 +1959,8 @@ class PointCloudNode(Node):
         self.boxes_pub.publish(clear)
 
     def _publish_debug(self, img: np.ndarray, src_header) -> None:
+        if self.box_debug_pub is None:  # release_mode
+            return
         msg = self.bridge.cv2_to_imgmsg(img, encoding='bgr8')
         msg.header = src_header
         self.box_debug_pub.publish(msg)
@@ -1944,6 +1971,8 @@ class PointCloudNode(Node):
         [z_min, z_max] (or zero depth from the sensor) are blacked out;
         detection mask outlines are drawn in white so it's obvious whether
         depth is dropping out *inside* the object silhouette."""
+        if self.depth_debug_pub is None:  # release_mode
+            return
         norm = np.zeros_like(z_m, dtype=np.uint8)
         if bool(valid.any()):
             zspan = max(self.z_max - self.z_min, 1e-6)

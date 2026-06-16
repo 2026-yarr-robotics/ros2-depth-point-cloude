@@ -244,6 +244,12 @@ def _setup(context, *_, **__):
             print(f'[fusion] tuning overlay → {latest}')
         else:
             print('[fusion] load_latest_tuning: no params_*.yaml snapshot found')
+    # --release: propagate release_mode to every node via the shared base
+    # (detection/point_cloud read it; others harmlessly ignore the override,
+    # same as the params.yaml /**: wildcard already does).
+    release = LaunchConfiguration('release').perform(context).strip().lower() \
+        in ('true', '1')
+    base_params.append({'release_mode': release})
     with open(params) as f:
         _y = yaml.safe_load(f) or {}
     dn = (_y.get('detection_node') or {}).get('ros__parameters') or {}
@@ -540,6 +546,12 @@ def generate_launch_description() -> LaunchDescription:
             'imgsz', default_value='640',
             description='YOLO inference size for BOTH detectors (dual = heavy; '
                         '640 default, set 1280 if GPU allows)'),
+        DeclareLaunchArgument(
+            'release', default_value='false',
+            description='Release mode: every node skips ALL debug-image '
+                        'synthesis (detection/box/depth/rim debug topics). '
+                        'Measurement outputs unaffected. Same as env '
+                        'DPC_RELEASE=1.'),
         DeclareLaunchArgument(
             'params',
             default_value=os.path.join(pkg, 'config', 'params.yaml')),

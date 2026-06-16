@@ -71,6 +71,8 @@ def _make_nodes(context, *args, **kwargs):
     params = LaunchConfiguration('params').perform(context)
     rviz_cfg = LaunchConfiguration('rviz_config').perform(context)
     camera_ns = LaunchConfiguration('camera_ns').perform(context).strip()
+    release = LaunchConfiguration('release').perform(context).strip().lower() \
+        in ('true', '1')
 
     # Newest panel-saved tuning snapshot, overlaid on cup_fusion_node so the
     # slider tuning + debug-plot toggles survive a restart (parity with
@@ -85,7 +87,8 @@ def _make_nodes(context, *args, **kwargs):
             print('[digital_twin] load_latest_tuning: no params_*.yaml '
                   'snapshot found')
 
-    common_params = [params, {'intrinsics_path': intrinsics}]
+    common_params = [params, {'intrinsics_path': intrinsics},
+                     {'release_mode': release}]
     # When a non-default camera namespace is used (cameras_only.launch.py
     # view:=exo publishes to /exo/exo/...) we need two things:
     #
@@ -244,5 +247,11 @@ def generate_launch_description() -> LaunchDescription:
             description='Overlay the newest panel-saved params_<ts>.yaml '
                         'snapshot on cup_fusion_node (false = params.yaml '
                         'only).'),
+        DeclareLaunchArgument(
+            'release', default_value='false',
+            description='Release mode: every node skips ALL debug-image '
+                        'synthesis (detection/box/depth/rim debug topics). '
+                        'Measurement outputs unaffected. Same as env '
+                        'DPC_RELEASE=1.'),
         OpaqueFunction(function=_make_nodes),
     ])

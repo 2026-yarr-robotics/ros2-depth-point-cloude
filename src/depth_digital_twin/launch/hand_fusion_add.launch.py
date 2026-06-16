@@ -71,6 +71,11 @@ def _setup(context, *a, **k):
             print('[hand_fusion_add] load_latest_tuning: no params_*.yaml '
                   'snapshot found')
     yaw = str(math.radians(float(L('world_base_yaw_deg'))))
+    # --release: strip ALL debug-image synthesis on the hand producer too
+    # (this launch builds params from per-node yaml dicts, NOT the params.yaml
+    # file, so the /**: release_mode wildcard never reaches these nodes —
+    # inject it explicitly). Env DPC_RELEASE=1 also works.
+    release = L('release').strip().lower() in ('true', '1')
 
     # Hand eye-in-hand calibration, ArUco-driven. world_origin_node in
     # `handeye_aruco` mode computes link_6 → hand_color_optical_frame from the
@@ -111,7 +116,8 @@ def _setup(context, *a, **k):
                      'image_topic': '/hand/hand/color/image_raw',
                      'detections_topic': '/digital_twin/detections_hand',
                      'debug_topic': '/digital_twin/detection_debug_hand',
-                     'model': model_hand}])
+                     'model': model_hand,
+                     'release_mode': release}])
     pc_hand = Node(
         package='depth_digital_twin', executable='point_cloud_node',
         name='point_cloud_node_hand', output='screen',
@@ -135,7 +141,8 @@ def _setup(context, *a, **k):
                      # digital_twin_fusion.launch.py). Doosan publishes joints
                      # under /dsr01 (no global /joint_states in start.sh).
                      'hand_motion_gating': True,
-                     'joint_states_topic': '/dsr01/joint_states'},
+                     'joint_states_topic': '/dsr01/joint_states',
+                     'release_mode': release},
                     *tuning])
     return [handeye, world_base, det_hand, pc_hand]
 
@@ -151,5 +158,10 @@ def generate_launch_description():
             description='Overlay the newest panel-saved params_<ts>.yaml '
                         'snapshot on the hand producer (false = params.yaml '
                         'only).'),
+        DeclareLaunchArgument(
+            'release', default_value='false',
+            description='Release mode: hand producer skips ALL debug-image '
+                        'synthesis (detection/box/depth/rim debug topics). '
+                        'Same as env DPC_RELEASE=1.'),
         OpaqueFunction(function=_setup),
     ])

@@ -76,6 +76,10 @@ def generate_launch_description() -> LaunchDescription:
         description='RealSense namespace. '
                     '"camera" = rs_align_depth_launch.py default. '
                     '"exo" = cameras_only.launch.py view:=exo (/exo/exo/...).')
+    release_arg = DeclareLaunchArgument(
+        'release', default_value='false',
+        description='Release mode: skip ALL debug-image synthesis '
+                    '(detection/box/depth/rim). Same as env DPC_RELEASE=1.')
 
     # ----- robot URDF -----
     robot_description_content = Command([
@@ -132,10 +136,12 @@ def generate_launch_description() -> LaunchDescription:
             'intrinsics': LaunchConfiguration('intrinsics'),
             'params': LaunchConfiguration('params'),
             'camera_ns': LaunchConfiguration('camera_ns'),
+            'release': LaunchConfiguration('release'),
         }.items())
 
     return LaunchDescription([
         model_arg, color_arg, name_arg, bridge_arg,
         rviz_arg, rviz_config_arg, intrinsics_arg, params_arg, camera_ns_arg,
+        release_arg,
         robot_state_publisher, pose_bridge, world_to_base_tf, digital_twin,
     ])

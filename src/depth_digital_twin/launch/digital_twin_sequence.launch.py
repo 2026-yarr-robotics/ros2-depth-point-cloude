@@ -189,7 +189,10 @@ def _setup(context, *_, **__):
 
     autostart = LaunchConfiguration('autostart').perform(context) == 'true'
     loop_flag = LaunchConfiguration('loop').perform(context) == 'true'
-    common_params = [params, {'intrinsics_path': intr}]
+    release = LaunchConfiguration('release').perform(context).strip().lower() \
+        in ('true', '1')
+    common_params = [params, {'intrinsics_path': intr},
+                     {'release_mode': release}]
 
     # Empty (default) ⇒ run at root namespace exactly as before.  Set
     # ns:=record (etc.) to isolate the whole replay stack under /record so it
@@ -237,6 +240,7 @@ def _setup_exo(context, seq, intr, pkg, params, model, autostart, loop_flag,
             'yolo_model': model,
             'rviz': LaunchConfiguration('rviz'),
             'control_panel': 'true',
+            'release': LaunchConfiguration('release'),
         }.items())
 
     playback_ctrl = Node(
@@ -409,5 +413,9 @@ def generate_launch_description() -> LaunchDescription:
             'params',
             default_value=os.path.join(pkg, 'config', 'params.yaml')),
         DeclareLaunchArgument('rviz', default_value='true'),
+        DeclareLaunchArgument(
+            'release', default_value='false',
+            description='Release mode: skip ALL debug-image synthesis '
+                        '(detection/box/depth/rim). Same as env DPC_RELEASE=1.'),
         OpaqueFunction(function=_setup),
     ])

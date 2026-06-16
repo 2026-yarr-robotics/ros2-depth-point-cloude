@@ -6,6 +6,7 @@ and publishes per-frame masks aligned to the source image.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Iterable
 
@@ -45,6 +46,13 @@ def _resolve_weight_path(model_name: str, logger) -> str:
     return model_name
 
 
+def _release_from_env() -> bool:
+    """True when DPC_RELEASE env is set truthy (1/true/yes/on). Lets a launcher
+    flip release mode for every node at once without per-launch wiring."""
+    return os.environ.get('DPC_RELEASE', '').strip().lower() in (
+        '1', 'true', 'yes', 'on')
+
+
 class DetectionNode(Node):
     def __init__(self) -> None:
         super().__init__('detection_node')
@@ -60,6 +68,8 @@ class DetectionNode(Node):
         self.declare_parameter('debug_topic', '/digital_twin/detection_debug')
         self.declare_parameter('device', '')  # '', 'cpu', '0'
         self.declare_parameter('imgsz', 640)  # YOLO inference resolution (px)
+        # --release: skip the annotated detection_debug Image synthesis.
+        self.declare_parameter('release_mode', False)
 
         # Lazy import so the package can be inspected without ultralytics installed.
         try:
@@ -92,6 +102,14 @@ class DetectionNode(Node):
         self.conf: float = float(self.get_parameter('confidence').value)
         self.imgsz: int = int(self.get_parameter('imgsz').value)
         self.bridge = CvBridge()
+        # --release / DPC_RELEASE: drop the annotated detection_debug Image
+        # (bbox + label + red mask-tint compositing, one cv2_to_imgmsg/frame).
+        # Detection output on /digital_twin/detections is UNAFFECTED.
+        self.release_mode: bool = bool(
+            self.get_parameter('release_mode').value) or _release_from_env()
+        if self.release_mode:
+            self.get_logger().info(
+                'release_mode ON — detection_debug image disabled')
 
         # Resolve target class IDs from model.names.
         self.class_id_to_name: dict[int, str] = {
@@ -105,7 +123,7 @@ class DetectionNode(Node):
 
         self.pub = self.create_publisher(
             SegmentedObjectArray, self.get_parameter('detections_topic').value, 10)
-        self.debug_pub = self.create_publisher(
+        self.debug_pub = None if self.release_mode else self.create_publisher(
             Image, self.get_parameter('debug_topic').value, 1)
         self.create_subscription(
             Image, self.get_parameter('image_topic').value, self._on_image, 10)
@@ -127,18 +145,19 @@ class DetectionNode(Node):
 
         out = SegmentedObjectArray()
         out.header = msg.header  # share stamp + frame_id with the source image
-        debug = bgr.copy()
+        debug = bgr.copy() if self.debug_pub is not None else None
 
         # If the model returned nothing, still publish the empty array AND a
         # live debug image (annotated with status) so the user always has a
-        # video feed.
+        # video feed. (release_mode: skip the debug image entirely.)
         if r.masks is None or r.boxes is None:
-            cv2.putText(debug, 'no detections', (10, 28),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
             self.pub.publish(out)
-            dbg = self.bridge.cv2_to_imgmsg(debug, encoding='bgr8')
-            dbg.header = msg.header
-            self.debug_pub.publish(dbg)
+            if self.debug_pub is not None:
+                cv2.putText(debug, 'no detections', (10, 28),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+                dbg = self.bridge.cv2_to_imgmsg(debug, encoding='bgr8')
+                dbg.header = msg.header
+                self.debug_pub.publish(dbg)
             return
 
         # masks.data: tensor (N, Hm, Wm) in [0,1] in the model's resolution.
@@ -186,22 +205,25 @@ class DetectionNode(Node):
             obj.mask.header = msg.header
             out.objects.append(obj)
 
-            cv2.rectangle(debug, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            id_tag = f'#{inst_id}' if inst_id >= 0 else '#?'
-            cv2.putText(debug, f'{id_tag} {name} {score:.2f}', (x1, max(0, y1 - 6)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            tint = np.zeros_like(debug)
-            tint[mask_u8 > 0] = (0, 0, 255)
-            debug = cv2.addWeighted(debug, 1.0, tint, 0.4, 0.0)
+            if self.debug_pub is not None:
+                cv2.rectangle(debug, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                id_tag = f'#{inst_id}' if inst_id >= 0 else '#?'
+                cv2.putText(debug, f'{id_tag} {name} {score:.2f}',
+                            (x1, max(0, y1 - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                tint = np.zeros_like(debug)
+                tint[mask_u8 > 0] = (0, 0, 255)
+                debug = cv2.addWeighted(debug, 1.0, tint, 0.4, 0.0)
 
-        # Annotate frame summary so an empty result is still distinguishable
-        # from "model not running".
-        cv2.putText(debug, f'objects={len(out.objects)}', (10, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         self.pub.publish(out)
-        dbg = self.bridge.cv2_to_imgmsg(debug, encoding='bgr8')
-        dbg.header = msg.header
-        self.debug_pub.publish(dbg)
+        # Annotate frame summary so an empty result is still distinguishable
+        # from "model not running". (release_mode: skip the debug image.)
+        if self.debug_pub is not None:
+            cv2.putText(debug, f'objects={len(out.objects)}', (10, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            dbg = self.bridge.cv2_to_imgmsg(debug, encoding='bgr8')
+            dbg.header = msg.header
+            self.debug_pub.publish(dbg)
 
 
 def main(args: Iterable[str] | None = None) -> None:

@@ -2,6 +2,12 @@
   ros__parameters:
     camera_frame: camera_color_optical_frame
     world_frame: world
+    # --release switch (global). true → every node skips ALL debug-image
+    # synthesis: detection_debug, box_debug, depth_debug, rim_debug. Measurement
+    # outputs (/digital_twin/boxes, cup_obs, /vision/cups_on_table) are
+    # unaffected. Override per-run with launch arg `release:=true` or env
+    # DPC_RELEASE=1 (env wins on any launch path, wired or not).
+    release_mode: false
     depth_unit: 0.001  # RealSense aligned_depth_to_color is uint16 mm
     # Floor-patch sampling (world_origin_node floor mode + point_cloud_node debug box)
     window_radius: 30
