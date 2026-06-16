@@ -78,38 +78,48 @@ def _pack_rgb(r: np.ndarray, g: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 
 def _classify_color_bgr(bgr: np.ndarray, allowed: list[str]):
-    """Bucket the median HSV of a (N,3) BGR pixel block to a color name.
+    """Classify a (N,3) BGR pixel block to a color name by PER-PIXEL bucket
+    vote (MODE) — NOT by the median of the hue.
+
+    Hue is circular and wraps at 0/179 (red sits at BOTH ends), so
+    np.median(hue) of a mask that mixes two pixel populations can land
+    *between* them — a mostly-red mask with some pixels at h≈178 and some at
+    h≈3 medians to ~90 = blue, a color neither cup is. Voting each pixel into a
+    bucket and taking the most common one is immune to that (h≈178 and h≈3 both
+    vote 'red') and is robust to a MINORITY of contaminating neighbour-cup /
+    background pixels (they can't flip the majority). OpenCV hue range is 0–179.
 
     Returns ``(color_or_None, (h_med, s_med, v_med))``. color is None if the
-    chosen bucket isn't in `allowed` (caller falls back to the existing track
-    color); the median HSV is returned alongside for diagnostics. OpenCV hue
-    range is 0–179.
+    winning bucket isn't in `allowed` (caller falls back to the existing track
+    color); the median HSV is returned for the diagnostic log only.
     """
     if bgr.size == 0:
         return None, (0.0, 0.0, 0.0)
     hsv = cv2.cvtColor(bgr.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV).reshape(-1, 3)
-    h_med = float(np.median(hsv[:, 0]))
-    s_med = float(np.median(hsv[:, 1]))
-    v_med = float(np.median(hsv[:, 2]))
-
-    if v_med < 35:
-        cand = 'black'
-    elif s_med < 40:
-        cand = 'white' if v_med > 200 else 'gray'
-    elif h_med < 10 or h_med >= 170:
-        cand = 'red'
-    elif h_med < 23:
-        cand = 'orange'
-    elif h_med < 35:
-        cand = 'yellow'
-    elif h_med < 80:
-        cand = 'green'
-    elif h_med < 130:
-        cand = 'blue'
+    H = hsv[:, 0].astype(np.int16)
+    S = hsv[:, 1]
+    V = hsv[:, 2]
+    med = (float(np.median(H)), float(np.median(S)), float(np.median(V)))
+    # Chromatic pixels (saturated, not near-black) vote a HUE bucket; prefer the
+    # chromatic majority whenever any chromatic pixel exists so a few
+    # gray/shadow pixels can't beat a real cup color.
+    chroma = (S >= 40) & (V >= 35)
+    h = H[chroma]
+    if h.size:
+        names = ['red', 'orange', 'yellow', 'green', 'blue', 'purple']
+        code = np.zeros(h.shape, dtype=np.int8)        # red = default (the wrap)
+        code[(h >= 10) & (h < 23)] = 1                 # orange
+        code[(h >= 23) & (h < 35)] = 2                 # yellow
+        code[(h >= 35) & (h < 80)] = 3                 # green
+        code[(h >= 80) & (h < 130)] = 4                # blue
+        code[(h >= 130) & (h < 170)] = 5               # purple
+        # h < 10 OR h >= 170 stays 0 (red) — two-range red, wrap-safe.
+        cand = names[int(np.argmax(np.bincount(code, minlength=6)[:6]))]
     else:
-        cand = 'purple'
+        v_med = med[2]
+        cand = 'black' if v_med < 35 else ('white' if v_med > 200 else 'gray')
 
-    return (cand if cand in allowed else None), (h_med, s_med, v_med)
+    return (cand if cand in allowed else None), med
 
 
 class PositionKF:
@@ -927,10 +937,20 @@ class PointCloudNode(Node):
                 color, hsv_med = _classify_color_bgr(
                     color_bgr, self._color_classes)
                 if color is not None:
-                    track['color_votes'][color] = \
-                        track['color_votes'].get(color, 0) + 1
-                    new_color = max(track['color_votes'],
-                                    key=track['color_votes'].get)
+                    # Recent-weighted (decaying) vote, NOT unbounded accumulation:
+                    # old votes fade so a cup swap at this track is reflected in a
+                    # few frames (the all-time 207-vs-208 blend that flipped a
+                    # settled color can't build up), while a single contaminated
+                    # frame still can't beat the recent majority (per-pixel MODE
+                    # already makes each frame robust). = color-discontinuity reset,
+                    # softened to avoid single-frame flicker.
+                    v = track['color_votes']
+                    for c in list(v):
+                        v[c] *= 0.85
+                        if v[c] < 0.05:
+                            del v[c]
+                    v[color] = v.get(color, 0.0) + 1.0
+                    new_color = max(v, key=v.get)
                     # Diagnostic: log on first-set / change of a track's
                     # committed color — the median H proves a mislabel's cause
                     # (H~110 voted 'red' => bucket/contamination; H~0/180 =>
@@ -1482,12 +1502,13 @@ class PointCloudNode(Node):
                 continue
             if tid in self._stacked_ids:
                 continue
-            if track.get('class_name') == 'fallen-cup':
-                # A tipped-over cup is NOT a pickable upright cup. Counting it
-                # by colour lies to the planner ("blue available") so it retries
-                # an un-pickable cup forever instead of recovering it. Match
-                # select_cup, which skips 'fallen-cup'. The hand-eye fallen_count
-                # surfaces it for recovery once no upright cup remains.
+            if track.get('class_name') in ('fallen-cup', 'mouth-up-cup'):
+                # A tipped-over OR mouth-up cup is NOT a pickable upright cup.
+                # Counting it by colour lies to the planner ("blue available")
+                # so it retries an un-pickable cup forever instead of recovering
+                # it. Match select_cup, which skips both. The hand-eye recovery
+                # count surfaces these once no upright cup remains. (The exo
+                # YOLO emits all three classes; only upright-cup is pickable.)
                 continue
             colour = track.get('color') or 'unknown'
             counts[colour] = counts.get(colour, 0) + 1
