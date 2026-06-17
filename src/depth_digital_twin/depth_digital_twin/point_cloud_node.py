@@ -1048,24 +1048,28 @@ class PointCloudNode(Node):
 
         # Per-frame box debug overlay using the LAST window's fit (frozen
         # box / frustum between updates is expected — they refresh every
-        # window_period_s).
-        debug_img = rgb.copy()
-        n_drawn = 0
-        for tid, track in self._tracks.items():
-            ls = track.get('last_state')
-            if ls is None:
-                continue
-            colour = _palette(tid - 1)
-            self._draw_box_overlay(
-                debug_img, ls['center'], ls['R'], ls['size'], ls['top_world'],
-                colour, ls['label'], R_wc, t_wc)
-            if ls.get('frustum') is not None:
-                self._draw_frustum_overlay(
-                    debug_img, ls['frustum'], colour, R_wc, t_wc)
-            n_drawn += 1
-        self._annotate_status(debug_img, n_drawn)
-        self._draw_aruco_axes(debug_img)
-        self._publish_debug(debug_img, rgb_msg.header)
+        # window_period_s). Subscriber-gated like depth_debug/rim_debug above:
+        # the rgb.copy() + per-track overlay draw + bgr8 encode + publish is
+        # pure visualization (nothing operational reads debug_img), so skip it
+        # entirely when no RViz/rqt/panel is subscribed — CPU save.
+        if self.box_debug_pub.get_subscription_count() > 0:
+            debug_img = rgb.copy()
+            n_drawn = 0
+            for tid, track in self._tracks.items():
+                ls = track.get('last_state')
+                if ls is None:
+                    continue
+                colour = _palette(tid - 1)
+                self._draw_box_overlay(
+                    debug_img, ls['center'], ls['R'], ls['size'],
+                    ls['top_world'], colour, ls['label'], R_wc, t_wc)
+                if ls.get('frustum') is not None:
+                    self._draw_frustum_overlay(
+                        debug_img, ls['frustum'], colour, R_wc, t_wc)
+                n_drawn += 1
+            self._annotate_status(debug_img, n_drawn)
+            self._draw_aruco_axes(debug_img)
+            self._publish_debug(debug_img, rgb_msg.header)
 
         # Window check — finalize after window_period_s elapsed.
         now = self.get_clock().now()
