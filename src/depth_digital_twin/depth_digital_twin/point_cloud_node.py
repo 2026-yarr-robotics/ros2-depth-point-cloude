@@ -1196,45 +1196,90 @@ class PointCloudNode(Node):
 # ----------------------------------------------------------------------
 # Geometry helpers
 # ----------------------------------------------------------------------
-def _fit_cup_axis_xy(points: np.ndarray, *, top_d: float, bot_d: float,
-                     height: float):
-    """Algebraic LS fit of the cup axis (cx, cy) and base elevation z_base
-    given a vertical truncated-cone prior.
+# def _fit_cup_axis_xy(points: np.ndarray, *, top_d: float, bot_d: float,
+#                      height: float):
+#     """Algebraic LS fit of the cup axis (cx, cy) and base elevation z_base
+#     given a vertical truncated-cone prior.
 
-    The cup may stand on any horizontal surface — table, shelf, floor — so
-    we don't assume a global floor height. The cluster's robust 5th-percentile
-    Z is treated as the cup base; r(z) interpolates between r_bot at z_base
-    and r_top at z_base+height. Every surface point satisfies
-        (x - cx)^2 + (y - cy)^2 = r(z)^2
-    so expanding gives a linear system in (cx, cy, C=cx^2+cy^2):
-        -2*cx*x - 2*cy*y + C = r(z)^2 - x^2 - y^2
+#     The cup may stand on any horizontal surface — table, shelf, floor — so
+#     we don't assume a global floor height. The cluster's robust 5th-percentile
+#     Z is treated as the cup base; r(z) interpolates between r_bot at z_base
+#     and r_top at z_base+height. Every surface point satisfies
+#         (x - cx)^2 + (y - cy)^2 = r(z)^2
+#     so expanding gives a linear system in (cx, cy, C=cx^2+cy^2):
+#         -2*cx*x - 2*cy*y + C = r(z)^2 - x^2 - y^2
 
-    Returns (cx, cy, z_base, rmse_residual_m) or None if degenerate. The
-    visible side alone is enough — radius variation along z constrains the
-    centre even from a one-sided arc.
-    """
+#     Returns (cx, cy, z_base, rmse_residual_m) or None if degenerate. The
+#     visible side alone is enough — radius variation along z constrains the
+#     centre even from a one-sided arc.
+#     """
+#     if points.shape[0] < 16 or height <= 1e-6:
+#         return None
+#     x = points[:, 0]
+#     y = points[:, 1]
+#     # Robust cup base: 5th percentile is resilient to a few stray low pixels
+#     # (e.g. table-edge bleed) without being pulled by upper noise.
+#     z_base = float(np.percentile(points[:, 2], 5.0))
+#     z_rel = np.clip(points[:, 2] - z_base, 0.0, height)
+#     r_bot = bot_d * 0.5
+#     r_top = top_d * 0.5
+#     r_z = r_bot + (r_top - r_bot) * (z_rel / height)
+#     A = np.column_stack([-2.0 * x, -2.0 * y, np.ones_like(x)])
+#     b = r_z ** 2 - x ** 2 - y ** 2
+#     try:
+#         sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+#     except np.linalg.LinAlgError:
+#         return None
+#     cx, cy, _ = (float(v) for v in sol)
+#     if not (np.isfinite(cx) and np.isfinite(cy)):
+#         return None
+#     rho = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
+#     rmse = float(np.sqrt(np.mean((rho - r_z) ** 2)))
+#     return cx, cy, z_base, rmse
+
+def _fit_cup_axis_xy(points: np.ndarray, *, height: float):
     if points.shape[0] < 16 or height <= 1e-6:
         return None
-    x = points[:, 0]
-    y = points[:, 1]
-    # Robust cup base: 5th percentile is resilient to a few stray low pixels
-    # (e.g. table-edge bleed) without being pulled by upper noise.
-    z_base = float(np.percentile(points[:, 2], 5.0))
-    z_rel = np.clip(points[:, 2] - z_base, 0.0, height)
-    r_bot = bot_d * 0.5
-    r_top = top_d * 0.5
-    r_z = r_bot + (r_top - r_bot) * (z_rel / height)
-    A = np.column_stack([-2.0 * x, -2.0 * y, np.ones_like(x)])
-    b = r_z ** 2 - x ** 2 - y ** 2
+    
+    # 1. 가장 확실한 데이터인 윗면 Z (95th Percentile) 추정
+    # (Top-down 뷰에서는 윗면 데이터가 카메라와 가장 가깝고 정확함)
+    z_top = float(np.percentile(points[:, 2], 95.0))
+    
+    # 2. Strict Z-PassThrough: 윗면 테두리 1.5cm 이내의 포인트만 생존시킴
+    # (가장 노이즈가 심한 사다리꼴 옆면 데이터는 강제로 날려버림)
+    top_mask = points[:, 2] > (z_top - 0.015)
+    top_points = points[top_mask]
+    
+    if top_points.shape[0] < 16:
+        return None
+
+    # 3. 윗면 포인트들로만 2D Circle Fitting (데이터가 깨끗하므로 LSTSQ도 이제 버팀)
+    x = top_points[:, 0]
+    y = top_points[:, 1]
+    
+    # 원의 방정식: x^2 + y^2 + c1*x + c2*y + c3 = 0
+    A = np.column_stack([x, y, np.ones_like(x)])
+    b = -(x ** 2 + y ** 2)
+    
     try:
         sol, *_ = np.linalg.lstsq(A, b, rcond=None)
     except np.linalg.LinAlgError:
         return None
-    cx, cy, _ = (float(v) for v in sol)
+        
+    cx = float(sol[0]) / -2.0
+    cy = float(sol[1]) / -2.0
+    
     if not (np.isfinite(cx) and np.isfinite(cy)):
         return None
+
+    # 4. 바닥 Z축은 보이지 않는 데이터를 믿지 말고 윗면에서 기하학적으로 역산
+    z_base = z_top - height
+    
+    # Residual 계산
+    r_top_estimated = np.sqrt(cx**2 + cy**2 - float(sol[2]))
     rho = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
-    rmse = float(np.sqrt(np.mean((rho - r_z) ** 2)))
+    rmse = float(np.sqrt(np.mean((rho - r_top_estimated) ** 2)))
+    
     return cx, cy, z_base, rmse
 
 
