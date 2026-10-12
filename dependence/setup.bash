@@ -167,6 +167,15 @@ hr
 if need "import iopath" "iopath";   then pip install 'git+https://github.com/facebookresearch/iopath.git'; fi
 if need "import fvcore" "fvcore";   then pip install 'git+https://github.com/facebookresearch/fvcore.git'; fi
 
+# ninja: required by torch.utils.cpp_extension. Without it, build falls back
+# to numpy.distutils which on setuptools ≥ 74 errors out with
+# `ModuleNotFoundError: No module named 'distutils.msvccompiler'`.
+if need "import ninja" "ninja (build backend)"; then pip install ninja; fi
+# setuptools < 74 keeps the distutils.msvccompiler stub that numpy.distutils
+# still imports during fallback. Pin defensively.
+python -c "import setuptools, sys; v=tuple(int(x) for x in setuptools.__version__.split('.')[:2]); sys.exit(0 if v < (74,0) else 1)" \
+    || { log "[fix] downgrading setuptools to <74 (distutils.msvccompiler compatibility)"; pip install 'setuptools<74'; }
+
 # ---- helper: rebuild a source-built torch extension if torch ABI changed --
 torch_abi_check() {
     # $1 = pkg name (detectron2 / pytorch3d), $2 = marker file

@@ -28,15 +28,20 @@ if [[ -z "${ROS_DISTRO:-}" ]]; then
     fi
 fi
 
-# 2) Python venv
-# shellcheck disable=SC1091
-source "$DEP_DIR/venv/bin/activate"
-
-# 3) Workspace overlay (post colcon build)
+# 2) Workspace overlay (post colcon build) — must come BEFORE the venv
+# activation so that venv/bin retains PATH priority (otherwise the colcon-
+# generated setup.bash re-prepends ROS-style paths and pushes venv/bin down,
+# which makes /usr/bin/colcon resolve first and rebuilds end up with a
+# /usr/bin/python3 shebang instead of the venv interpreter).
 if [[ -f "$WS_DIR/install/setup.bash" ]]; then
     # shellcheck disable=SC1091
     source "$WS_DIR/install/setup.bash"
 fi
+
+# 3) Python venv (LAST — keeps venv/bin first in PATH)
+# shellcheck disable=SC1091
+source "$DEP_DIR/venv/bin/activate"
+hash -r 2>/dev/null || true
 
 # 4) Convenience env vars used by Cube R-CNN launch.
 # Pick whichever Base_Omni3D*.yaml exists (Omni3D has renamed the file across
