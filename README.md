@@ -592,3 +592,72 @@ python3 src/depth_digital_twin/test/fit_check_sequence.py \
 
 측정 기준치 (seq 0010, imgsz 1280): fit 실패율 0 %, 정지 컵 per-frame σ_xy
 1.6–2.9 mm, exo 마스크 경계 바이어스 b ≈ −0.95 px.
+
+---
+
+## UC-7. depth_digital_twin 발전 과정 데모 (검출 방식 진화 — GIF 녹화용)
+
+`depth_digital_twin`이 어떻게 발전해 왔는지를 **7단계(M0·M0.5 + M1~M5)** 검출 방식으로
+단계 전환하며 RViz에서 보여준다. 각 단계를 순서대로(M0 → M5) GIF로 녹화하면 그 자체가
+발전 스토리가 된다. 모든 방식은 운영 파이프라인과 **같은 측정 수학**(`cup_geometry`,
+`point_cloud_node` 헬퍼)을 재사용하는 충실한 재현이며, 단계가 또렷하게 보이도록
+KF/트래킹 잡음 없이 깨끗하게 렌더한다.
+
+| # | 방식 | 의미 |
+|---|---|---|
+| M0 | Raw Cloud (ArUco OFF) | 전체 점군을 **카메라 좌표 그대로** 표시(보정 미적용) → 테이블·로봇과 어긋나 떠 있음 |
+| M0.5 | Raw Cloud (ArUco ON) | 같은 점군을 camera→world(=robot base)로 변환 → 테이블·로봇에 정렬 |
+| 1 | Raw Point-Cloud OBB | erode·필터 없음 → 크고 노이즈한 박스 |
+| 2 | Point-Cloud Cone Fit | 점군에서 컵 frustum 형상 fit (무거움) |
+| 3 | Exo + Hand 융합 | exo 단독은 사각·불확실 → hand(관절 FK) 관측을 역공분산 융합 |
+| 4 | RGB Rim Fit | 실루엣/윤곽 fit (정밀하나 배포엔 무거움) |
+| 5 | Erode + 형상 Prior AABB | erode·필터 → 깨끗한 점군 → 알려진 컵 크기 축정렬 박스(직립 컵은 회전체라 yaw 없음 → AABB) → 집을 타깃 선택 |
+
+동작:
+- **ArUco 우선 잠금**: 초반 warm-up 프레임 `[0, warmup_end]`를 루프 재생해
+  `world_origin_node_exo`가 exo ArUco로 `world(=robot base)` TF를 잠근다. 잠긴
+  순간 데모 노드가 player의 `~/begin_range`를 호출해 **1333~1666 프레임**으로
+  점프, 그 구간을 무한 반복한다.
+- **방식 전환**: 임시 Tk 창(`evolution_control`)의 **Next method ▶** 버튼으로
+  M0 → M5 순환. 각 전환 시점에서 RViz 화면을 GIF로 녹화. M0(보정 OFF)→M0.5(보정 ON)
+  전환이 ArUco 보정 효과를 그대로 보여준다.
+- ROS_DOMAIN_ID=**1** (충돌 방지) — launch가 자동 설정.
+- YOLO: **`0610-2.pt`** (params.yaml `detection_node.model`), exo·hand 공통.
+
+```bash
+# 두/세 워크스페이스 source (dsr_description2 = m0609 URDF, hand FK·로봇 모델용)
+source ~/ros2_ws/install/setup.bash
+source ~/Projects/ros2-depth-point-cloude/install/setup.bash
+
+ros2 launch depth_digital_twin digital_twin_evolution.launch.py \
+    sequence:=/home/eunwoo/Projects/cup_stack/seq_record/0010
+```
+
+| arg | default | 설명 |
+|---|---|---|
+| `sequence` | *(필수)* | 녹화 시퀀스 폴더 절대경로 |
+| `range_start` / `range_end` | `1333` / `1666` | 반복 재생 프레임 구간 |
+| `warmup_end` | `200` | ArUco 잠금용 초반 루프 끝 프레임 |
+| `aruco_samples` | `15` | 잠금 전 평균낼 ArUco 프레임 수 (낮을수록 빨리 잠금) |
+| `start_method` | `1` | 시작 방식 (1~5) |
+| `model_yolo` | `''` | YOLO 가중치 (비우면 params의 `0610-2.pt`) |
+| `imgsz` | `1280` | YOLO 추론 해상도 (듀얼=무거움; 느리면 `640`) |
+| `render_period_s` | `0.0` | 무거운 렌더 최소 주기(s); `0`=매 프레임 |
+| `rviz` | `true` | RViz2 실행 |
+| `domain_id` | `1` | ROS_DOMAIN_ID |
+
+RViz(Fixed Frame=`world`) 표시: **DemoPoints**(`/demo/points`),
+**DemoMarkers**(`/demo/markers` — 박스·frustum·타깃 라벨·방식 타이틀 텍스트),
+**Overlay**(`/demo/overlay` — 방식별 2D 오버레이; method 4의 윤곽·실루엣 등),
+**RobotModel**(m0609), TF.
+
+방식 전환은 서비스로도 가능: `ros2 service call /evolution_demo_node/next_method
+std_srvs/srv/Trigger`, 또는 `ros2 topic pub --once /evolution_demo_node/set_method
+std_msgs/msg/Int32 "{data: 4}"`.
+
+> ⚠ 라이브 `dsr_bringup2`가 켜져 있으면 `world→base_link→…→link_6` TF가 충돌한다.
+> 종료 후 실행하거나 도메인을 분리한다(이 launch는 ROS_DOMAIN_ID=1 사용).
+>
+> ⚠ exo가 초반 프레임에서 ArUco를 못 보면 world가 잠기지 않아 검출이 로봇
+> 좌표계로 변환되지 않는다(데모가 warm-up 루프에서 대기). `warmup_end`를 늘리거나
+> ArUco가 보이는 구간이 `[0, warmup_end]`에 포함되도록 조정한다.

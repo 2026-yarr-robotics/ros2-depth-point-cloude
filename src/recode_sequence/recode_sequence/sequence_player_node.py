@@ -94,6 +94,15 @@ class SequencePlayerNode(Node):
         gp('ee_frame', 'ee_recorded')
         gp('autostart', True)
         gp('loop', False)
+        # Optional frame-range looping with an ArUco warm-up phase. When
+        # range_start >= 0 the player first LOOPS [0, warmup_end] (so a
+        # world_origin_node has frames to lock the ArUco world TF), then on a
+        # ~/begin_range Trigger jumps to range_start and LOOPS
+        # [range_start, range_end] indefinitely. Defaults (-1) keep the legacy
+        # straight-through playback untouched.
+        gp('range_start', -1)
+        gp('range_end', -1)
+        gp('warmup_end', 200)
 
         def P(n: str) -> Any:
             return self.get_parameter(n).value
@@ -108,6 +117,14 @@ class SequencePlayerNode(Node):
         self.exo_frame = str(P('exo_frame'))
         self.hand_frame = str(P('hand_frame'))
         self.loop = bool(P('loop'))
+        self.range_start = int(P('range_start'))
+        self.range_end = int(P('range_end'))
+        self.warmup_end = int(P('warmup_end'))
+        self.range_active = (
+            self.range_start >= 0 and self.range_end >= self.range_start)
+        # 'warmup' loops the early frames until ~/begin_range; 'range' loops the
+        # target window; 'free' = legacy straight-through playback.
+        self.phase = 'warmup' if self.range_active else 'free'
 
         self.idx = 0
         self.running = bool(P('autostart'))
@@ -138,6 +155,7 @@ class SequencePlayerNode(Node):
         self.create_service(Trigger, '~/stop', self._srv_stop)
         self.create_service(Trigger, '~/resume', self._srv_resume)
         self.create_service(Trigger, '~/replay', self._srv_replay)
+        self.create_service(Trigger, '~/begin_range', self._srv_begin_range)
         self.create_subscription(Int32, '~/goto_step', self._on_goto, 10)
 
         rate = max(self.reader.record_rate_hz, 1.0)
@@ -168,6 +186,21 @@ class SequencePlayerNode(Node):
         self.running = False  # spec: jump then stay paused until Resume
         self.get_logger().info(f'goto step {self.idx} (paused)')
 
+    def _srv_begin_range(self, _req, res):
+        """Leave the warm-up loop and start looping [range_start, range_end].
+        Called once by the demo consumer after the ArUco world TF is locked."""
+        if not self.range_active:
+            res.success = False
+            res.message = 'range mode inactive (set range_start/range_end)'
+            return res
+        self.phase = 'range'
+        self.idx = self.range_start
+        self.running = True
+        res.success = True
+        res.message = f'range loop {self.range_start}..{self.range_end}'
+        self.get_logger().info(res.message)
+        return res
+
     # -- playback -----------------------------------------------------------
     def _tick(self) -> None:
         n = self.reader.n_steps
@@ -178,10 +211,17 @@ class SequencePlayerNode(Node):
 
         state = 'RUNNING' if self.running else 'STOPPED'
         m = String()
-        m.data = f'{state} {self.idx}/{n - 1}'
+        suffix = f' [{self.phase}]' if self.range_active else ''
+        m.data = f'{state} {self.idx}/{n - 1}{suffix}'
         self.pub_state.publish(m)
 
         if not self.running:
+            return
+        if self.range_active:
+            lo, hi = ((0, self.warmup_end) if self.phase == 'warmup'
+                      else (self.range_start, self.range_end))
+            hi = min(hi, n - 1)
+            self.idx = lo if self.idx >= hi else self.idx + 1
             return
         if self.idx >= n - 1:
             if self.loop:

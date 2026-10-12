@@ -35,6 +35,8 @@ setup(
             'cup_fusion_node = depth_digital_twin.cup_fusion_node:main',
             'digital_twin_panel = depth_digital_twin.digital_twin_panel:main',
             'pick_ui_node = depth_digital_twin.pick_ui_node:main',
+            'evolution_demo_node = depth_digital_twin.evolution_demo_node:main',
+            'evolution_control = depth_digital_twin.evolution_control:main',
         ],
     },
 )
