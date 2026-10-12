@@ -13,6 +13,7 @@ the horizontal projection is used to recover its orientation.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Iterable
 
@@ -457,6 +458,26 @@ class PointCloudNode(Node):
         # are subtracted from /cups_on_table so a "stacked" cup is not double
         # counted (verifier owns the slot, depth owns the table count).
         self._stacked_ids: set[int] = set()
+        # Sim GT colour injection (2026-06-17): RTX lighting makes the HSV cup
+        # colour fundamentally unstable (red↔green in mixed scenes). When
+        # CUP_GT_COLORS is set (comma-separated colour per cup index, from
+        # sim_params.cups.positions) override each track's colour with the nearest
+        # sim GT cup's colour. Detection & positions stay from vision (real
+        # hand-eye picking unaffected); only the colour LABEL is ground truth.
+        # Sim-only — empty map (env unset) → no-op, real rig untouched.
+        _gtc = os.environ.get('CUP_GT_COLORS', '')
+        self._gt_color_map: dict[int, str] = {
+            i: c.strip().lower() for i, c in enumerate(_gtc.split(','))
+            if c.strip()} if _gtc else {}
+        self._gt_xy: dict[int, tuple] = {}
+        self._gt_color_tol: float = 0.08
+        self._gt_color_hyst: float = 0.04   # stacking xy-overlap hysteresis band
+        if self._gt_color_map:
+            self.create_subscription(String, '/sim/cup_poses_gt',
+                                     self._on_gt_poses, 10)
+            self.get_logger().warning(
+                f'GT colour injection ON — {len(self._gt_color_map)} cup colours '
+                f'(CUP_GT_COLORS); HSV colour overridden by nearest GT cup.')
         self.cup_resid_max: float = float(self.get_parameter('cup_fit_residual_max').value)
         self.cup_class_names: set[str] = {
             s.lower() for s in self.get_parameter('cup_class_names').value}
@@ -914,6 +935,11 @@ class PointCloudNode(Node):
                     track['color'] = max(
                         track['color_votes'],
                         key=track['color_votes'].get)
+            if self._gt_color_map:                       # sim GT colour override
+                _cup = self._gt_cup_for(centroid_xy, track.get('_gt_cup'))
+                track['_gt_cup'] = _cup
+                if _cup is not None:
+                    track['color'] = self._gt_color_map.get(_cup, track['color'])
             track['last_display_name'] = obj.class_name
 
             if (self.cup_obs_pub is not None
@@ -1467,6 +1493,41 @@ class PointCloudNode(Node):
 
     def _on_stack_track_ids(self, msg: Int32MultiArray) -> None:
         self._stacked_ids = {int(x) for x in msg.data}
+
+    def _on_gt_poses(self, msg: String) -> None:
+        """Sim /sim/cup_poses_gt {cup_<i>: [x,y,z]} → {i: (x,y)} for on-table cups
+        (hidden cups parked at z<-1 / x>1). Feeds the GT colour override."""
+        try:
+            d = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        self._gt_xy = {int(k.split('_')[1]): (float(v[0]), float(v[1]))
+                       for k, v in d.items()
+                       if len(v) >= 3 and v[2] > -1.0 and v[0] < 1.0}
+
+    def _gt_cup_for(self, xy, current):
+        """Nearest GT cup index to world-xy, WITH hysteresis so a track keeps its
+        previously-matched cup. The pyramid slots overlap in xy (L2 sits between
+        two L1 cups 0.039 m away; L3 shares L1_mid's xy), so a plain nearest-xy
+        match flips the colour red↔green as a stacked track jitters. A cup's
+        colour is fixed once assigned on the table (0.096 m apart, unambiguous);
+        it is only re-matched when the prior cup drifts out of range (a genuine
+        relocation, e.g. scene reset)."""
+        if not self._gt_xy:
+            return current
+        best, bd = None, 1e9
+        for cup, (gx, gy) in self._gt_xy.items():
+            d = float(np.hypot(float(xy[0]) - gx, float(xy[1]) - gy))
+            if d < bd:
+                best, bd = cup, d
+        if bd > self._gt_color_tol:
+            return current                       # nothing in range → keep prior
+        if current is not None and current in self._gt_xy:
+            gx, gy = self._gt_xy[current]
+            cd = float(np.hypot(float(xy[0]) - gx, float(xy[1]) - gy))
+            if cd <= self._gt_color_tol and cd <= bd + self._gt_color_hyst:
+                return current                   # prior cup still close → no flip
+        return best
 
     # ------------------------------------------------------------------
     def _kf_update_centre(self, tid: int, track: dict,

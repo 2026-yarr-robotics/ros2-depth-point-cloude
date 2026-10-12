@@ -79,7 +79,7 @@ class WorldOriginNode(Node):
 
         # ── mode ───────────────────────────────────────────────────────────
         self.declare_parameter(
-            'world_origin_mode', 'aruco')  # aruco | handeye_aruco | floor
+            'world_origin_mode', 'aruco')  # aruco | handeye_aruco | floor | param
 
         # ── handeye_aruco mode params ──────────────────────────────────────
         # FK chain endpoints. With m0609, base_link → ... → link_6.
@@ -144,6 +144,16 @@ class WorldOriginNode(Node):
         self.declare_parameter('max_plane_residual', 0.01)
         self.declare_parameter('samples_required', 10)
 
+        # ── param mode (FIXED origin — exact camera→world, no detection) ──────
+        # world_origin_mode: param publishes a fixed camera_frame→world_frame TF
+        # from these two arrays — the world origin's pose IN the camera frame:
+        # translation xyz (m) + quaternion xyzw — i.e. the same T_cam_world that
+        # aruco/floor modes publish. For the Isaac sim (exact camera/marker
+        # poses) this sidesteps flaky live ArUco. The REAL rig never selects
+        # 'param' (it uses aruco), so the shared params.yaml logic is unaffected.
+        self.declare_parameter('param_origin_xyz_m', [0.0, 0.0, 0.0])
+        self.declare_parameter('param_origin_quat_xyzw', [0.0, 0.0, 0.0, 1.0])
+
         # ── resolve common ─────────────────────────────────────────────────
         path = Path(self.get_parameter('intrinsics_path').value)
         if not path.is_file():
@@ -170,6 +180,8 @@ class WorldOriginNode(Node):
 
         if self._mode in ('aruco', 'handeye_aruco'):
             self._setup_aruco_mode()
+        elif self._mode == 'param':
+            self._setup_param_mode()
         else:
             self._setup_floor_mode()
 
@@ -206,6 +218,33 @@ class WorldOriginNode(Node):
             resp.message = 'Floor fit reset'
 
         return resp
+
+    # ── Param mode (FIXED origin, no detection) ──────────────────────────────
+
+    def _setup_param_mode(self) -> None:
+        """Publish a FIXED camera_frame→world_frame TF from param_origin_* and do
+        nothing else — no color/depth subscription, no detection, no timeout.
+
+        param_origin encodes the world origin's pose IN the camera frame
+        (xyz translation + quaternion xyzw), i.e. the same T_cam_world that
+        aruco/floor modes publish via _publish_static_tf. Used by the Isaac sim,
+        whose camera/marker poses are exact, to avoid flaky live ArUco. The TF is
+        latched (StaticTransformBroadcaster) so late/restarted listeners get it.
+        """
+        xyz = [float(v) for v in self.get_parameter('param_origin_xyz_m').value]
+        quat = [float(v) for v in self.get_parameter('param_origin_quat_xyzw').value]
+        if len(xyz) != 3 or len(quat) != 4:
+            raise ValueError(
+                'param mode needs param_origin_xyz_m[3] + '
+                f'param_origin_quat_xyzw[4], got {len(xyz)}/{len(quat)}')
+        T = np.eye(4)
+        T[:3, :3] = _quat_to_R(quat[0], quat[1], quat[2], quat[3])
+        T[:3, 3] = np.array(xyz)
+        self._publish_static_tf(T, mode='param-fixed')
+        self.get_logger().info(
+            'Param mode: FIXED origin published (no detection). '
+            f'world-in-cam xyz=({xyz[0]:.3f}, {xyz[1]:.3f}, {xyz[2]:.3f}) m '
+            f'quat_xyzw=({quat[0]:.4f}, {quat[1]:.4f}, {quat[2]:.4f}, {quat[3]:.4f})')
 
     # ── ArUco mode ─────────────────────────────────────────────────────────
 
